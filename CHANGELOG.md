@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.2] - 2026-06-01
+
+### Fixed
+- Default caching was OFF (cache_ttl=0). Now defaults to 3600s (1 hour). Repeat fetches return instantly from cache.
+- Added 40KB content chunking with offset continuation. AI agents get a truncation notice when content exceeds the limit.
+
 ## [1.0.0] - 2026-06-01
 
 ### Added

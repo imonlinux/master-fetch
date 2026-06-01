@@ -42,6 +42,8 @@ ExtendedExtractionType = Literal["markdown", "html", "text", "article", "structu
 SessionType = Literal["dynamic", "stealthy"]
 ScreenshotType = Literal["png", "jpeg"]
 
+MAX_CONTENT_CHARS = 40000
+
 
 class ResponseModel(BaseModel):
     """Request's response information structure."""
@@ -94,6 +96,27 @@ class _SessionEntry:
     session: Any  # AsyncDynamicSession | AsyncStealthySession
     session_type: SessionType
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS) -> ResponseModel:
+    """Truncate content if it exceeds max_chars. Adds continuation info."""
+    total = sum(len(c) for c in result.content)
+    if total <= max_chars:
+        return result
+    truncated = []
+    budget = max_chars
+    for c in result.content:
+        if budget <= 0:
+            break
+        truncated.append(c[:budget])
+        budget -= len(truncated[-1])
+    if truncated:
+        remaining = total - max_chars
+        truncated[-1] += f"\n\n[Content truncated: {remaining:,} more chars available. Re-fetch with offset parameter to continue.]"
+    return ResponseModel(
+        status=result.status, content=truncated, url=result.url,
+        cached=result.cached, fetcher_used=result.fetcher_used,
+    )
 
 
 def _translate_response(
@@ -801,7 +824,7 @@ class MasterFetchServer:
         css_selector: Optional[str] = None,
         main_content_only: bool = True,
         use_trafilatura: bool = True,
-        cache_ttl: int = 0,
+        cache_ttl: int = DEFAULT_TTL,
         force_fetcher: Optional[Literal["http", "dynamic", "stealthy"]] = None,
         headless: bool = True,
         real_chrome: bool = False,
@@ -834,7 +857,7 @@ class MasterFetchServer:
         :param css_selector: CSS selector to narrow content.
         :param main_content_only: Strip nav/ads/footers (default True).
         :param use_trafilatura: Use Trafilatura for cleaner article extraction (default True).
-        :param cache_ttl: Cache TTL in seconds. 0 = no cache (default). 3600 = 1 hour.
+        :param cache_ttl: Cache TTL in seconds. Default 3600 (1 hour). Set to 0 to disable.
         :param force_fetcher: Force a specific fetcher: 'http', 'dynamic', or 'stealthy'. Skip auto-routing.
         :param headless: Run browser in headless mode (default True).
         :param real_chrome: Use installed Chrome instead of Chromium.
@@ -855,7 +878,7 @@ class MasterFetchServer:
             if cached is not None:
                 cached["cached"] = True
                 cached["fetcher_used"] = "cache"
-                return ResponseModel(**cached)
+                return _apply_chunking(ResponseModel(**cached))
 
         # 2. Force specific fetcher
         if force_fetcher == "http":
@@ -868,7 +891,7 @@ class MasterFetchServer:
             await record_result(url, "none", True)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         if force_fetcher == "dynamic":
             result = await self.fetch(url, extraction_type=extraction_type, css_selector=css_selector,
@@ -879,7 +902,7 @@ class MasterFetchServer:
             await record_result(url, "low", True)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         if force_fetcher == "stealthy":
             result = await self.stealthy_fetch(url, extraction_type=extraction_type,
@@ -893,7 +916,7 @@ class MasterFetchServer:
             await record_result(url, "high", True)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         # 3. Auto-escalation logic
         domain_level = await get_domain_level(url)
@@ -913,7 +936,7 @@ class MasterFetchServer:
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         # Phase B: If domain needs dynamic, try dynamic then escalate
         if domain_level == "low":
@@ -928,7 +951,7 @@ class MasterFetchServer:
                 await record_result(url, "low", True, elapsed)
                 if cache_ttl > 0:
                     await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-                return result
+                return _apply_chunking(result)
             # Escalate to stealthy
             result = await self.stealthy_fetch(url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
@@ -942,7 +965,7 @@ class MasterFetchServer:
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         # Phase C: Unknown domain — try HTTP first (fastest), then escalate
         _http_cookies = {c["name"]: c["value"] for c in cookies} if cookies else None
@@ -959,7 +982,7 @@ class MasterFetchServer:
             await record_result(url, "none", True, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         # Failed with HTTP — try dynamic
         result = await self.fetch(url, extraction_type=extraction_type,
@@ -974,7 +997,7 @@ class MasterFetchServer:
             await record_result(url, "low", True, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-            return result
+            return _apply_chunking(result)
 
         # Failed with dynamic — escalate to stealthy
         result = await self.stealthy_fetch(url, extraction_type=extraction_type,
@@ -989,7 +1012,7 @@ class MasterFetchServer:
         await record_result(url, "high", result.status < 400, elapsed)
         if cache_ttl > 0:
             await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
-        return result
+        return _apply_chunking(result)
 
     # ─── Cache Management Tools ───────────────────────────────────────
 
