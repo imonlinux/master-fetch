@@ -1,4 +1,4 @@
-"""Trafilatura-based content extraction — cleaner articles than Readability/markdownify.
+"""Trafilatura-based content extraction:
 
 Trafilatura excels at extracting the main article content from news/blog pages,
 stripping navigation, footers, sidebars, cookie banners, and other noise.
@@ -194,14 +194,14 @@ def _extract_type(html: str, url: str, extraction_type: str) -> str | None:
             }, indent=2)
         return None
 
-    else:  # html or unknown — Trafilatura doesn't do HTML
+    else:  # html or unknown: Trafilatura doesn't do HTML
         return None
 
 
 def _fallback_extract(page, extraction_type: str, css_selector: Optional[str]) -> list[str]:
     """Fall back to Scrapling's built-in extraction (last resort)."""
     from scrapling.core.shell import Convertor
-    # Scrapling only knows markdown/html/text/raw — map our extended types
+    # Scrapling only knows markdown/html/text/raw: map our extended types
     scrapling_type = "markdown" if extraction_type in ("article", "structured") else extraction_type
     logger.info(f"Falling back to Scrapling extraction (type={scrapling_type})")
     return list(Convertor._extract_content(
@@ -250,14 +250,14 @@ def extract_with_trafilatura(
                     continue
             if parts:
                 return parts
-            # CSS selector found nothing — try full page instead
+            # CSS selector found nothing: try full page instead
             logger.info(f"CSS selector '{css_selector}' found nothing, trying full page extraction")
 
         result = _extract_type(html, page_url, extraction_type)
         if result:
             return [result]
 
-        # Even _extract_type returned None — try one more time with markdown
+        # Even _extract_type returned None: try one more time with markdown
         # regardless of requested type, just to get SOME clean content
         if extraction_type != "markdown":
             md = _trafilatura_markdown(html, page_url)
@@ -265,7 +265,7 @@ def extract_with_trafilatura(
                 logger.info(f"Requested type '{extraction_type}' failed, returning markdown fallback")
                 return [md]
 
-        # Total failure — fall back to Scrapling
+        # Total failure: fall back to Scrapling
         logger.warning(f"All Trafilatura methods failed for {page_url}, falling back to Scrapling")
         return _fallback_extract(page, extraction_type, css_selector)
 

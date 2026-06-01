@@ -1,7 +1,7 @@
 [project]
-name = "master-fetch"
-version = "1.1.0"
-description = "One MCP server to rule them all — web fetching with anti-bot bypass, smart routing, Trafilatura extraction, and content caching"
+name = "hound-mcp"
+version = "2.2.1"
+description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever."
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +27,9 @@ keywords = ["mcp", "web-scraping", "cloudflare-bypass", "anti-bot", "content-ext
 dev = [
     "pytest>=8.0",
 ]
+all = [
+    "requests>=2.31",
+]
 
 [project.urls]
 Repository = "https://github.com/dondai1234/master-fetch"
@@ -34,7 +37,7 @@ Issues = "https://github.com/dondai1234/master-fetch/issues"
 Changelog = "https://github.com/dondai1234/master-fetch/blob/master/CHANGELOG.md"
 
 [project.scripts]
-master-fetch = "master_fetch.server:main"
+hound = "master_fetch.server:main"
 
 [build-system]
 requires = ["hatchling"]

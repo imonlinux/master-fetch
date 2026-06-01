@@ -42,7 +42,7 @@ def _get_robots_parser(domain: str, user_agent: str = "*") -> RobotFileParser | 
         parser, fetched_at = _robots_cache[domain]
         if now_ts - fetched_at < _ROBOTS_CACHE_TTL:
             return parser
-        # Expired — remove and re-fetch
+        # Expired:
         del _robots_cache[domain]
 
     robots_url = f"https://{domain}/robots.txt"
@@ -77,16 +77,16 @@ def is_allowed(url: str, user_agent: str = "*") -> bool:
     """
     domain = _domain_from_url(url)
     if not domain:
-        return True  # Malformed URL — allow
+        return True  # Malformed URL: allow
 
     parser = _get_robots_parser(domain, user_agent)
     if parser is None:
-        return True  # Can't reach robots.txt — allow
+        return True  # Can't reach robots.txt: allow
 
     try:
         return parser.can_fetch(user_agent, url)
     except Exception:
-        return True  # Parse error — allow
+        return True  # Parse error: allow
 
 
 def clear_robots_cache() -> None:
