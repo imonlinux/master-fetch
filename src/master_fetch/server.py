@@ -192,6 +192,8 @@ class MasterFetchServer:
         self._sessions: Dict[str, _SessionEntry] = {}
         self._cache_ttl = cache_ttl
         self._use_trafilatura = use_trafilatura
+        self._auto_dynamic_id: Optional[str] = None
+        self._auto_stealthy_id: Optional[str] = None
 
     def _get_session(self, session_id: str, expected_type: Optional[SessionType]) -> _SessionEntry:
         """Look up a session by ID, optionally validating its type."""
@@ -206,6 +208,16 @@ class MasterFetchServer:
                 f"'{expected_type}' session. Use the matching fetch tool for your session type."
             )
         return entry
+
+    async def _ensure_auto_session(self, session_type: SessionType) -> str:
+        """Get or create an auto-persistent browser session. Avoids browser startup on every fetch."""
+        attr = "_auto_dynamic_id" if session_type == "dynamic" else "_auto_stealthy_id"
+        existing_id = getattr(self, attr)
+        if existing_id and existing_id in self._sessions and self._sessions[existing_id].session._is_alive:
+            return existing_id
+        sid = await self.open_session(session_type=session_type, headless=True)
+        setattr(self, attr, sid.session_id)
+        return sid.session_id
 
     # ─── Session Management ──────────────────────────────────────────
 
@@ -894,25 +906,31 @@ class MasterFetchServer:
             return _apply_chunking(result)
 
         if force_fetcher == "dynamic":
+            dsid = await self._ensure_auto_session("dynamic")
             result = await self.fetch(url, extraction_type=extraction_type, css_selector=css_selector,
                 main_content_only=main_content_only, use_trafilatura=use_trafilatura,
                 headless=headless, real_chrome=real_chrome, wait=wait,
                 proxy=proxy, timeout=timeout, network_idle=network_idle,
-                extra_headers=extra_headers, useragent=useragent, cookies=cookies)
+                disable_resources=True,
+                extra_headers=extra_headers, useragent=useragent, cookies=cookies,
+                session_id=dsid)
             await record_result(url, "low", True)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
         if force_fetcher == "stealthy":
+            ssid = await self._ensure_auto_session("stealthy")
             result = await self.stealthy_fetch(url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
                 use_trafilatura=use_trafilatura, headless=headless,
                 real_chrome=real_chrome, wait=wait, proxy=proxy,
                 timeout=timeout, network_idle=network_idle,
+                disable_resources=True,
                 solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
                 hide_canvas=hide_canvas, extra_headers=extra_headers,
-                useragent=useragent, cookies=cookies)
+                useragent=useragent, cookies=cookies,
+                session_id=ssid)
             await record_result(url, "high", True)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
@@ -924,14 +942,17 @@ class MasterFetchServer:
 
         # Phase A: If domain is known to need stealthy, skip to stealthy
         if domain_level == "high":
+            ssid = await self._ensure_auto_session("stealthy")
             result = await self.stealthy_fetch(url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
                 use_trafilatura=use_trafilatura, headless=headless,
                 real_chrome=real_chrome, wait=wait, proxy=proxy,
                 timeout=timeout, network_idle=network_idle,
+                disable_resources=True,
                 solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
                 hide_canvas=hide_canvas, extra_headers=extra_headers,
-                useragent=useragent, cookies=cookies)
+                useragent=useragent, cookies=cookies,
+                session_id=ssid)
             elapsed = (now() - start_time) * 1000
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
@@ -940,12 +961,15 @@ class MasterFetchServer:
 
         # Phase B: If domain needs dynamic, try dynamic then escalate
         if domain_level == "low":
+            dsid = await self._ensure_auto_session("dynamic")
             result = await self.fetch(url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
                 use_trafilatura=use_trafilatura, headless=headless,
                 real_chrome=real_chrome, wait=wait, proxy=proxy,
                 timeout=timeout, network_idle=network_idle,
-                extra_headers=extra_headers, useragent=useragent, cookies=cookies)
+                disable_resources=True,
+                extra_headers=extra_headers, useragent=useragent, cookies=cookies,
+                session_id=dsid)
             if result.status < 400 and not _is_cloudflare_from_response(result):
                 elapsed = (now() - start_time) * 1000
                 await record_result(url, "low", True, elapsed)
@@ -953,14 +977,17 @@ class MasterFetchServer:
                     await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
                 return _apply_chunking(result)
             # Escalate to stealthy
+            ssid = await self._ensure_auto_session("stealthy")
             result = await self.stealthy_fetch(url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
                 use_trafilatura=use_trafilatura, headless=headless,
                 real_chrome=real_chrome, wait=wait, proxy=proxy,
                 timeout=timeout, network_idle=network_idle,
+                disable_resources=True,
                 solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
                 hide_canvas=hide_canvas, extra_headers=extra_headers,
-                useragent=useragent, cookies=cookies)
+                useragent=useragent, cookies=cookies,
+                session_id=ssid)
             elapsed = (now() - start_time) * 1000
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
@@ -985,12 +1012,15 @@ class MasterFetchServer:
             return _apply_chunking(result)
 
         # Failed with HTTP — try dynamic
+        dsid = await self._ensure_auto_session("dynamic")
         result = await self.fetch(url, extraction_type=extraction_type,
             css_selector=css_selector, main_content_only=main_content_only,
             use_trafilatura=use_trafilatura, headless=headless,
             real_chrome=real_chrome, wait=wait, proxy=proxy,
             timeout=timeout, network_idle=network_idle,
-            extra_headers=extra_headers, useragent=useragent, cookies=cookies)
+            disable_resources=True,
+            extra_headers=extra_headers, useragent=useragent, cookies=cookies,
+            session_id=dsid)
         elapsed = (now() - start_time) * 1000
 
         if result.status < 400 and not _is_cloudflare_from_response(result):
@@ -1000,14 +1030,17 @@ class MasterFetchServer:
             return _apply_chunking(result)
 
         # Failed with dynamic — escalate to stealthy
+        ssid = await self._ensure_auto_session("stealthy")
         result = await self.stealthy_fetch(url, extraction_type=extraction_type,
             css_selector=css_selector, main_content_only=main_content_only,
             use_trafilatura=use_trafilatura, headless=headless,
             real_chrome=real_chrome, wait=wait, proxy=proxy,
             timeout=timeout, network_idle=network_idle,
+            disable_resources=True,
             solve_cloudflare=solve_cloudflare, block_webrtc=block_webrtc,
             hide_canvas=hide_canvas, extra_headers=extra_headers,
-            useragent=useragent, cookies=cookies)
+            useragent=useragent, cookies=cookies,
+            session_id=ssid)
         elapsed = (now() - start_time) * 1000
         await record_result(url, "high", result.status < 400, elapsed)
         if cache_ttl > 0:

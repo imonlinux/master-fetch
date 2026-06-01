@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.3] - 2026-06-02
+
+### Fixed
+- Domain extraction now correctly handles multi-part TLDs (.co.uk, .com.au, .co.jp, etc.)
+- Auto-persistent browser sessions in smart_fetch. Dynamic and stealthy tiers now reuse browser instances instead of launching a new browser each time.
+- Disabled resource loading in dynamic/stealthy tiers for ~25% speed improvement.
+- Rewrote README with accurate, minimal information.
+
 ## [1.0.2] - 2026-06-01
 
 ### Fixed

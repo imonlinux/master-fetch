@@ -27,16 +27,29 @@ _KNOWN_DYNAMIC_DOMAINS = {
 }
 
 
+# Two-part TLDs where we need 3 domain parts, not 2
+_MULTI_PART_TLDS = {
+    "co.uk", "com.au", "net.au", "org.au", "co.nz", "net.nz", "org.nz",
+    "co.jp", "ac.uk", "gov.uk", "org.uk", "me.uk", "net.uk", "sch.uk",
+    "co.za", "web.za", "co.in", "net.in", "org.in", "firm.in", "gen.in",
+    "com.br", "org.br", "net.br", "gov.br", "com.cn", "net.cn", "org.cn",
+}
+
+
 def _extract_domain(url: str) -> str:
-    """Extract registered domain from URL."""
+    """Extract registered domain from URL, handling multi-part TLDs."""
     try:
         from urllib.parse import urlparse
         host = urlparse(url).hostname or ""
-        # Simple: take last two parts for most domains
         parts = host.split(".")
-        if len(parts) >= 2:
-            return ".".join(parts[-2:])
-        return host
+        if len(parts) <= 1:
+            return host
+        # Check for two-part TLDs like .co.uk or .com.au
+        if len(parts) >= 3:
+            tld_candidate = ".".join(parts[-2:])
+            if tld_candidate in _MULTI_PART_TLDS:
+                return ".".join(parts[-3:])
+        return ".".join(parts[-2:])
     except Exception:
         return url
 
