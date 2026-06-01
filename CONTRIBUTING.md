@@ -1,0 +1,36 @@
+# Contributing
+
+Issues and pull requests are welcome. AI-generated issues are fine. Just make sure they're real problems you encountered while using Hound, not hypotheticals.
+
+## Reporting issues
+
+Open an issue on GitHub. Include:
+
+- What you were trying to do
+- The URL you tried to fetch or query you searched
+- The error or unexpected behavior
+- Your Python version and OS
+
+Bug report and feature request templates are available when you open a new issue.
+
+## Pull requests
+
+- Keep changes focused. One problem per PR.
+- Run `pytest tests/` before submitting.
+- If adding features, include tests.
+
+## Development
+
+```bash
+git clone https://github.com/dondai1234/master-fetch.git
+cd master-fetch
+pip install -e .[all,dev]
+playwright install chromium
+pytest tests/
+```
+
+The fetch engine is in `src/master_fetch/server.py`. Search is in `src/master_fetch/search.py`.
+
+## License
+
+MIT. By contributing, you agree to license your work under the same terms.

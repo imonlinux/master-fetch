@@ -1,4 +1,4 @@
-"""Master Fetch MCP Server — One server to rule them all.
+"""Master Fetch MCP Server.
 
 Forks Scrapling's built-in MCP server and adds:
 - Trafilatura article extraction (cleaner than markdownify)
@@ -8,12 +8,15 @@ Forks Scrapling's built-in MCP server and adds:
 - smart_fetch umbrella tool (single entry point that routes automatically)
 - extract_article and extract_structured modes
 """
+import logging
 from uuid import uuid4
 from asyncio import gather, sleep as asyncio_sleep
 from datetime import datetime, timezone
 from time import time as now
 from dataclasses import dataclass, field
 from typing import Sequence
+
+logger = logging.getLogger("master-fetch.server")
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ImageContent, TextContent
@@ -37,6 +40,7 @@ from master_fetch.cache import get_cached, set_cached, clear_cache, clear_all_ca
 from master_fetch.domain_intel import get_domain_level, record_result, guess_protection_level
 from master_fetch.trafilatura_extractor import extract_with_trafilatura
 from master_fetch.robots import is_allowed, clear_robots_cache
+from master_fetch.search import SearchResponseModel
 
 # Extended extraction types (beyond Scrapling's markdown/html/text)
 ExtendedExtractionType = Literal["markdown", "html", "text", "article", "structured"]
@@ -57,6 +61,13 @@ class ResponseModel(BaseModel):
     session_id: str = Field(default="", description="Browser session ID used for this request.")
     duration_ms: float = Field(default=0, description="Request duration in milliseconds.")
     error: str = Field(default="", description="Error message if the request failed.")
+
+
+class BulkResponseModel(BaseModel):
+    """Response from bulk fetch operations, one result per URL."""
+    results: list[ResponseModel] = Field(description="Individual results for each URL.")
+    total: int = Field(description="Total number of URLs fetched.")
+    successful: int = Field(description="Number of successful fetches (status < 400).")
 
 
 class ArticleModel(BaseModel):
@@ -101,6 +112,7 @@ class _SessionEntry:
     session: Any  # AsyncDynamicSession | AsyncStealthySession
     session_type: SessionType
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    _alive: bool = True  # True from creation; set False only on explicit close or crash
 
 
 def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS) -> ResponseModel:
@@ -131,6 +143,7 @@ def _translate_response(
     main_content_only: bool,
     use_trafilatura: bool = False,
     fetcher_used: str = "",
+    duration_ms: float = 0,
 ) -> ResponseModel:
     """Extract content from a response and translate it to a ResponseModel.
     
@@ -160,7 +173,19 @@ def _translate_response(
                 main_content_only=main_content_only,
             )
         )
-    return ResponseModel(status=page.status, content=content, url=page.url, fetcher_used=fetcher_used)
+    # Add user-friendly note for stealthy 503 (simple test servers block headless browsers)
+    if page.status == 503 and fetcher_used == "stealthy":
+        note = "[503 via stealthy fetcher. The target server may block headless browser fingerprints. Try smart_fetch or http/dynamic fetcher instead.]"
+        content = [note]
+    return ResponseModel(status=page.status, content=content, url=page.url, fetcher_used=fetcher_used, duration_ms=duration_ms)
+
+
+async def _timed(coro):
+    """Run a coroutine and return (result, elapsed_ms)."""
+    t0 = now()
+    result = await coro
+    elapsed = (now() - t0) * 1000
+    return result, elapsed
 
 
 def _normalize_credentials(credentials: Optional[Dict[str, str]]) -> Optional[Tuple[str, str]]:
@@ -263,7 +288,7 @@ class MasterFetchServer:
         :param google_search: Enabled by default, Scrapling will set a Google referer header.
         :param real_chrome: If you have a Chrome browser installed, enable this to use your real browser.
         :param wait: Time (milliseconds) to wait after everything finishes.
-        :param proxy: Proxy to use — string or dict with 'server', 'username', 'password'.
+        :param proxy: Proxy to use: string or dict with 'server', 'username', 'password'.
         :param timezone_id: Change browser timezone.
         :param locale: User locale, e.g., 'en-GB'.
         :param extra_headers: Extra headers to add to requests.
@@ -278,7 +303,7 @@ class MasterFetchServer:
         :param max_pages: Max concurrent browser tabs (default 5).
         :param hide_canvas: (Stealthy only) Random noise on canvas to prevent fingerprinting.
         :param block_webrtc: (Stealthy only) Prevent IP leak via WebRTC.
-        :param allow_webgl: (Stealthy only) Keep WebGL enabled (default True — WAFs check for it).
+        :param allow_webgl: (Stealthy only) Keep WebGL enabled (default True; WAFs check for it).
         :param solve_cloudflare: (Stealthy only) Auto-solve Cloudflare challenges.
         :param additional_args: (Stealthy only) Extra Playwright context args.
         """
@@ -305,9 +330,16 @@ class MasterFetchServer:
         else:
             session = AsyncDynamicSession(**common_kwargs)
 
-        await session.start()
+        # Add entry to sessions dict BEFORE start() so it's visible immediately
+        # (fixes race: list_sessions called right after open_session)
         entry = _SessionEntry(session=session, session_type=session_type)
         self._sessions[session_id] = entry
+        try:
+            await session.start()
+        except Exception:
+            entry._alive = False
+            self._sessions.pop(session_id, None)  # Clean up on failure
+            raise
 
         return SessionCreatedModel(
             session_id=session_id, session_type=session_type,
@@ -331,7 +363,7 @@ class MasterFetchServer:
         return [
             SessionInfo(
                 session_id=sid, session_type=entry.session_type,
-                created_at=entry.created_at, is_alive=entry.session._is_alive,
+                created_at=entry.created_at, is_alive=entry._alive,
             )
             for sid, entry in self._sessions.items()
         ]
@@ -356,7 +388,7 @@ class MasterFetchServer:
 
         :param url: The URL to navigate to and capture.
         :param session_id: ID of an open browser session.
-        :param image_type: Image format — "png" (default) or "jpeg".
+        :param image_type: Image format: "png" (default) or "jpeg".
         :param full_page: Capture full scrollable page instead of viewport.
         :param quality: JPEG quality (0-100), only for jpeg.
         :param wait: Milliseconds to wait after page load.
@@ -430,7 +462,7 @@ class MasterFetchServer:
         :param headers: Request headers.
         :param cookies: Request cookies.
         :param timeout: Timeout in seconds (default 30).
-        :param follow_redirects: Redirect policy — 'safe', True, or False.
+        :param follow_redirects: Redirect policy: 'safe', True, or False.
         :param max_redirects: Max redirects (default 30).
         :param retries: Retry attempts (default 3).
         :param retry_delay: Seconds between retries (default 1).
@@ -441,7 +473,8 @@ class MasterFetchServer:
         :param http3: Use HTTP/3 (default False).
         :param stealthy_headers: Generate real browser headers (default True).
         """
-        results = await MasterFetchServer.bulk_get(
+        t0 = now()
+        bulk = await MasterFetchServer.bulk_get(
             urls=[url], impersonate=impersonate, extraction_type=extraction_type,
             css_selector=css_selector, main_content_only=main_content_only,
             use_trafilatura=use_trafilatura, params=params, headers=headers,
@@ -450,7 +483,9 @@ class MasterFetchServer:
             proxy=proxy, proxy_auth=proxy_auth, auth=auth, verify=verify,
             http3=http3, stealthy_headers=stealthy_headers,
         )
-        return results[0]
+        result = bulk.results[0]
+        result.duration_ms = (now() - t0) * 1000
+        return result
 
     @staticmethod
     async def bulk_get(
@@ -474,7 +509,7 @@ class MasterFetchServer:
         verify: Optional[bool] = True,
         http3: Optional[bool] = False,
         stealthy_headers: Optional[bool] = True,
-    ) -> List[ResponseModel]:
+    ) -> BulkResponseModel:
         """Async parallel GET requests with browser fingerprint impersonation.
         Fast, but only works for low-protection sites.
 
@@ -504,21 +539,23 @@ class MasterFetchServer:
         use_tf = use_trafilatura and extraction_type in ("markdown", "text", "article", "structured")
 
         async with FetcherSession() as session:
-            tasks = [
-                session.get(
+            timed_tasks = [
+                _timed(session.get(
                     url, auth=normalized_auth, proxy=proxy, http3=http3, verify=verify,
                     params=params, headers=headers, cookies=cookies, timeout=timeout,
                     retries=retries, proxy_auth=normalized_proxy_auth, retry_delay=retry_delay,
                     impersonate=impersonate, max_redirects=max_redirects,
                     follow_redirects=follow_redirects, stealthy_headers=stealthy_headers,
-                )
+                ))
                 for url in urls
             ]
-            responses = await gather(*tasks)
-            return [
-                _translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "http")
-                for page in responses
+            timed_responses = await gather(*timed_tasks)
+            results = [
+                _translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "http", elapsed)
+                for page, elapsed in timed_responses
             ]
+            successful = sum(1 for r in results if r.status < 400)
+            return BulkResponseModel(results=results, total=len(results), successful=successful)
 
     # ─── Dynamic Fetcher (Playwright) ────────────────────────────────
 
@@ -573,7 +610,8 @@ class MasterFetchServer:
         :param wait_selector_state: Selector wait state.
         :param session_id: Reuse existing browser session.
         """
-        results = await self.bulk_fetch(
+        t0 = now()
+        bulk = await self.bulk_fetch(
             urls=[url], extraction_type=extraction_type, css_selector=css_selector,
             main_content_only=main_content_only, use_trafilatura=use_trafilatura,
             headless=headless, google_search=google_search, real_chrome=real_chrome,
@@ -583,7 +621,9 @@ class MasterFetchServer:
             wait_selector=wait_selector, cookies=cookies, network_idle=network_idle,
             wait_selector_state=wait_selector_state, session_id=session_id,
         )
-        return results[0]
+        result = bulk.results[0]
+        result.duration_ms = (now() - t0) * 1000
+        return result
 
     async def bulk_fetch(
         self,
@@ -609,7 +649,7 @@ class MasterFetchServer:
         network_idle: bool = False,
         wait_selector_state: SelectorWaitStates = "attached",
         session_id: Optional[str] = None,
-    ) -> List[ResponseModel]:
+    ) -> BulkResponseModel:
         """Async parallel dynamic fetch via Playwright. Handles JS-rendered pages.
 
         :param urls: List of URLs to fetch.
@@ -639,16 +679,16 @@ class MasterFetchServer:
 
         if session_id:
             entry = self._get_session(session_id, "dynamic")
-            tasks = [
-                entry.session.fetch(
+            timed_tasks = [
+                _timed(entry.session.fetch(
                     url, wait=wait, timeout=timeout, google_search=google_search,
                     extra_headers=extra_headers, disable_resources=disable_resources,
                     wait_selector=wait_selector, wait_selector_state=wait_selector_state,
                     network_idle=network_idle, proxy=proxy,
-                )
+                ))
                 for url in urls
             ]
-            responses = await gather(*tasks)
+            timed_responses = await gather(*timed_tasks)
         else:
             async with AsyncDynamicSession(
                 wait=wait, proxy=proxy, locale=locale, timeout=timeout,
@@ -660,10 +700,12 @@ class MasterFetchServer:
                 disable_resources=disable_resources,
                 wait_selector_state=wait_selector_state,
             ) as session:
-                tasks = [session.fetch(url) for url in urls]
-                responses = await gather(*tasks)
+                timed_tasks = [_timed(session.fetch(url)) for url in urls]
+                timed_responses = await gather(*timed_tasks)
 
-        return [_translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "dynamic") for page in responses]
+        results = [_translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "dynamic", elapsed) for page, elapsed in timed_responses]
+        successful = sum(1 for r in results if r.status < 400)
+        return BulkResponseModel(results=results, total=len(results), successful=successful)
 
     # ─── Stealthy Fetcher (Patchright) ───────────────────────────────
 
@@ -706,10 +748,10 @@ class MasterFetchServer:
         :param main_content_only: Strip nav/ads/footers (default True).
         :param use_trafilatura: Use Trafilatura for article extraction (default True).
         :param headless: Run browser in headless mode (default True).
-        :param solve_cloudflare: Auto-solve Cloudflare challenges (default False — enable for CF sites).
+        :param solve_cloudflare: Auto-solve Cloudflare challenges (default False; enable for CF sites).
         :param block_webrtc: Prevent IP leak via WebRTC.
         :param hide_canvas: Random noise on canvas to prevent fingerprinting.
-        :param allow_webgl: Keep WebGL enabled (default True — WAFs check for it).
+        :param allow_webgl: Keep WebGL enabled (default True; WAFs check for it).
         :param real_chrome: Use installed Chrome instead of Chromium.
         :param wait: Milliseconds to wait after page load.
         :param proxy: Proxy to use.
@@ -727,7 +769,8 @@ class MasterFetchServer:
         :param additional_args: Extra Playwright context args.
         :param session_id: Reuse existing browser session.
         """
-        results = await self.bulk_stealthy_fetch(
+        t0 = now()
+        bulk = await self.bulk_stealthy_fetch(
             urls=[url], extraction_type=extraction_type, css_selector=css_selector,
             main_content_only=main_content_only, use_trafilatura=use_trafilatura,
             headless=headless, google_search=google_search, real_chrome=real_chrome,
@@ -739,7 +782,9 @@ class MasterFetchServer:
             allow_webgl=allow_webgl, solve_cloudflare=solve_cloudflare,
             additional_args=additional_args, session_id=session_id,
         )
-        return results[0]
+        result = bulk.results[0]
+        result.duration_ms = (now() - t0) * 1000
+        return result
 
     async def bulk_stealthy_fetch(
         self,
@@ -770,7 +815,7 @@ class MasterFetchServer:
         solve_cloudflare: bool = False,
         additional_args: Optional[Dict] = None,
         session_id: Optional[str] = None,
-    ) -> List[ResponseModel]:
+    ) -> BulkResponseModel:
         """Async parallel stealthy fetch with anti-bot bypass.
 
         :param urls: List of URLs to fetch.
@@ -804,16 +849,16 @@ class MasterFetchServer:
 
         if session_id:
             entry = self._get_session(session_id, "stealthy")
-            tasks = [
-                entry.session.fetch(
+            timed_tasks = [
+                _timed(entry.session.fetch(
                     url, wait=wait, timeout=timeout, google_search=google_search,
                     extra_headers=extra_headers, disable_resources=disable_resources,
                     wait_selector=wait_selector, wait_selector_state=wait_selector_state,
                     network_idle=network_idle, proxy=proxy, solve_cloudflare=solve_cloudflare,
-                )
+                ))
                 for url in urls
             ]
-            responses = await gather(*tasks)
+            timed_responses = await gather(*timed_tasks)
         else:
             async with AsyncStealthySession(
                 wait=wait, proxy=proxy, locale=locale, cdp_url=cdp_url,
@@ -827,10 +872,12 @@ class MasterFetchServer:
                 disable_resources=disable_resources,
                 wait_selector_state=wait_selector_state,
             ) as session:
-                tasks = [session.fetch(url) for url in urls]
-                responses = await gather(*tasks)
+                timed_tasks = [_timed(session.fetch(url)) for url in urls]
+                timed_responses = await gather(*timed_tasks)
 
-        return [_translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "stealthy") for page in responses]
+        results = [_translate_response(page, extraction_type, css_selector, main_content_only, use_tf, "stealthy", elapsed) for page, elapsed in timed_responses]
+        successful = sum(1 for r in results if r.status < 400)
+        return BulkResponseModel(results=results, total=len(results), successful=successful)
 
     # ─── SMART FETCH (The One Tool To Rule Them All) ──────────────────
 
@@ -884,8 +931,8 @@ class MasterFetchServer:
         """THE ONE TOOL TO RULE THEM ALL. Automatically picks the best fetcher for the URL.
 
         How it works:
-        1. Check cache — if URL was fetched within cache_ttl seconds, return cached result
-        2. Check domain intelligence — do we know this domain needs stealth?
+        1. Check cache: if URL was fetched within cache_ttl seconds, return cached result
+        2. Check domain intelligence: do we know this domain needs stealth?
         3. If force_fetcher is set, use that fetcher directly
         4. Otherwise, try HTTP first (fastest). If blocked/403/503, escalate to dynamic.
         5. If dynamic also fails, escalate to stealthy (full anti-bot bypass).
@@ -929,9 +976,10 @@ class MasterFetchServer:
         if cache_ttl > 0:
             cached = await get_cached(url, extraction_type, css_selector, ttl=cache_ttl)
             if cached is not None:
-                cached["cached"] = True
-                cached["fetcher_used"] = "cache"
-                return _apply_chunking(ResponseModel(**cached))
+                return _apply_chunking(ResponseModel(
+                    url=cached["url"], status=cached["status"], content=cached["content"],
+                    cached=True, fetcher_used="cache", duration_ms=0,
+                ))
 
         # 2. Force specific fetcher
         if force_fetcher == "http":
@@ -995,6 +1043,7 @@ class MasterFetchServer:
                 useragent=useragent, cookies=cookies,
                 session_id=ssid)
             elapsed = (now() - start_time) * 1000
+            result.duration_ms = elapsed
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
@@ -1013,6 +1062,7 @@ class MasterFetchServer:
                 session_id=dsid)
             if result.status < 400 and not _is_cloudflare_from_response(result):
                 elapsed = (now() - start_time) * 1000
+                result.duration_ms = elapsed
                 await record_result(url, "low", True, elapsed)
                 if cache_ttl > 0:
                     await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
@@ -1030,12 +1080,13 @@ class MasterFetchServer:
                 useragent=useragent, cookies=cookies,
                 session_id=ssid)
             elapsed = (now() - start_time) * 1000
+            result.duration_ms = elapsed
             await record_result(url, "high", result.status < 400, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
-        # Phase C: Unknown domain — try HTTP first (fastest), then escalate
+        # Phase C: Unknown domain: try HTTP first (fastest), then escalate
         errors = []  # Collect errors for better diagnostics
         _http_cookies = {c["name"]: c["value"] for c in cookies} if cookies else None
 
@@ -1045,23 +1096,25 @@ class MasterFetchServer:
             proxy=proxy if isinstance(proxy, str) else None,
             headers=extra_headers, cookies=_http_cookies, stealthy_headers=True)
         elapsed = (now() - start_time) * 1000
+        result.duration_ms = elapsed
 
-        # Success with HTTP — done, fastest path
+        # Success with HTTP: done, fastest path
         if result.status < 400:
             await record_result(url, "none", True, elapsed)
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
-        # Failed with HTTP — check if it's a bot challenge or just an error page
+        # Failed with HTTP: check if it's a bot challenge or just an error page
         if not _is_cloudflare_from_response(result):
             # Not a bot challenge. Don't waste time escalating. Return the error.
             await record_result(url, "none", False, elapsed)
+            result.duration_ms = elapsed
             if cache_ttl > 0:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
-        # Bot challenge detected — try dynamic
+        # Bot challenge detected: try dynamic
         errors.append(f"HTTP tier blocked (status {result.status})")
         dsid = await self._ensure_auto_session("dynamic")
         result = await self.fetch(url, extraction_type=extraction_type,
@@ -1073,6 +1126,7 @@ class MasterFetchServer:
             extra_headers=extra_headers, useragent=useragent, cookies=cookies,
             session_id=dsid)
         elapsed = (now() - start_time) * 1000
+        result.duration_ms = elapsed
 
         if result.status < 400 and not _is_cloudflare_from_response(result):
             await record_result(url, "low", True, elapsed)
@@ -1080,7 +1134,7 @@ class MasterFetchServer:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
-        # Failed with dynamic — escalate to stealthy
+        # Failed with dynamic: escalate to stealthy
         errors.append(f"Dynamic tier failed (status {result.status})")
         ssid = await self._ensure_auto_session("stealthy")
         result = await self.stealthy_fetch(url, extraction_type=extraction_type,
@@ -1094,6 +1148,7 @@ class MasterFetchServer:
             useragent=useragent, cookies=cookies,
             session_id=ssid)
         elapsed = (now() - start_time) * 1000
+        result.duration_ms = elapsed
 
         if result.status < 400 and not _is_cloudflare_from_response(result):
             await record_result(url, "high", True, elapsed)
@@ -1101,7 +1156,7 @@ class MasterFetchServer:
                 await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
             return _apply_chunking(result)
 
-        # All tiers failed — return with diagnostic info
+        # All tiers failed: return with diagnostic info
         errors.append(f"Stealthy tier also failed (status {result.status})")
         result.content = [
             f"[All fetch tiers failed for {url}]\n"
@@ -1110,6 +1165,7 @@ class MasterFetchServer:
             f"Final status: {result.status}"
         ]
         await record_result(url, "high", False, elapsed)
+        result.duration_ms = elapsed
         if cache_ttl > 0:
             await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
         return _apply_chunking(result)
@@ -1128,6 +1184,38 @@ class MasterFetchServer:
             count = await clear_cache()
             clear_robots_cache()
             return CacheInfoModel(message=f"Cleared {count} expired cache entries.", purged=count)
+
+    # ─── Search ──────────────────────────────────────────────────────
+
+    async def smart_search(
+        self,
+        query: str,
+        max_results: int = 10,
+        cache_ttl: int = 300,
+        api_key: str = "",
+    ) -> SearchResponseModel:
+        """Search the web via TinyFish API (free, 30/min) and return structured results.
+
+        No API key needed. Returns title, URL, and snippet for each result.
+
+        :param query: The search query.
+        :param max_results: Maximum number of results (1-50, default 10).
+        :param cache_ttl: Cache TTL in seconds (default 300 = 5 minutes).
+        :param api_key: Optional TinyFish API key (uses built-in key if empty).
+        """
+        try:
+            from master_fetch.search import smart_search as _smart_search
+            return await _smart_search(self, query, max_results, cache_ttl, api_key)
+        except ImportError as e:
+            return SearchResponseModel(
+                query=query, results=[], total_results=0,
+                error=f"Search dependencies not installed. Run: pip install master-fetch[all] ({e})",
+            )
+        except Exception as e:
+            return SearchResponseModel(
+                query=query, results=[], total_results=0,
+                error=str(e)[:200],
+            )
 
     # ─── Serve ────────────────────────────────────────────────────────
 
@@ -1157,6 +1245,9 @@ class MasterFetchServer:
 
         # THE ONE TOOL TO RULE THEM ALL
         server.add_tool(self.smart_fetch, title="smart_fetch", description=self.smart_fetch.__doc__, structured_output=True)
+
+        # Web Search
+        server.add_tool(self.smart_search, title="smart_search", description=self.smart_search.__doc__, structured_output=True)
 
         # Cache management
         server.add_tool(self.cache_clear, title="cache_clear", description=self.cache_clear.__doc__, structured_output=True)

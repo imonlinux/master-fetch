@@ -1,4 +1,4 @@
-"""Domain intelligence — track which domains need which fetcher level.
+"""Domain intelligence:
 
 Stores per-domain protection level so smart_fetch can auto-escalate.
 Levels: "none" (plain HTTP works), "low" (dynamic needed), "high" (stealthy needed).
@@ -99,7 +99,7 @@ async def get_domain_level(url: str) -> str:
         if row:
             return row["protection_level"]
 
-    # No record — guess from known lists
+    # No record:
     return guess_protection_level(url)
 
 

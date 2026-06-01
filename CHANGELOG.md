@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.0.0] - 2026-06-02: Hound
+
+Renamed product from "Master Fetch" to **Hound**: web research for AI agents.
+Internal module name stays `master_fetch`. Package: `hound-mcp`. CLI: `hound`.
+
+### Added
+
+### Added
+- Web search via TinyFish API: `smart_search` tool returns structured results (title, url, snippet)
+  - Free (30 searches/min), no API key needed
+  - Results cached for 5 minutes via SQLite
+  - Optional install: `pip install master-fetch[all]`
+  - Fetch-only users stay lean with zero extra dependencies
+
+### Changed
+- Package architecture: `master-fetch` = fetch only, `master-fetch[all]` = fetch + search
+- README rewritten with competitor comparison tables and one-prompt install guides
+
 ## [1.1.0] - 2026-06-02
 
 ### Added
