@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.4.0] - 2026-06-02
+
+### Changed
+- **Complete README overhaul**: Rewritten for beginners. Honest comparison tables researched against Exa, Tavily, Bright Data, Firecrawl, Crawl4AI, Jina. Pi agent setup section with exact prompts and mcp.json config. Two-minute install flow. Marketing that doesn't oversell.
+
 ## [2.3.1] - 2026-06-02
 
 ### Fixed

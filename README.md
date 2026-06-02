@@ -1,100 +1,99 @@
-# Hound
+<div align="center">
 
-<p align="center">
-  <img src="https://img.shields.io/badge/cost-$0%20forever-brightgreen" alt="$0 forever">
+# 🐕 Hound
+
+**Give your AI agent the web. In 2 minutes. For $0.**
+
+<p>
+  <img src="https://img.shields.io/badge/cost-$0_forever-brightgreen" alt="$0 forever">
   <img src="https://img.shields.io/badge/bypass-Cloudflare-blue" alt="Cloudflare bypass">
-  <img src="https://img.shields.io/badge/mcp-stdio-purple" alt="MCP">
+  <img src="https://img.shields.io/badge/search-30%2Fmin_free-orange" alt="Free search">
+  <img src="https://img.shields.io/badge/MCP-stdio-purple" alt="MCP stdio">
   <img src="https://img.shields.io/github/license/dondai1234/master-fetch" alt="MIT">
 </p>
 
-<p align="center">
-  <strong>Web research for AI agents. Fetch any page. Search the web. $0 forever.</strong>
-</p>
+*Free MCP server. Fetch any page, search the web, bypass bot protection.*<br>
+*No API keys. No accounts. No Docker. No credit card.*
 
-<p align="center">
-  Bypasses Cloudflare bot protection. Extracts clean content. Built-in web search.<br>
-  No API keys needed. No accounts. No Docker. One MCP server.
-</p>
+[Install now](#install) · [How it works](#how-it-works) · [Comparison](#comparison) · [Pi Agent setup](#for-pi-agent-users)
 
-> The fetch engine is called Master Fetch internally (`master_fetch` module). The product is Hound. Repo: `dondai1234/master-fetch`.
+</div>
 
 ---
 
-## Tools
+## What is this?
 
-| Tool | Does |
-|------|------|
-| `smart_fetch` | Fetches any URL. Auto-escalates if blocked. Returns clean markdown. |
-| `smart_search` | Searches the web. Returns title, URL, snippet. Free, 30/min. |
-| `fetch` / `stealthy_fetch` | Manual tier selection. |
-| `screenshot` | Full-page screenshot of any URL. |
-| `open_session` / `close_session` | Persistent browser sessions. |
-| `bulk_fetch` / `bulk_stealthy_fetch` | Parallel fetching. |
-| `cache_clear` | Clear the cache. |
+Hound is an MCP server that gives any AI agent web capabilities: fetch pages, bypass bot protection, search the web. You install it, tell your agent about it, and you're done. Two commands, one config entry.
 
----
+It's built for people who are new to AI agents and just want their agent to read websites without paying for Exa or Tavily. If you've been copying URLs into chat boxes, this replaces that entirely.
 
-## Install via AI agent
+**What you get:**
+- Fetch any URL. If the site blocks simple HTTP, Hound automatically retries with a real browser. If that's blocked too, it switches to anti-bot stealth mode. You don't pick. It figures it out.
+- Search the web. 30 searches per minute, free, no API key. Results include title, URL, and snippet.
+- Clean markdown output. Navigation, ads, and footers stripped automatically.
+- Content caching. Same URL within an hour? Instant. No re-fetch.
+- 40KB smart chunking. Large pages get truncated with a continuation offset so your agent can read the rest.
 
-Paste the prompt below. The agent does the work. You just provide an API key when asked.
-
-### Full package (fetch + search)
-
-```
-Install Hound MCP server on this machine. Steps:
-
-1. Run: pip install hound-mcp[all]
-2. Run: playwright install chromium
-3. Add Hound to the MCP config on this machine. The server name is "hound". The command is "hound" with no arguments. Create a backup of the config file before editing.
-4. After setup, guide me to get a free TinyFish API key:
-
-   Tell me: "Go to https://tinyfish.ai, click Get API Key, sign up (free, no credit card needed). Copy the key and paste it here."
-
-   Wait for me to paste the key. Do not proceed until I provide it.
-5. Once I give you the key, add it as an environment variable TINYFISH_API_KEY in the hound server's MCP config.
-6. Tell me: "Done. Restart your agent to apply. You should see smart_fetch and smart_search in your tools."
-```
-
-### Fetch only
-
-```
-Install Hound MCP server (fetch only) on this machine. Steps:
-
-1. Run: pip install hound-mcp
-2. Run: playwright install chromium
-3. Add Hound to the MCP config on this machine. The server name is "hound". The command is "hound" with no arguments. Create a backup of the config file before editing.
-4. Tell me: "Done. Restart your agent to apply. You should see smart_fetch in your tools."
-```
+**What you don't get (honest limits):**
+- DataDome, Akamai Bot Manager, and Cloudflare Turnstile (interactive captcha): not bypassed. No free tool bypasses these. The next step up is a paid proxy service ($50+/mo).
+- Reddit: first page of posts only. No infinite scroll.
+- YouTube: minimal text content (it's a video platform, this is expected).
 
 ---
 
-## Updating
+## Install
+
+### Option A: Tell your AI agent to do it
+
+Copy this prompt, paste it into your agent (Claude, Cursor, Codex, etc.):
+
+**Full package (fetch + search):**
+```
+Install the Hound MCP server on this machine. Steps:
+
+1. pip install hound-mcp[all]
+2. playwright install chromium
+3. Add to MCP config. Server name: "hound". Command: "hound". No arguments. Back up the config before editing.
+4. Done? Tell me to restart my agent.
+```
+
+**Fetch only (no search, smaller install):**
+```
+Install the Hound MCP server (fetch only) on this machine. Steps:
+
+1. pip install hound-mcp
+2. playwright install chromium
+3. Add to MCP config. Server name: "hound". Command: "hound". No arguments. Back up the config before editing.
+4. Done? Tell me to restart my agent.
+```
+
+That's it. 2 commands + 1 config entry. Your agent handles the rest.
+
+### Option B: Manual
 
 ```bash
-pip install --upgrade hound-mcp[all]
-```
+# Install
+pip install hound-mcp[all]        # fetch + search
+# or
+pip install hound-mcp              # fetch only
 
-Then restart your agent. MCP servers launch fresh on each session, so the new version is picked up automatically. No config changes needed.
-
----
-
-## Manual install
-
-```bash
-# Full package
-git clone https://github.com/dondai1234/master-fetch.git
-cd master-fetch
-pip install -e .[all]
-playwright install chromium
-
-# Fetch only
-git clone https://github.com/dondai1234/master-fetch.git
-cd master-fetch
-pip install -e .
+# Browser (required for JS/anti-bot pages)
 playwright install chromium
 ```
 
-Add to MCP config (`mcpServers` / `mcp.servers`):
+Add to your MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "hound": {
+      "command": "hound"
+    }
+  }
+}
+```
+
+For search with your own API key (higher limits than the built-in one):
 
 ```json
 {
@@ -106,71 +105,165 @@ Add to MCP config (`mcpServers` / `mcp.servers`):
       }
     }
   }
+```
+
+Get a free TinyFish key at [tinyfish.ai](https://tinyfish.ai). No credit card needed. The built-in key works out of the box at 30 searches/min. Your own key raises that limit.
+
+### Updating
+
+```bash
+pip install --upgrade hound-mcp[all]
+```
+
+Restart your agent. MCP servers launch fresh each session, so the new version loads automatically.
+
+---
+
+## How it works
+
+### Smart fetch: one tool, three tiers
+
+`smart_fetch` tries the fastest method first. If blocked, it escalates automatically:
+
+| Tier | Engine | Speed | When it's used |
+|------|--------|-------|----------------|
+| HTTP | curl_cffi (Chrome TLS fingerprint) | 1-3s | Most websites. Works for anything static. |
+| Dynamic | Playwright + Chromium | 3-8s | JS-heavy pages (SPAs, React/Angular sites). |
+| Stealthy | Patchright + Cloudflare solver | 5-13s | Pages behind bot protection. |
+
+**How escalation works:**
+1. Try HTTP. If the page returns a JS-only shell like "You need to enable JavaScript", escalate to dynamic.
+2. Try dynamic. If the page returns a bot challenge or JS-disabled placeholder, escalate to stealthy.
+3. Try stealthy. Full anti-bot bypass with fingerprint spoofing and Cloudflare solving.
+4. If all tiers fail, return a clear error telling you what was tried.
+
+**What it remembers:**
+- Domain intelligence: after fetching a domain, Hound remembers which tier works. Next time, it skips straight there.
+- Content cache: SQLite, 1 hour TTL. Repeat fetches are instant.
+- The `error` field signals content quality: `js_shell_detected`, `geo_redirect_detected`, `bot_challenge_detected`. Your agent knows the fetch failed without parsing the content.
+
+### Smart search: free web search
+
+`smart_search` searches the web via TinyFish API. Returns title, URL, and snippet for each result. 30/min free, no API key needed. Results cached for 5 minutes.
+
+### Content chunking
+
+Large pages get truncated at 40KB with a continuation notice:
+
+```
+[Content truncated: received 40,000 of 60,000 chars (offset 0-40,000).
+20,000 chars remaining. Call smart_fetch again with offset=40000 to get the next chunk.]
+```
+
+Your agent calls `smart_fetch` with `offset=40000` and gets the next chunk instantly from cache. No re-fetch needed.
+
+---
+
+## Tools
+
+| Tool | What it does |
+|------|-------------|
+| `smart_fetch` | Fetch any URL. Auto-routes to the right tier. Start here. |
+| `smart_search` | Search the web. Free, 30/min, no API key. |
+| `get` / `bulk_get` | HTTP-only fetch. Fast, for known-static sites. |
+| `fetch` / `bulk_fetch` | Dynamic fetch. Playwright browser, JS rendering. |
+| `stealthy_fetch` / `bulk_stealthy_fetch` | Anti-bot fetch. Patchright + Cloudflare solver. |
+| `screenshot` | Full-page screenshot of any URL (needs open session). |
+| `open_session` / `close_session` / `list_sessions` | Persistent browser sessions. |
+| `cache_clear` | Clear the content cache. |
+
+---
+
+## Comparison
+
+### Hound vs paid tools (fetch capabilities)
+
+| | Hound | Exa | Tavily | Bright Data MCP | Firecrawl |
+|---|---|---|---|---|---|
+| **Cost** | $0 forever | 1K/mo free, then $7/1K | 1K/mo free, then $8/credit | 5K/mo free, then paid | 1K/mo free, then $19/mo |
+| **Cloudflare bypass** | Built-in | No | No | Yes (proxy infra) | No |
+| **Auto-escalation** | HTTP -> Browser -> Stealth | No | No | No | No |
+| **Runs locally** | Yes | No (cloud API) | No (cloud API) | No (cloud API) | No (cloud API) |
+| **MCP native** | Yes (stdio) | No | No (remote MCP) | Yes (remote MCP) | Yes (remote MCP) |
+| **Content caching** | SQLite, instant hits | No | No | No | No |
+| **Domain memory** | Learns per-domain | No | No | No | No |
+| **No account/signup** | Yes | API key required | API key required | API key required | API key required |
+
+The key difference: Hound runs on your machine with real browsers. Exa, Tavily, Firecrawl, and Bright Data are cloud APIs. When they can't fetch a page, you're stuck. When Hound's HTTP tier fails, it opens a real Chromium browser on your hardware and tries again.
+
+**Where paid tools win:** Bright Data has residential proxy infrastructure that bypasses DataDome and Akamai, which Hound cannot. Exa and Tavily have better search quality and scale at high volume. If you need 10K+ searches/day or enterprise anti-bot, those are the right tools. For everything else, Hound covers it at $0.
+
+### Hound vs free OSS alternatives
+
+| | Hound | Crawl4AI | Jina Reader |
+|---|---|---|---|
+| **Anti-bot bypass** | Built-in (3-tier auto) | Stealth mode (basic, needs external proxies for protected sites) | No |
+| **Cloudflare bypass** | Yes | Partial (needs proxy config) | No |
+| **Web search** | Built-in, 30/min free | No | No |
+| **MCP native** | Yes (stdio, 0 config) | Docker MCP only | No |
+| **All-in-one install** | `pip install` + one config entry | `pip install` + Docker for MCP | API call, no install |
+| **Smart routing** | Auto (HTTP -> Browser -> Stealth) | Manual tier selection | Single HTTP fetch |
+| **Content caching** | SQLite | In-memory only | No |
+| **GitHub stars** | New | 50K+ | 10K+ |
+
+Crawl4AI has way more features (LLM extraction, deep crawling, sitemap parsing, Docker dashboard, etc.). It's a power tool. Hound is a plug-and-play MCP server. If you need Crawl4AI's depth, use it. If you want your agent to just fetch pages and search the web without reading docs, Hound does that in 2 minutes.
+
+---
+
+## For Pi Agent Users
+
+If you're running the [Pi coding agent](https://pi.dev), adding Hound is one step after the pip install.
+
+### Setup
+
+1. Install Hound:
+```bash
+pip install hound-mcp[all]
+playwright install chromium
+```
+
+2. Install the MCP extension if you haven't:
+```bash
+pi install npm:pi-mcp-extension
+```
+
+3. Add Hound to `~/.pi/agent/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "hound": {
+      "command": "hound",
+      "transport": "stdio",
+      "lifecycle": "eager"
+    }
+  }
 }
 ```
 
-A built-in API key is included and works out of the box. Get your own free key at [tinyfish.ai](https://tinyfish.ai) for higher limits.
+4. Run `/reload` in Pi. Check with `/mcp` -- you should see `hound` as connected.
+
+### Prompt to give your agent
+
+If your Pi agent doesn't have web capabilities yet, give it this prompt so it knows how to use Hound:
+
+```
+You now have Hound MCP tools for web access. Use them like this:
+
+- To fetch any webpage: use mcp_hound_smart_fetch with the URL. It handles JS rendering and bot protection automatically. No need to pick a fetcher.
+- To search the web: use mcp_hound_smart_search with your query. Returns titles, URLs, and snippets.
+- If content is truncated, call smart_fetch again with the offset value from the truncation message to get the next chunk.
+- For screenshots: open a session with mcp_hound_open_session (session_type="stealthy"), then use mcp_hound_screenshot with the session_id.
+
+You do not need to ask me before fetching URLs or searching. Do it proactively when it would help answer my question.
+```
 
 ---
-
-## How fetching works
-
-`smart_fetch` tries the fastest method first, escalates only if blocked:
-
-| Tier | Engine | Speed | Best for |
-|------|--------|-------|----------|
-| HTTP | curl_cffi (Chrome TLS) | 1-3s | Most websites |
-| Dynamic | Playwright/Chromium | 3-8s | JS-heavy pages |
-| Stealthy | Patchright + solver | 5-13s | Pages behind bot protection |
-
-It remembers which tier works per domain. Results are cached (SQLite, 1hr TTL) so repeat fetches are instant.
-
----
-
-## Fetch comparison
-
-Hound's fetch engine (Master Fetch) vs every alternative. Tested live, June 2026.
-
-| | Hound | Exa | Tavily | Crawl4AI | Jina |
-|---|---|---|---|---|---|
-| **Cloudflare bypass** | ✅ Built-in | ❌ | ❌ | ⚠️ Needs external proxies | ❌ |
-| **Auto-escalation** | ✅ HTTP→Browser→Stealth | ❌ | ❌ | ⚠️ Proxy rotation | ❌ |
-| **Domain intelligence** | ✅ Remembers per-domain | ❌ | ❌ | ❌ | ❌ |
-| **Content caching** | ✅ SQLite, instant hits | ❌ | ❌ | ❌ | ❌ |
-| **Persistent sessions** | ✅ 2x speed on repeats | ❌ | ❌ | ❌ | ❌ |
-| **Retry logic** | ✅ Exponential backoff | ❌ | ❌ | ✅ Via proxies | ❌ |
-| **Runs on your hardware** | ✅ | ❌ | ❌ | ✅ | ❌ |
-| **Cost** | $0 forever | 1K/mo free | 1K/mo free | $0 | Free tier |
-| **MCP native** | ✅ Stdio | ❌ | ❌ | ❌ | ❌ |
-
-**Real-world example:** Fetching a Cloudflare-protected page:
-- Hound: escalates to stealthy, solves challenge, returns full content (5-13s)
-- Exa/Tavily: HTTP 403. No fallback. Returns error.
-- Crawl4AI: 403 unless you bring your own proxy service. Returns error or empty.
-- Jina: 403. Returns error.
-
-## Full package comparison
-
-| | Hound | Exa | Tavily |
-|---|---|---|---|
-| **Web search** | ✅ 30/min | ✅ | ✅ |
-| **Content fetching** | ✅ + anti-bot bypass | ✅ | ✅ |
-| **All-in-one MCP** | ✅ One server | ❌ Two APIs | ❌ Two APIs |
-| **Cost** | $0 forever | 1K/mo free | 1K/mo free |
-
----
-
-## Limits
-
-- DataDome, Akamai Bot Manager, and Cloudflare Turnstile (interactive): not bypassed. No free tool can bypass these. Hound is the closest you can get at $0. The next step up is paid proxy services or enterprise scraping APIs.
-- Reddit: stealthy tier, first page only (no infinite scroll)
-- YouTube: minimal text (expected for video pages)
 
 ## Requirements
 
 - Python 3.11+
-- Chromium: `playwright install chromium`
-- Search: `pip install hound-mcp[all]`
+- Chromium (installed via `playwright install chromium`)
+- Search features: `pip install hound-mcp[all]`
 
 ## License
 
