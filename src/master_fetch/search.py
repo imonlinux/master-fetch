@@ -1,6 +1,7 @@
-"""Web search for Master Fetch via TinyFish API (free, 30/min).
+"""Web search for Master Fetch via TinyFish API.
 
-No API key needed. Structured JSON results. Cached for 5 minutes.
+Requires TINYFISH_API_KEY env var (free key at tinyfish.ai, no credit card).
+Structured JSON results. Cached for 5 minutes.
 """
 
 import asyncio
@@ -17,7 +18,6 @@ from master_fetch.cache import get_cached, set_cached
 logger = logging.getLogger("master-fetch.search")
 
 TINYFISH_API = "https://api.search.tinyfish.ai"
-TINYFISH_KEY = "REDACTED"
 TINYFISH_TIMEOUT = 12
 SEARCH_CACHE_TTL = 300  # 5 minutes
 
@@ -51,7 +51,9 @@ def _get_requests():
 async def _tinyfish_search(query: str, max_results: int = 10, api_key: str = "") -> list[SearchResult]:
     """Query TinyFish search API. Returns list of SearchResult or raises on failure."""
     requests = _get_requests()
-    key = api_key or os.environ.get("TINYFISH_API_KEY", "") or TINYFISH_KEY
+    key = api_key or os.environ.get("TINYFISH_API_KEY", "")
+    if not key:
+        raise Exception("TinyFish API key required for search. Get a free key at tinyfish.ai and set TINYFISH_API_KEY env var in your MCP config.")
     url = f"{TINYFISH_API}?query={quote(query)}&location=US&language=en"
     try:
         resp = await asyncio.to_thread(
@@ -98,7 +100,7 @@ async def smart_search(
         query: Search query string.
         max_results: Max results to return (1-50, default 10).
         cache_ttl: Cache TTL in seconds (default 300 = 5 min, 0 = no cache).
-        api_key: Optional TinyFish API key (uses built-in key if empty).
+        api_key: TinyFish API key. Uses TINYFISH_API_KEY env var if empty.
     """
     t0 = time()
     query = query.strip()

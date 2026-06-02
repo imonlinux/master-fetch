@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.4.0] - 2026-06-02
+
+### Changed
+- README overhaul: honest competitor comparison (Hound vs Crawl4AI/Firecrawl/Bright Data/Exa/Tavily/Jina), Pi agent one-prompt install section, installation prompts for all major agent harnesses
+- Pi agent setup uses pi-mcp-adapter (correct package name)
+- Search now requires TINYFISH_API_KEY env var (get free key at tinyfish.ai)
+
 ## [2.3.1] - 2026-06-02
 
 ### Fixed

@@ -27,4 +27,4 @@ Thumbs.db
 *.log
 
 # Test artifacts
-TEST/exa_himeno.txt
+.hound_cache/
