@@ -293,7 +293,7 @@ def _translate_response(
     raw_body = getattr(page, 'body', None)
     total_size = len(raw_body) if isinstance(raw_body, bytes) else 0
 
-    # Detect JSON responses — return raw JSON without extraction
+    # Detect JSON responses. Return raw JSON without extraction.
     is_json = raw_ct.startswith('application/json') or raw_ct.startswith('text/json')
     if is_json and raw_body:
         try:
@@ -1292,12 +1292,12 @@ class MasterFetchServer:
         - Fetching any web page for content extraction
         - Sites that might have anti-bot protection (Cloudflare, DataDome)
         - Fetching multiple URLs at once (use urls parameter)
-        - When you don't know which fetcher to use — this tool decides for you
+        - When you don't know which fetcher to use. This tool decides for you.
 
         When NOT to use:
-        - Taking screenshots — use the screenshot tool instead
-        - Web search — use smart_search instead
-        - You specifically need HTTP-only without escalation — set force_fetcher="http"
+        - Taking screenshots: use the screenshot tool instead
+        - Web search: use smart_search instead
+        - You specifically need HTTP-only without escalation: set force_fetcher="http"
 
         Response contains: url, status, content (extracted text), content_type (e.g. 'text/html',
         'application/json'), total_size_bytes, is_truncated (if content was too long),
@@ -1493,7 +1493,7 @@ class MasterFetchServer:
         domain_level = await get_domain_level(url)
         start_time = now()
 
-        # Phase A: Domain known to need stealthy — skip straight to it
+        # Phase A: Domain known to need stealthy. Skip straight to it.
         if domain_level == "high":
             ssid = await self._ensure_auto_session("stealthy")
             result = await self.stealthy_fetch(
@@ -1514,7 +1514,7 @@ class MasterFetchServer:
             await record_result(url, "high", result.status < 400, elapsed)
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
-        # Phase B: Domain needs dynamic — try dynamic, escalate to stealthy if blocked
+        # Phase B: Domain needs dynamic. Try dynamic, escalate to stealthy if blocked.
         if domain_level == "low":
             remaining = max(timeout - int((now() - start_time) * 1000), 5000)
             dsid = await self._ensure_auto_session("dynamic")
@@ -1536,7 +1536,7 @@ class MasterFetchServer:
                 await record_result(url, "low", True, elapsed)
                 return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
-            # Dynamic failed — escalate to stealthy
+            # Dynamic failed. Escalate to stealthy.
             remaining = max(timeout - int((now() - start_time) * 1000), 5000)
             ssid = await self._ensure_auto_session("stealthy")
             result = await self.stealthy_fetch(
@@ -1557,7 +1557,7 @@ class MasterFetchServer:
             await record_result(url, "high", result.status < 400, elapsed)
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
-        # Phase C: Unknown domain — try HTTP first, escalate on failure
+        # Phase C: Unknown domain. Try HTTP first, escalate on failure.
         return await self._phase_c_unknown(
             url, extraction_type, css_selector, main_content_only,
             use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
@@ -1595,7 +1595,7 @@ class MasterFetchServer:
         # Decide whether to escalate. Two reasons:
         # 1. Status 200 with JS shell -> page needs a real browser
         # 2. Status 403 or 503 -> explicit bot block
-        # Don't check _is_cloudflare_from_response on 200 — legitimate articles
+        # Don't check _is_cloudflare_from_response on 200. Legitimate articles
         # about web security contain "cloudflare" in the body.
         should_escalate = (result.status < 400 and _is_js_shell(result)) or result.status in (403, 503)
         if not should_escalate:
@@ -1724,14 +1724,14 @@ class MasterFetchServer:
         """Search the web via TinyFish API and return structured results.
         Requires TINYFISH_API_KEY env var.
 
-        Free API key (tinyfish.ai, no credit card). Returns title, URL, and snippet
+        Free API key (no credit card): https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4
         for each result.
 
         :param query: The search query.
         :param max_results: Maximum number of results (1-50, default 10).
         :param cache_ttl: Cache TTL in seconds (default 300 = 5 minutes).
         :param api_key: TinyFish API key. If empty, uses TINYFISH_API_KEY env var.
-            Get a free key at tinyfish.ai.
+            Free key (no credit card): https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4
         """
         try:
             query = validate_search_query(query)
@@ -1778,11 +1778,11 @@ class MasterFetchServer:
             description="List all open browser sessions with their IDs, types, and ages.",
             structured_output=True)
 
-        # Main fetch tool — all fetch operations go through this
+        # Main fetch tool. All fetch operations go through this.
         server.add_tool(self.smart_fetch, title="smart_fetch",
             description=(
                 "Fetch a URL (or multiple URLs) with automatic anti-bot escalation. "
-                "Use this for ALL web page fetching — it auto-selects the best method. "
+                "Use this for ALL web page fetching. Auto-selects the best method. "
                 "Single URL: pass 'url'. Multiple URLs: pass 'urls' (returns bulk results). "
                 "Returns extracted content with metadata: content_type, total_size_bytes, "
                 "is_truncated, escalation_path (e.g. 'http→dynamic→stealthy'), duration_ms. "
@@ -1800,7 +1800,7 @@ class MasterFetchServer:
         # Search
         server.add_tool(self.smart_search, title="smart_search",
             description=(
-                "Search the web via TinyFish API. Free key at tinyfish.ai (no credit card). "
+                "Search the web via TinyFish API. Free key (no credit card): https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4 "
                 "Returns title, URL, and snippet for each result. "
                 "Use this to find information on the web before fetching specific pages with smart_fetch."
             ),
@@ -1935,7 +1935,8 @@ def _do_install():
         print("Chromium: unknown (run: playwright install chromium)")
 
     print(f"\n  MCP config: add 'hound' as command to your MCP client")
-    print(f"  Search: set TINYFISH_API_KEY env var (free key at tinyfish.ai)")
+    print(f"  Search: set TINYFISH_API_KEY env var")
+    print(f"  Free key: https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4")
 
 
 def main():

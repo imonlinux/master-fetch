@@ -32,7 +32,7 @@ Install the Hound MCP server on this machine:
 
 1. Run: hound install
 2. Add Hound to the MCP config. Server name: "hound", command: "hound", no args. Backup the config file first.
-3. Ask me: "Get a free API key at tinyfish.ai (no credit card) and paste it here."
+3. Ask me: "Get a free API key (no credit card): https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4 and paste the key here."
 4. Add the key as TINYFISH_API_KEY env var in the hound MCP config.
 5. Done. Restart your agent. smart_fetch and smart_search should be available.
 ```
@@ -128,7 +128,7 @@ Install the Hound MCP server:
    "hound": { "command": "hound", "transport": "stdio", "lifecycle": "eager" }
 
    Backup the file first.
-4. For search: get a free key at tinyfish.ai (no credit card), then add as env:
+4. For search: get a free key (no credit card): https://agent.tinyfish.ai/sign-up?ref=v1.dXNlcl8zRGVtcWxON25nSU5aSkRzU0NLQXNtT1BVUXk.VU_44hCD2lp3YXGzJWIy3mwwsHQ8xr1TbnmQQrUNDj4 and add as env:
 
    "hound": { "command": "hound", "transport": "stdio", "lifecycle": "eager", "env": { "TINYFISH_API_KEY": "<key>" } }
 
@@ -136,5 +136,9 @@ Install the Hound MCP server:
 ```
 
 ---
+
+---
+
+*TinyFish links are referral links. I get a small credit when you sign up. Costs you nothing.*
 
 MIT
