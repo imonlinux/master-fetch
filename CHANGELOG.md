@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.0] - 2026-06-06
+
+### Removed
+- 6 redundant tools removed: `get`, `fetch`, `stealthy_fetch`, `bulk_get`, `bulk_fetch`, `bulk_stealthy_fetch`. All functionality merged into `smart_fetch` via `force_fetcher` and `urls` params. 13 tools → 7.
+
+### Changed
+- `smart_fetch` now accepts `urls` (list) for bulk fetching. Returns `BulkResponseModel`.
+
+### Added
+- `ResponseModel` metadata: `content_type` (e.g. "text/html", "application/json"), `total_size_bytes`, `is_truncated`, `escalation_path` (e.g. "http→dynamic→stealthy"), `retry_count`
+- JSON responses detected and returned raw — no more trafilatura mangling
+- Agent-focused tool descriptions: "when to use", output shape, recovery hints
+- Actionable error messages with recovery tips ("Try: use smart_fetch for auto-escalation")
+
 ## [2.7.0] - 2026-06-06
 
 ### Security

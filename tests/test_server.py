@@ -34,6 +34,40 @@ class TestResponseModel:
         assert r.fetcher_used == ""
         assert r.error == ""
 
+    def test_new_defaults(self):
+        """v2.8.0 fields have sensible defaults."""
+        r = _make_response()
+        assert r.content_type == ""
+        assert r.total_size_bytes == 0
+        assert r.is_truncated is False
+        assert r.escalation_path == ""
+        assert r.retry_count == 0
+
+    def test_content_type_field(self):
+        r = _make_response()
+        r.content_type = "text/html"
+        assert r.content_type == "text/html"
+
+    def test_escalation_path_field(self):
+        r = _make_response()
+        r.escalation_path = "http→dynamic→stealthy"
+        assert r.escalation_path == "http→dynamic→stealthy"
+
+    def test_retry_count_field(self):
+        r = _make_response()
+        r.retry_count = 4
+        assert r.retry_count == 4
+
+    def test_is_truncated_field(self):
+        r = _make_response()
+        r.is_truncated = True
+        assert r.is_truncated is True
+
+    def test_total_size_bytes_field(self):
+        r = _make_response()
+        r.total_size_bytes = 54321
+        assert r.total_size_bytes == 54321
+
     def test_bulk_response_counting(self):
         results = [
             _make_response(status=200),
@@ -199,6 +233,74 @@ class TestChunking:
         r = _make_response(content=["line1", "line2"])
         result = _apply_chunking(r)
         assert "line1\nline2" == result.content[0]
+
+    def test_is_truncated_set_when_chunked(self):
+        """When content exceeds max_chars, is_truncated should be True."""
+        content = "x" * 200
+        r = _make_response(content=[content])
+        r.total_size_bytes = len(content)
+        result = _apply_chunking(r, max_chars=100)
+        assert result.is_truncated is True
+
+    def test_is_truncated_false_when_not_chunked(self):
+        """When content fits, is_truncated should be False."""
+        content = "short"
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=10000)
+        assert result.is_truncated is False
+
+    def test_truncation_preserves_escalation_path(self):
+        """Chunking should pass through escalation_path."""
+        content = "x" * 200
+        r = _make_response(content=[content])
+        r.escalation_path = "http→dynamic"
+        result = _apply_chunking(r, max_chars=100)
+        assert result.escalation_path == "http→dynamic"
+        assert result.is_truncated is True
+
+    def test_truncation_preserves_retry_count(self):
+        content = "x" * 200
+        r = _make_response(content=[content])
+        r.retry_count = 3
+        result = _apply_chunking(r, max_chars=100)
+        assert result.retry_count == 3
+
+
+class TestNewResponseMetadata:
+    """Tests for v2.8.0 metadata fields in the full pipeline."""
+
+    def test_json_content_type_detection(self):
+        """Verify content_type can be set and read on a response."""
+        r = _make_response()
+        r.content_type = "application/json"
+        assert r.content_type == "application/json"
+
+    def test_escalation_path_direct_http(self):
+        r = _make_response()
+        r.escalation_path = "direct:http"
+        assert r.escalation_path == "direct:http"
+
+    def test_escalation_path_full_chain(self):
+        r = _make_response()
+        r.escalation_path = "http→dynamic→stealthy"
+        assert "http" in r.escalation_path
+        assert "dynamic" in r.escalation_path
+        assert "stealthy" in r.escalation_path
+
+    def test_all_new_fields_in_roundtrip(self):
+        """All new fields survive a chunking roundtrip."""
+        r = _make_response()
+        r.content_type = "text/html; charset=utf-8"
+        r.total_size_bytes = 65536
+        r.escalation_path = "direct:stealthy(auto)"
+        r.retry_count = 1
+
+        result = _apply_chunking(r)
+        assert result.content_type == "text/html; charset=utf-8"
+        assert result.total_size_bytes == 65536
+        assert result.escalation_path == "direct:stealthy(auto)"
+        assert result.retry_count == 1
+        assert result.is_truncated is False  # small content
 
 
 class TestSafeCookieDict:
