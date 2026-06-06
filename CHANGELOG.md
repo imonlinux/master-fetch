@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.7.0] - 2026-06-06
+
+### Security
+- SSRF protection: blocks internal IPs, localhost, cloud metadata endpoints, dangerous URL schemes
+- Input validation on all entry points: URLs, CSS selectors, custom headers, proxies, timeouts, search queries
+- API key redaction in error messages and logs
+- Response body size limit (50MB cap)
+
+### Fixed
+- `_is_cloudflare_from_response` defined after class, causing runtime NameError. Moved above class.
+- `is_allowed()` was blocking the async event loop with sync urllib. Now fully async.
+- Cache corruption silently swallowed (bare except). Now logged.
+
+### Changed
+- Deduplicated fetch→annotate→cache→chunk pattern (8 copies → 1 `_finalize_result` helper)
+- Smart fetch split into `_force_fetch`, `_auto_escalate`, `_phase_c_unknown`
+- `__init__.py` uses lazy imports so lightweight modules don't pull scrapling
+- Cookie conversion hardened against missing keys
+
+### Added
+- `security.py` module
+- 158 unit tests across 6 test files
+
 ## [2.6.0] - 2026-06-02
 
 ### Fixed

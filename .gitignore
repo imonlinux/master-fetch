@@ -22,9 +22,20 @@ env/
 .DS_Store
 Thumbs.db
 
+# Environment/Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
 # Project
 .master_fetch_cache/
+.hound_cache/
 *.log
 
 # Test artifacts
-.hound_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml

@@ -58,7 +58,11 @@ def _extract_domain(url: str) -> str:
     """Extract registered domain from URL, handling multi-part TLDs."""
     try:
         from urllib.parse import urlparse
-        host = urlparse(url).hostname or ""
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        # Fallback: if no scheme (e.g., 'example.com'), treat entire string as host
+        if not host and not parsed.scheme:
+            host = parsed.path.split("/")[0] if parsed.path else url
         parts = host.split(".")
         if len(parts) <= 1:
             return host
