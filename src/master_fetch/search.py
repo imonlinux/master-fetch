@@ -14,7 +14,7 @@ from urllib.parse import quote
 from pydantic import BaseModel, Field
 
 from master_fetch.cache import get_cached, set_cached
-from master_fetch.security import validate_search_query, redact_api_key
+from master_fetch.security import validate_search_query, redact_api_key, SecurityError
 
 logger = logging.getLogger("master-fetch.search")
 
@@ -57,7 +57,7 @@ def _validate_api_key(api_key: str) -> str:
     if not key:
         key = os.environ.get("TINYFISH_API_KEY", "").strip()
     if not key:
-        raise Exception(
+        raise SecurityError(
             "TinyFish API key required for search. Get a free key at tinyfish.ai "
             "and set TINYFISH_API_KEY env var in your MCP config."
         )
@@ -89,23 +89,23 @@ async def _tinyfish_search(
     try:
         resp = await asyncio.to_thread(_do_request)
     except Exception as e:
-        raise Exception(f"TinyFish request failed: {e}")
+        raise SecurityError(f"TinyFish request failed: {e}")
 
     if resp.status_code == 429:
-        raise Exception(
+        raise SecurityError(
             "TinyFish rate limited (30/min free tier). Wait a moment and retry."
         )
     if resp.status_code == 401:
-        raise Exception("TinyFish API key invalid. Get a free key at tinyfish.ai")
+        raise SecurityError("TinyFish API key invalid. Get a free key at tinyfish.ai")
     if resp.status_code == 403:
-        raise Exception("TinyFish API key lacks permission. Check your key at tinyfish.ai")
+        raise SecurityError("TinyFish API key lacks permission. Check your key at tinyfish.ai")
     if not resp.ok:
-        raise Exception(f"TinyFish returned HTTP {resp.status_code}")
+        raise SecurityError(f"TinyFish returned HTTP {resp.status_code}")
 
     try:
         data = resp.json()
     except ValueError:
-        raise Exception("TinyFish returned invalid JSON response")
+        raise SecurityError("TinyFish returned invalid JSON response")
 
     results_raw = data.get("results", [])
     if not results_raw:
@@ -155,10 +155,10 @@ async def smart_search(
 
     max_results = max(1, min(max_results, 50))
 
-    # Check cache
+    # Check cache — get_cached args: (url, extraction_type, ...).
+    # set_cached stores with key hash("query|search:v1|"). Must match order.
     if cache_ttl > 0:
-        cache_key = "search:v1"
-        cached = await get_cached(cache_key, query, None, ttl=cache_ttl)
+        cached = await get_cached(query, "search:v1", None, ttl=cache_ttl)
         if cached and cached.get("content"):
             try:
                 data = json.loads(cached["content"][0])
@@ -187,9 +187,8 @@ async def smart_search(
 
     # Cache successful results
     if cache_ttl > 0 and results:
-        cache_key = "search:v1"
         cache_data = json.dumps({"results": [r.model_dump() for r in results]})
-        await set_cached(query, cache_key, [cache_data], 200, None, cache_ttl)
+        await set_cached(query, "search:v1", [cache_data], 200, None, cache_ttl)
 
     return SearchResponseModel(
         query=query, results=results, total_results=len(results),

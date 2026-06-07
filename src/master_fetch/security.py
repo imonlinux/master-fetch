@@ -18,6 +18,19 @@ _BLOCKED_SCHEMES = frozenset({
     "about", "chrome", "chrome-extension", "jar",
 })
 
+# Hostnames that must never be targeted (bypass IP checks via name resolution)
+_BLOCKED_HOSTNAMES = frozenset({
+    "localhost", "metadata.google.internal", "169.254.169.254",
+    "0.0.0.0", "0",  # "0" from bare IPv6 without brackets (e.g. http://0:0:0:...)
+})
+
+# DNS rebinding service suffixes (nip.io, sslip.io, etc.)
+# These services resolve subdomains to arbitrary IPs, enabling SSRF bypass.
+_DNS_REBINDING_SUFFIXES = (
+    ".nip.io", ".sslip.io", ".xip.io", ".nip.name",
+    ".1u.ms",  # resolves to loopback
+)
+
 # Private/reserved IP ranges that must never be targeted
 _PRIVATE_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),       # Loopback
@@ -28,7 +41,8 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),         # Current network
     ipaddress.ip_network("224.0.0.0/4"),       # Multicast
     ipaddress.ip_network("240.0.0.0/4"),       # Reserved
-    ipaddress.ip_network("::1/128"),            # IPv6 loopback
+    ipaddress.ip_network("::1/128"),            # IPv6 loopback (compressed)
+    ipaddress.ip_network("::ffff:0:0/96"),     # IPv4-mapped IPv6 — extract mapped v4 for re-check
     ipaddress.ip_network("fc00::/7"),           # IPv6 unique local
     ipaddress.ip_network("fe80::/10"),          # IPv6 link-local
     ipaddress.ip_network("::/128"),             # IPv6 unspecified
@@ -55,6 +69,9 @@ def validate_url(url: str, allow_internal: bool = False) -> str:
     - File:// and other dangerous schemes
     - Oversized URLs (DoS)
     - Malformed URLs
+    - URL parsing confusion attacks (backslash in authority, bracketed hosts)
+    - CVE-2024-11168: urllib.parse bracket-host SSRF bypass
+    - CVE-2025-0454-style: backslash-@ authority confusion between parsers
 
     Args:
         url: The URL to validate.
@@ -71,10 +88,22 @@ def validate_url(url: str, allow_internal: bool = False) -> str:
 
     url = url.strip()
 
+    if not url:
+        raise SecurityError("URL must be a non-empty string")
+
     if len(url) > MAX_URL_LENGTH:
         raise SecurityError(
             f"URL exceeds maximum length of {MAX_URL_LENGTH} characters"
         )
+
+    # CRITICAL: Reject URLs containing backslash in authority section.
+    # Backslash causes parsing confusion between urlparse (treats \\ as part
+    # of userinfo/netloc) and urllib3/requests (treats \\ as path delimiter).
+    # This enables SSRF: http://evil.com\\@127.0.0.1/ passes urlparse validation
+    # (hostname=127.0.0.1) but fetches from evil.com.
+    # See: corCTF 2025 "Python URL Parsing Confusion"; CVE-2025-0454
+    if "\\" in url:
+        raise SecurityError("URL contains backslash character (potential SSRF bypass)")
 
     try:
         parsed = urlparse(url)
@@ -88,6 +117,22 @@ def validate_url(url: str, allow_internal: bool = False) -> str:
 
     if scheme not in ("http", "https"):
         raise SecurityError(f"Only http and https URLs are supported, got: {scheme}")
+
+    # Block bracketed hosts that aren't valid IPv6 — CVE-2024-11168
+    # urlparse in Python <3.12.7 improperly validated bracketed hosts, allowing
+    # arbitrary content in brackets to be treated as valid hostnames.
+    netloc = (parsed.netloc or "").lower()
+    if "[" in netloc or "]" in netloc:
+        if not (netloc.startswith("[") and "]" in netloc):
+            raise SecurityError("URL contains malformed bracketed host (potential SSRF bypass)")
+        # Extract the bracketed part and verify it's a valid IPv6 address
+        bracket_content = netloc[1:netloc.index("]")]
+        try:
+            ipaddress.IPv6Address(bracket_content)
+        except ipaddress.AddressValueError:
+            # Allow IPvFuture (v[0-9]+\..+) but nothing else
+            if not re.match(r'^v[0-9]+\..+$', bracket_content, re.IGNORECASE):
+                raise SecurityError("URL contains invalid bracketed host (potential SSRF bypass)")
 
     hostname = parsed.hostname
     if not hostname:
@@ -103,16 +148,30 @@ def validate_url(url: str, allow_internal: bool = False) -> str:
             pass  # Not an IP address — check hostname blocklist below
 
         if is_ip:
+            # Check IPv4-mapped IPv6: extract the mapped IPv4 and re-check it
+            if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+                ipv4_addr = addr.ipv4_mapped
+                for network in _PRIVATE_NETWORKS:
+                    if isinstance(network, ipaddress.IPv4Network) and ipv4_addr in network:
+                        raise SecurityError(
+                            f"URL targets internal/private IP (IPv4-mapped {hostname} → {ipv4_addr} in {network})"
+                        )
             for network in _PRIVATE_NETWORKS:
-                if addr in network:
-                    raise SecurityError(
-                        f"URL targets internal/private IP ({hostname} in {network})"
-                    )
+                try:
+                    if addr in network:
+                        raise SecurityError(
+                            f"URL targets internal/private IP ({hostname} in {network})"
+                        )
+                except TypeError:
+                    pass  # IPv4/IPv6 type mismatch, skip
         else:
-            # Block known internal hostnames (cloud metadata, localhost)
-            if hostname.lower() in ("localhost", "metadata.google.internal",
-                                     "169.254.169.254", "0.0.0.0"):
+            # Block known internal hostnames (cloud metadata, localhost, DNS rebinding services)
+            hostname_lower = hostname.lower()
+            if hostname_lower in _BLOCKED_HOSTNAMES:
                 raise SecurityError(f"URL targets internal service: {hostname}")
+            # Block DNS rebinding services that resolve to internal IPs
+            if hostname_lower.endswith(_DNS_REBINDING_SUFFIXES):
+                raise SecurityError(f"URL uses DNS rebinding service: {hostname}")
 
     return url
 

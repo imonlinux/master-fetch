@@ -12,6 +12,9 @@ import aiosqlite
 _CACHE_DIR = Path.home() / ".master_fetch_cache"
 _DB_NAME = "domains.db"
 
+# Shared DB path cache — avoids re-running PRAGMA on every operation
+_db_initialized: dict[Path, bool] = {}
+
 PROTECTION_LEVELS = ("none", "low", "high")
 # Domains known to be static (HTTP works fine). Prevents over-escalation.
 _KNOWN_SAFE_DOMAINS = {
@@ -81,7 +84,12 @@ async def _ensure_db() -> Path:
     d.mkdir(parents=True, exist_ok=True)
     db_path = d / _DB_NAME
 
+    if _db_initialized.get(db_path):
+        return db_path
+
     async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS domain_intel (
                 domain TEXT PRIMARY KEY,
@@ -92,8 +100,10 @@ async def _ensure_db() -> Path:
                 last_seen REAL NOT NULL
             )
         """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_domain_last_seen ON domain_intel(last_seen)")
         await db.commit()
 
+    _db_initialized[db_path] = True
     return db_path
 
 
@@ -177,8 +187,9 @@ async def record_result(url: str, level: str, success: bool, response_ms: float 
                 new_level = "low"
             elif not success and level == "low":
                 new_level = "high"
-            # If we succeeded with stealthy many times, consider downgrading
-            elif success and level == "high" and hits > 5 and fails == 0:
+            # If we succeeded with stealthy many times, consider downgrading.
+            # Require 10+ consecutive hits with zero fails to prevent flip-flopping.
+            elif success and level == "high" and hits > 10 and fails == 0:
                 new_level = "low"
 
             await db.execute(

@@ -1,6 +1,7 @@
 """Tests for robots.py — robots.txt compliance."""
 
 import pytest
+import pytest_asyncio
 from unittest.mock import AsyncMock, patch
 from master_fetch.robots import (
     _extract_netloc,
@@ -31,12 +32,12 @@ class TestExtractNetloc:
 class TestIsAllowed:
     """Robots.txt compliance checks."""
 
-    @pytest.fixture(autouse=True)
-    def _clear_cache(self):
+    @pytest_asyncio.fixture(autouse=True)
+    async def _clear_cache(self):
         """Clear robots cache before each test to prevent cross-test pollution."""
-        clear_robots_cache()
+        await clear_robots_cache()
         yield
-        clear_robots_cache()
+        await clear_robots_cache()
 
     @pytest.mark.asyncio
     async def test_malformed_url_allowed(self):
@@ -108,11 +109,11 @@ class TestIsAllowed:
 class TestClearRobotsCache:
     """Cache clearing."""
 
-    @pytest.fixture(autouse=True)
-    def _clear_cache(self):
-        clear_robots_cache()
+    @pytest_asyncio.fixture(autouse=True)
+    async def _clear_cache(self):
+        await clear_robots_cache()
         yield
-        clear_robots_cache()
+        await clear_robots_cache()
 
     @pytest.mark.asyncio
     async def test_clear_removes_cached_entries(self):
@@ -122,7 +123,7 @@ class TestClearRobotsCache:
             # Populate cache
             await is_allowed("https://clear-cache-test.com/page1")
             # Clear
-            clear_robots_cache()
+            await clear_robots_cache()
             # Should re-fetch
             await is_allowed("https://clear-cache-test.com/page2")
             assert mock_fetch.call_count == 2

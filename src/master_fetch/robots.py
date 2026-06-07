@@ -15,8 +15,17 @@ logger = logging.getLogger("master-fetch.robots")
 
 # Cache robots.txt parsers per domain: {domain: (RobotFileParser, fetch_time)}
 _robots_cache: dict[str, tuple[RobotFileParser, float]] = {}
+_robots_lock: asyncio.Lock | None = None
 _ROBOTS_CACHE_TTL = 3600  # 1 hour
 _FETCH_TIMEOUT = 10  # seconds
+
+
+def _get_robots_lock() -> asyncio.Lock:
+    """Lazy-init the robots cache lock (needs running event loop)."""
+    global _robots_lock
+    if _robots_lock is None:
+        _robots_lock = asyncio.Lock()
+    return _robots_lock
 
 DEFAULT_USER_AGENT = (
     "Hound/2.7 (web research for AI agents; https://github.com/dondai1234/master-fetch)"
@@ -49,10 +58,9 @@ async def _fetch_robots_txt(domain: str) -> str | None:
                 if body:
                     return body.decode(response.encoding or 'utf-8', errors='replace')
     except ImportError:
-        # Fallback: use aiohttp if available, or urllib in thread
-        pass
-    except Exception:
-        pass
+        logger.debug(f"scrapling not available for robots.txt fetch of {domain}, using fallback")
+    except Exception as e:
+        logger.debug(f"Scrapling robots.txt fetch failed for {domain}: {e}")
 
     # Fallback: urllib in thread (no impersonation, but works for basic sites)
     try:
@@ -68,7 +76,11 @@ async def _fetch_robots_txt(domain: str) -> str | None:
                 return resp.read().decode("utf-8", errors="replace")
 
         return await asyncio.to_thread(_sync_fetch)
-    except (URLError, OSError, Exception):
+    except (URLError, OSError) as e:
+        logger.debug(f"robots.txt unreachable for {domain}: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"Unexpected error fetching robots.txt for {domain}: {e}")
         return None
 
 
@@ -79,13 +91,15 @@ async def _get_robots_parser(domain: str, user_agent: str = "*") -> RobotFilePar
     Returns RobotFileParser if successfully fetched.
     """
     now_ts = time()
+    lock = _get_robots_lock()
 
-    # Check cache
-    if domain in _robots_cache:
-        parser, fetched_at = _robots_cache[domain]
-        if now_ts - fetched_at < _ROBOTS_CACHE_TTL:
-            return parser
-        del _robots_cache[domain]
+    async with lock:
+        # Check cache
+        if domain in _robots_cache:
+            parser, fetched_at = _robots_cache[domain]
+            if now_ts - fetched_at < _ROBOTS_CACHE_TTL:
+                return parser
+            del _robots_cache[domain]
 
     raw = await _fetch_robots_txt(domain)
     if raw is None:
@@ -95,7 +109,8 @@ async def _get_robots_parser(domain: str, user_agent: str = "*") -> RobotFilePar
     try:
         parser = RobotFileParser()
         parser.parse(raw.splitlines())
-        _robots_cache[domain] = (parser, now_ts)
+        async with lock:
+            _robots_cache[domain] = (parser, now_ts)
         logger.debug(f"Fetched and parsed robots.txt for {domain}")
         return parser
     except Exception as e:
@@ -127,7 +142,9 @@ async def is_allowed(url: str, user_agent: str = "*") -> bool:
         return True  # Parse error: allow
 
 
-def clear_robots_cache() -> None:
+async def clear_robots_cache() -> None:
     """Clear the robots.txt cache."""
-    _robots_cache.clear()
+    lock = _get_robots_lock()
+    async with lock:
+        _robots_cache.clear()
     logger.info("Robots.txt cache cleared")

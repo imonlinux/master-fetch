@@ -125,11 +125,11 @@ class TestCloudflareDetection:
         assert _is_cloudflare_from_response(r) is True
 
     def test_detects_captcha_delivery(self):
-        r = _make_response(content=["captcha-delivery.com/..."])
+        r = _make_response(content=["captcha-delivery.com/..."], status=403)
         assert _is_cloudflare_from_response(r) is True
 
     def test_detects_datadome(self):
-        r = _make_response(content=["datadome test page" "dd=... var..."])
+        r = _make_response(content=["datadome test page" "dd=... var..."], status=503)
         assert _is_cloudflare_from_response(r) is True
 
     def test_normal_content_not_cf(self):
@@ -138,11 +138,12 @@ class TestCloudflareDetection:
         assert _is_cloudflare_from_response(r) is False
 
     def test_article_mentioning_cloudflare_not_blocked(self):
-        """Articles about web security mention 'cloudflare' in body text."""
+        """Articles about web security mention 'cloudflare' in body text with status 200."""
         r = _make_response(content=["Cloudflare announced a new feature today..."])
-        # This is a known limitation — cloudflare in body triggers detection
-        # but _phase_c_unknown handles this by not checking on 200-status responses
-        assert _is_cloudflare_from_response(r) is True
+        # Status 200 + cloudflare in body = NOT a bot challenge
+        assert _is_cloudflare_from_response(r) is False
+        # _detect_content_issue also should not flag it
+        assert _detect_content_issue(r) == ""
 
 
 class TestContentIssueDetection:
@@ -159,7 +160,7 @@ class TestContentIssueDetection:
         assert "geo_redirect_detected" in issue
 
     def test_detects_bot_challenge(self):
-        r = _make_response(content=["Cloudflare ray id: checking your browser..."])
+        r = _make_response(content=["Cloudflare ray id: checking your browser..."], status=503)
         issue = _detect_content_issue(r)
         assert "bot_challenge_detected" in issue
 

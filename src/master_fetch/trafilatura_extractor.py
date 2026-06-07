@@ -19,8 +19,6 @@ import trafilatura
 from lxml.etree import tostring
 from lxml.html import fromstring as html_fromstring
 
-from scrapling.parser import Selector
-
 logger = logging.getLogger("master_fetch.trafilatura_extractor")
 
 
