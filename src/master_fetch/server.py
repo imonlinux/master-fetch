@@ -95,6 +95,7 @@ SessionType = Literal["dynamic", "stealthy"]
 ScreenshotType = Literal["png", "jpeg"]
 
 MAX_CONTENT_CHARS = 40000
+MIN_CHUNK_CHARS = 500  # if remaining < this, merge into current chunk (avoids wasteful round-trips)
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024  # 50MB hard cap for response bodies
 MAX_BULK_URLS = 100  # hard cap to prevent DoS via unbounded parallel requests
 
@@ -112,7 +113,8 @@ class ResponseModel(BaseModel):
     error: str = Field(default="", description="Error + recovery hints")
     content_type: str = Field(default="", description="e.g. text/html, application/json")
     total_size_bytes: int = Field(default=0, description="Raw body bytes")
-    is_truncated: bool = Field(default=False, description="True=more content, use next_offset")
+    total_extracted_chars: int = Field(default=0, description="Total chars of extracted text (before chunking). Use to gauge how much remains: total_extracted_chars - offset")
+    is_truncated: bool = Field(default=False, description="True=more extracted content. Use next_offset. Check total_extracted_chars to see how much remains.")
     next_offset: int = Field(default=0, description="Next offset when is_truncated. 0=no more")
     escalation_path: str = Field(default="", description="e.g. http→dynamic→stealthy")
     retry_count: int = Field(default=0, description="Retries")
@@ -267,13 +269,15 @@ def _annotate_quality(result: ResponseModel) -> ResponseModel:
 def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, offset: int = 0) -> ResponseModel:
     """Truncate content if it exceeds max_chars, starting from offset.
 
-    When content is truncated, sets is_truncated=True and includes a
-    continuation notice telling the caller how to get the next chunk.
-    Preserves all ResponseModel metadata fields.
+    Smart merge: if remaining content after a chunk is less than MIN_CHUNK_CHARS,
+    include it all in the current chunk. This prevents wasteful round-trips where
+    an agent calls again just to get 55 chars.
+
+    Always sets total_extracted_chars so agents can gauge remaining content
+    without making a follow-up call.
     """
     full_text = "\n".join(result.content)
     total_len = len(full_text)
-    truncated = False
 
     if offset >= total_len:
         return ResponseModel(
@@ -282,6 +286,7 @@ def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, o
             extracted_type=result.extracted_type, session_id=result.session_id,
             duration_ms=result.duration_ms, error=result.error,
             content_type=result.content_type, total_size_bytes=result.total_size_bytes,
+            total_extracted_chars=total_len,
             escalation_path=result.escalation_path, retry_count=result.retry_count,
             next_offset=0,
         )
@@ -290,13 +295,21 @@ def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, o
     chunk_len = len(chunk)
     remaining = total_len - offset - chunk_len
 
+    # Smart merge: if remaining is small, include it all in this chunk.
+    # Avoids wasteful round-trip where agent calls again for 55 chars.
+    truncated = False
     next_off = 0
-    if remaining > 0:
+    if remaining > MIN_CHUNK_CHARS:
         truncated = True
         next_off = offset + chunk_len
+        remaining_hint = total_len - next_off
         chunk += (
-            f"\n\n[Truncated: {chunk_len:,}/{total_len:,} chars. Next offset: {next_off}]"
+            f"\n\n[Truncated: showing {chunk_len:,} of {total_len:,} extracted chars. "
+            f"{remaining_hint:,} chars remaining. Next offset: {next_off}]"
         )
+    elif remaining > 0:
+        # Remaining is small — include it all, no truncation flag
+        chunk = full_text[offset:]
 
     return ResponseModel(
         status=result.status, content=[chunk], url=result.url,
@@ -304,6 +317,7 @@ def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, o
         extracted_type=result.extracted_type, session_id=result.session_id,
         duration_ms=result.duration_ms, error=result.error,
         content_type=result.content_type, total_size_bytes=result.total_size_bytes,
+        total_extracted_chars=total_len,
         is_truncated=truncated, next_offset=next_off,
         escalation_path=result.escalation_path, retry_count=result.retry_count,
     )
@@ -1901,7 +1915,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_fetch",
-            "description": "Fetch any URL. Auto HTTP→browser→stealth escalation. Bulk: pass urls. Truncated? Use next_offset. Fresh: cache_ttl=0.",
+            "description": "Fetch any URL. Auto HTTP→browser→stealth escalation. Bulk: pass urls. Offset pages through EXTRACTED text (not raw HTML). If extraction produces 40KB from a 1MB page, offset can't reach beyond that 40KB. Use extraction_type=html for raw HTML. Cache: cache_ttl=0 bypasses cache. is_truncated=true + total_extracted_chars tells you exactly how much remains.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1910,7 +1924,7 @@ class MasterFetchServer:
                     "extraction_type": {"type": "string", "enum": ["markdown", "html", "text", "article", "structured"], "description": "markdown|html|text|article|structured"},
                     "cache_ttl": {"type": "integer", "description": "Cache seconds. 0=fresh"},
                     "force_fetcher": {"type": "string", "enum": ["http", "dynamic", "stealthy"], "description": "Lock to one tier"},
-                    "offset": {"type": "integer", "description": "0-based char offset. is_truncated=true? Use next_offset value."},
+                    "offset": {"type": "integer", "description": "Char offset into extracted text (not raw HTML). Use next_offset from previous response. Check total_extracted_chars to see total available."},
                     "options": {"type": "object", "description": "css_selector, proxy, timeout, cookies, extra_headers, useragent, wait, network_idle, headless, real_chrome, respect_robots, main_content_only, use_trafilatura, solve_cloudflare, block_webrtc, hide_canvas", "additionalProperties": True},
                 },
             },
@@ -1931,7 +1945,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Web search via TinyFish. Free key at tinyfish.ai.",
+            "description": "Web search via TinyFish. Free key at tinyfish.ai. Results cached 5min (cache_ttl to adjust).",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
@@ -1943,7 +1957,7 @@ class MasterFetchServer:
         },
         {
             "name": "cache_clear",
-            "description": "Clear fetch cache. all=true wipes all.",
+            "description": "Clear fetch cache. all=true wipes all. Cache stores extracted text per URL+extraction_type. Default TTL: 1hr.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

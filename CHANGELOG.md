@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.1.0] - 2026-06-07
+
+### Changed
+- **Smart chunking merge**: When remaining content after a chunk is less than 500 chars, it's included in the current chunk instead of setting `is_truncated: true`. No more wasteful round-trips for 55-char second calls.
+- **`total_extracted_chars` field**: New ResponseModel field shows total extracted text length (before chunking). Agents can calculate remaining content without a follow-up call: `total_extracted_chars - offset`.
+- **Honest chunking meta-awareness**: `offset` pages through EXTRACTED text, not raw HTML. If extraction produces 40KB from a 1MB page, offset can't reach beyond that 40KB. Tool description now explains this. Use `extraction_type=html` for raw HTML.
+- **Honest truncation messages**: Now includes exact remaining chars count: `[Truncated: showing 40,000 of 120,000 extracted chars. 80,000 chars remaining. Next offset: 40000]`
+- **Cache meta-awareness**: `cache_clear` and `mcp_smart_search` descriptions now mention cache behavior and TTL.
+
 ## [3.0.1] - 2026-06-07
 
 ### Fixed

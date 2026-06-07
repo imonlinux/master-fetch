@@ -11,6 +11,7 @@ from master_fetch.server import (
     _apply_chunking,
     _safe_cookie_dict,
     MAX_CONTENT_CHARS,
+    MIN_CHUNK_CHARS,
 )
 
 
@@ -190,19 +191,19 @@ class TestChunking:
         assert result.content == ["Short content"]
 
     def test_large_content_truncated(self):
-        huge = "x" * (MAX_CONTENT_CHARS + 100)
+        huge = "x" * (MAX_CONTENT_CHARS + MIN_CHUNK_CHARS + 100)  # enough remainder to trigger truncation
         r = _make_response(content=[huge])
         result = _apply_chunking(r)
         assert "[Truncated:" in result.content[0]
-        assert len(result.content[0]) < MAX_CONTENT_CHARS + 500  # room for notice
+        assert result.is_truncated is True
 
     def test_offset_continuation(self):
         content = "ABCDEFGHIJ"  # 10 chars
         r = _make_response(content=[content])
         result = _apply_chunking(r, max_chars=4, offset=4)
-        # Should get chars 4-7 (EFGH) + truncation note
-        assert "EFGH" in result.content[0]
-        assert "Next offset:" in result.content[0]
+        # Should get chars 4-7 (EFGH) — remaining is 2 < MIN_CHUNK_CHARS, so smart merge includes all
+        assert "EFGHIJ" in result.content[0]
+        assert result.is_truncated is False  # smart merged
 
     def test_offset_beyond_content(self):
         content = "ABC"  # 3 chars
@@ -236,12 +237,12 @@ class TestChunking:
         assert "line1\nline2" == result.content[0]
 
     def test_is_truncated_set_when_chunked(self):
-        """When content exceeds max_chars, is_truncated should be True."""
-        content = "x" * 200
+        """When content exceeds max_chars by more than MIN_CHUNK_CHARS, is_truncated should be True."""
+        content = "x" * 2000
         r = _make_response(content=[content])
-        r.total_size_bytes = len(content)
-        result = _apply_chunking(r, max_chars=100)
+        result = _apply_chunking(r, max_chars=1000)
         assert result.is_truncated is True
+        assert result.next_offset == 1000
 
     def test_is_truncated_false_when_not_chunked(self):
         """When content fits, is_truncated should be False."""
@@ -252,19 +253,67 @@ class TestChunking:
 
     def test_truncation_preserves_escalation_path(self):
         """Chunking should pass through escalation_path."""
-        content = "x" * 200
+        content = "x" * 2000
         r = _make_response(content=[content])
         r.escalation_path = "http→dynamic"
-        result = _apply_chunking(r, max_chars=100)
+        result = _apply_chunking(r, max_chars=1000)
         assert result.escalation_path == "http→dynamic"
         assert result.is_truncated is True
 
     def test_truncation_preserves_retry_count(self):
-        content = "x" * 200
+        content = "x" * 2000
         r = _make_response(content=[content])
         r.retry_count = 3
-        result = _apply_chunking(r, max_chars=100)
+        result = _apply_chunking(r, max_chars=1000)
         assert result.retry_count == 3
+
+    def test_smart_merge_small_remainder(self):
+        """When remaining content < MIN_CHUNK_CHARS, merge it all into current chunk."""
+        # 1000 + 50 chars remaining. 50 < MIN_CHUNK_CHARS → merge all.
+        content = "x" * 1000 + "y" * 50
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=1000)
+        assert result.is_truncated is False  # smart merged, no truncation flag
+        assert "y" in result.content[0]  # remainder included
+        assert result.total_extracted_chars == 1050
+
+    def test_no_smart_merge_large_remainder(self):
+        """When remaining content > MIN_CHUNK_CHARS, set truncation flag."""
+        content = "x" * 1000 + "y" * 1000
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=1000)
+        assert result.is_truncated is True
+        assert result.next_offset == 1000
+        assert result.total_extracted_chars == 2000
+
+    def test_total_extracted_chars_field(self):
+        """total_extracted_chars shows total extracted text length before chunking."""
+        content = "x" * 5000
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=1000)
+        assert result.total_extracted_chars == 5000
+
+    def test_total_extracted_chars_on_no_truncation(self):
+        """total_extracted_chars is set even when content fits in one chunk."""
+        content = "short"
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=10000)
+        assert result.total_extracted_chars == 5
+        assert result.is_truncated is False
+
+    def test_total_extracted_chars_offset_beyond(self):
+        """total_extracted_chars is set even when offset goes beyond content."""
+        r = _make_response(content=["ABC"])
+        result = _apply_chunking(r, offset=10)
+        assert result.total_extracted_chars == 3
+
+    def test_truncation_message_includes_remaining(self):
+        """Truncation message tells agent exactly how much remains."""
+        content = "x" * 3000
+        r = _make_response(content=[content])
+        result = _apply_chunking(r, max_chars=1000)
+        assert "2,000 chars remaining" in result.content[0]
+        assert "3,000 extracted chars" in result.content[0]
 
 
 class TestNewResponseMetadata:
