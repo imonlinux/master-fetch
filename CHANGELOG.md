@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.5.1] - 2026-06-08
+
+### Added
+- **Pre-warm on smart_search**: Browser launches in background when the agent calls smart_search (always the first call). By the time smart_fetch runs, the browser is warm. No race condition — search is API-only, doesn't touch the browser.
+- **Browser stays alive**: Idle timeout set to 0 (keep forever). Browser sits at idle consuming minimal RAM, wakes instantly when stealthy fetch needs it, returns to idle after. No cold starts after the first search.
+
+## [3.5.0] - 2026-06-08
+
+### Changed
+- **Ripped out Phase A/B/C domain intel routing**: No more "high", "low", "none" domain levels deciding which fetcher to use. The algorithm is now dead simple: try HTTP first. If it fails, use stealthy. That's it. Every URL gets the same treatment. HTTP is fast (~1s), stealthy handles everything else. No more stale domain intel forcing sites through slow browser paths when HTTP would work fine.
+- **Removed dynamic (Playwright) tier entirely**: One browser engine (Patchright/stealthy). No second Chrome instance possible. `force_fetcher="dynamic"` now routes to stealthy — Patchright handles everything Playwright does.
+
+### Added
+- **Post-HTTP pre-warming**: After a successful HTTP fetch, the stealthy browser starts in the background. No race condition — the current call is already done. The next call that needs a browser finds it warm and ready. Zero cold-start on second fetch.
+
 ## [3.4.1] - 2026-06-08
 
 ### Fixed
