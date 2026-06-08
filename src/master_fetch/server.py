@@ -475,6 +475,7 @@ class MasterFetchServer:
         self._auto_dynamic_last_used: float = 0  # timestamp of last auto dynamic session use
         self._auto_stealthy_last_used: float = 0  # timestamp of last auto stealthy session use
         self._idle_monitor_task: Optional[Any] = None  # asyncio.Task for idle session cleanup
+        self._prewarm_triggered: bool = False  # pre-warm stealthy on first browser-using call
 
     # ─── Core helpers ─────────────────────────────────────────────
 
@@ -544,6 +545,42 @@ class MasterFetchServer:
         self._ensure_idle_monitor()
 
         return sid.session_id
+
+    async def _prewarm_stealthy(self) -> None:
+        """Pre-warm the stealthy browser in the background.
+
+        Launches Chrome before the first fetch call needs it, eliminating
+        the 3-5s cold-start penalty. Fire-and-forget — failures are silent
+        (the browser will just launch on first actual use).
+        """
+        try:
+            await self._ensure_auto_session("stealthy")
+            logger.debug("Stealthy browser pre-warmed successfully")
+        except Exception:
+            pass  # Will launch on first actual fetch
+
+    async def _close_auto_dynamic_session(self) -> None:
+        """Close the auto dynamic browser session if it exists.
+
+        Called when a stealthy auto session is created — Patchright handles
+        everything Playwright can, so keeping both is wasted memory (~100-180MB).
+
+        Safe to call even if no dynamic session exists (no-op).
+        """
+        async with self._sessions_lock:
+            dsid = self._auto_dynamic_id
+            if dsid is None:
+                return
+            self._auto_dynamic_id = None
+        # Close outside lock to avoid blocking
+        try:
+            await self.close_session(dsid)
+        except Exception as e:
+            logger.warning(f"Failed to close dynamic auto session during consolidation: {e}")
+            async with self._sessions_lock:
+                entry = self._sessions.pop(dsid, None)
+                if entry:
+                    entry._alive = False
 
     def _stealthy_auto_alive(self) -> bool:
         """Check if the auto stealthy session is alive (Patchright browser running).
@@ -1697,6 +1734,9 @@ class MasterFetchServer:
 
         else:  # stealthy
             ssid = await self._ensure_auto_session("stealthy")
+            # Stealthy handles everything dynamic does — close the dynamic
+            # auto session to free memory (~100-180MB of Chrome RAM).
+            await self._close_auto_dynamic_session()
             result = await self.stealthy_fetch(
                 url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
@@ -1726,6 +1766,9 @@ class MasterFetchServer:
         # Phase A: Domain known to need stealthy. Skip straight to it.
         if domain_level == "high":
             ssid = await self._ensure_auto_session("stealthy")
+            # Stealthy handles everything dynamic does — close any leftover
+            # dynamic auto session to free memory (~100-180MB of Chrome RAM).
+            await self._close_auto_dynamic_session()
             result = await self.stealthy_fetch(
                 url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
@@ -1794,6 +1837,9 @@ class MasterFetchServer:
             # Dynamic failed. Escalate to stealthy.
             remaining = max(timeout - int((now() - start_time) * 1000), 5000)
             ssid = await self._ensure_auto_session("stealthy")
+            # Stealthy handles everything dynamic does — close the dynamic
+            # auto session to free memory (saves ~100-180MB of Chrome RAM).
+            await self._close_auto_dynamic_session()
             result = await self.stealthy_fetch(
                 url, extraction_type=extraction_type,
                 css_selector=css_selector, main_content_only=main_content_only,
@@ -1812,7 +1858,10 @@ class MasterFetchServer:
             await record_result(url, "high", result.status < 400, elapsed)
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
-        # Phase C: Unknown domain. Try HTTP first, escalate on failure.
+        # Phase C: Unknown domain. Try HTTP first; if it fails, jump straight
+        # to stealthy. No reason to try dynamic in between — stealthy handles
+        # everything dynamic does, and trying both leaves an orphan Chrome
+        # process eating memory (~100-180MB).
         return await self._phase_c_unknown(
             url, extraction_type, css_selector, main_content_only,
             use_trafilatura, cache_ttl, offset, headless, real_chrome, wait,
@@ -1826,7 +1875,12 @@ class MasterFetchServer:
         proxy, timeout, network_idle, solve_cloudflare, block_webrtc,
         hide_canvas, extra_headers, useragent, cookies, start_time,
     ) -> ResponseModel:
-        """Phase C: Unknown domain. Try HTTP, escalate on any failure. No fancy gating."""
+        """Phase C: Unknown domain. Try HTTP, escalate directly to stealthy.
+
+        Skip dynamic (Playwright) entirely for unknown domains. Patchright handles
+        everything Playwright can, and trying both sequentially leaves an orphan
+        Chrome process eating memory. Two tiers: HTTP → Stealthy.
+        """
         errors = []
         http_cookies = _safe_cookie_dict(cookies)
 
@@ -1858,35 +1912,14 @@ class MasterFetchServer:
             result.duration_ms = elapsed
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
-        # Tier 2: Dynamic (skip if stealthy already alive — Patchright handles everything Playwright does)
+        # Tier 2: Stealthy (skip dynamic — Patchright handles everything Playwright does,
+        # and trying both sequentially wastes memory + time)
         errors.append(f"HTTP failed (status {result.status})")
         remaining = max(timeout - int((now() - start_time) * 1000), 5000)
-        _skipped_dynamic = self._stealthy_auto_alive()
-        if not _skipped_dynamic:
-            dsid = await self._ensure_auto_session("dynamic")
-            result = await self.fetch(
-                url, extraction_type=extraction_type,
-                css_selector=css_selector, main_content_only=main_content_only,
-                use_trafilatura=use_trafilatura, headless=headless,
-                real_chrome=real_chrome, wait=wait, proxy=proxy,
-                timeout=remaining, network_idle=network_idle,
-                disable_resources=True,
-                extra_headers=extra_headers, useragent=useragent, cookies=cookies,
-                session_id=dsid,
-            )
-            elapsed = (now() - start_time) * 1000
-            result.duration_ms = elapsed
-
-            if result.status < 400 and not _is_js_shell(result):
-                result.escalation_path = "http→dynamic"
-                await record_result(url, "low", True, elapsed)
-                return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
-
-            errors.append(f"Dynamic failed (status {result.status})")
-            remaining = max(timeout - int((now() - start_time) * 1000), 5000)
-
-        # Tier 3: Stealthy
         ssid = await self._ensure_auto_session("stealthy")
+        # If a dynamic auto session exists from a prior call (e.g. Phase B),
+        # close it now — stealthy handles everything. Saves ~100-180MB RAM.
+        await self._close_auto_dynamic_session()
         result = await self.stealthy_fetch(
             url, extraction_type=extraction_type,
             css_selector=css_selector, main_content_only=main_content_only,
@@ -1903,23 +1936,15 @@ class MasterFetchServer:
         result.duration_ms = elapsed
 
         if result.status < 400 and not _is_js_shell(result):
-            # Stealthy is the last tier. If it returns 200 with real content, accept it.
-            if _skipped_dynamic:
-                result.escalation_path = "http→stealthy(auto,consolidated)"
-                # Record "low" — skipped dynamic for resource consolidation,
-                # not failure. Let next auto-escalation try dynamic first.
-                await record_result(url, "low", True, elapsed)
-            else:
-                result.escalation_path = "http→dynamic→stealthy"
-                await record_result(url, "high", True, elapsed)
+            result.escalation_path = "http→stealthy"
+            await record_result(url, "high", True, elapsed)
             return await self._finalize_result(result, url, extraction_type, css_selector, cache_ttl, offset)
 
         # All tiers failed
         errors.append(f"Stealthy failed (status {result.status})")
-        _tiers = "HTTP → Stealthy (dynamic skipped)" if _skipped_dynamic else "HTTP → Dynamic → Stealthy"
         result.content = [
             f"[All fetch tiers failed for {url}]\n"
-            f"Attempted: {_tiers}\n"
+            f"Attempted: HTTP → Stealthy\n"
             f"Failures: {'; '.join(errors)}\n"
             f"Final status: {result.status}\n"
             f"\n"
@@ -1929,8 +1954,8 @@ class MasterFetchServer:
             f"- Set solve_cloudflare=True (already tried).\n"
             f"- Try with a proxy via the proxy parameter."
         ]
-        result.escalation_path = "http→stealthy(all_failed)" if _skipped_dynamic else "http→dynamic→stealthy(all_failed)"
-        result.retry_count = 2 if _skipped_dynamic else 3
+        result.escalation_path = "http→stealthy(all_failed)"
+        result.retry_count = 2
         await record_result(url, "high", False, elapsed)
         result.duration_ms = elapsed
         result.error = f"all_tiers_failed: HTTP status {result.status}"
@@ -2184,6 +2209,20 @@ class MasterFetchServer:
         - content_list for tools with mixed content (e.g. screenshot with ImageContent)
         """
         from mcp.types import TextContent, ImageContent
+
+        # Pre-warm stealthy browser on first browser-using tool call.
+        # Runs in background — browser is warm by the time a follow-up
+        # fetch or escalate starts (eliminates 3-5s cold-start penalty).
+        if not self._prewarm_triggered and name in (
+            "mcp_smart_fetch", "mcp_open_session", "mcp_screenshot"
+        ):
+            self._prewarm_triggered = True
+            try:
+                _get_scrapling()
+                import asyncio
+                asyncio.create_task(self._prewarm_stealthy())
+            except Exception:
+                pass  # Pre-warming is best-effort; fails silently
 
         options = args.get("options") or {}
 

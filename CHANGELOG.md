@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.4.0] - 2026-06-08
+
+### Fixed
+- **Double Chrome instance after auto-escalation**: When Phase B or C escalated from dynamic to stealthy, the dynamic auto session was never closed. Result: two Chrome processes (Playwright + Patchright) consuming ~300MB RAM combined. Added `_close_auto_dynamic_session()` to atomically close the dynamic session whenever a stealthy auto session is created. Patchright handles everything Playwright does — no reason to keep both.
+
+### Changed
+- **Phase C (unknown domain) skips dynamic tier**: HTTP → Stealthy directly instead of HTTP → Dynamic → Stealthy. For unknown domains, trying dynamic first wastes 3-5s launching a browser that will likely need escalation anyway, and leaves an orphan Chrome process. Cuts worst-case first-fetch latency from ~12s to ~7s.
+
+### Added
+- **Browser pre-warming**: Stealthy Chrome launches in the background on the first `smart_fetch`, `open_session`, or `screenshot` call. By the time a follow-up fetch or escalation needs it, the browser is already warm — eliminating the 3-5s cold-start penalty on subsequent calls. Fire-and-forget, fails silently.
+
 ## [3.3.1] - 2026-06-07
 
 ### Changed
