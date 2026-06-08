@@ -137,6 +137,6 @@ Install the Hound MCP server. Follow every step. Do not skip any.
 
 ---
 
-*TinyFish links are referral links. I get a small credit when you sign up. Costs you nothing.*
+*TinyFish links are referral links, I get a small credit when you sign up. Costs you nothing and helps me a bit :)*
 
 MIT
