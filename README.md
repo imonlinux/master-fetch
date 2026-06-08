@@ -53,7 +53,7 @@ Install the Hound MCP server on this machine. Follow every step. Do not skip any
 
 | Tool | Does |
 |------|------|
-| `smart_fetch` | Fetch any URL. Auto HTTP → browser → stealth escalation. Use `urls` for bulk. |
+| `smart_fetch` | Fetch any URL. HTTP first, stealthy if blocked. Use `urls` for bulk. |
 | `smart_search` | Web search via TinyFish. Free key required. |
 | `screenshot` | Full-page screenshot via open session. |
 | `open_session` / `close_session` / `list_sessions` | Browser session management. |
@@ -64,15 +64,9 @@ Install the Hound MCP server on this machine. Follow every step. Do not skip any
 
 ## How it works
 
-`smart_fetch` tries the fastest method. Escalates if blocked:
+`smart_fetch` tries HTTP first (fast, ~1s). If the site blocks HTTP or needs JavaScript, it falls back to the stealthy browser (Patchright + Cloudflare solver). Two tiers, nothing more.
 
-| Tier | Engine | Speed | Used for |
-|------|--------|-------|----------|
-| HTTP | curl_cffi (Chrome TLS) | 1-3s | Most sites |
-| Dynamic | Playwright + Chromium | 3-8s | JS-heavy pages |
-| Stealthy | Patchright + Cloudflare solver | 5-13s | Bot protection |
-
-First browser launch takes a few seconds. After that the session stays open and subsequent fetches are fast. Hound remembers which tier works per domain and caches results (SQLite, 1hr TTL).
+The browser pre-warms when you call `smart_search` — so by the time you fetch a search result, it's already ready. It stays alive at idle between calls, waking instantly when needed.
 
 Content over 40KB gets chunked with a continuation offset. Your agent can call again to get the rest, instantly from cache.
 
@@ -92,7 +86,7 @@ Hand-crafted tool definitions instead of Pydantic auto-generated schemas. No out
 
 | | Fetch pages | Anti-bot | Search | Free? |
 |---|---|---|---|---|
-| **Hound** | 3-tier auto | Cloudflare + bot walls | Yes (TinyFish) | Yes |
+| **Hound** | HTTP + stealthy | Cloudflare + bot walls | Yes (TinyFish) | Yes |
 | **Crawl4AI** | Playwright | Stealth mode (basic) | No | Yes |
 | **Firecrawl** (self) | HTTP + browser | No | Yes | API key |
 
