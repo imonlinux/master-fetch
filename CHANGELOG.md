@@ -1,5 +1,11 @@
 # Changelog
 
+## [3.3.1] - 2026-06-07
+
+### Changed
+- **smart_fetch description**: Added "USE THIS whenever you need information from the web — this is your web access" to make agents recognize it as their primary web tool, not an optional utility.
+- **smart_search description**: Added "Search finds links — descriptions are NOT enough to answer questions. ALWAYS fetch the result URL with smart_fetch for full content" to prevent agents from answering based on search snippets alone.
+
 ## [3.3.0] - 2026-06-07
 
 ### Added

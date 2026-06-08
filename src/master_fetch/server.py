@@ -2063,7 +2063,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_fetch",
-            "description": "Fetch any URL. Auto HTTP→browser→stealth escalation. Bulk: pass urls. Offset pages through EXTRACTED text (not raw HTML). If extraction produces 40KB from a 1MB page, offset can't reach beyond that 40KB. Use extraction_type=html for raw HTML. Cache: cache_ttl=0 bypasses cache. is_truncated=true + total_extracted_chars tells you exactly how much remains.",
+            "description": "Fetch any URL with full content extraction. USE THIS whenever you need information from the web — this is your web access. Auto HTTP→browser→stealth escalation. Bulk: pass urls. Offset pages through EXTRACTED text (not raw HTML). If extraction produces 40KB from a 1MB page, offset can't reach beyond that 40KB. Use extraction_type=html for raw HTML. Cache: cache_ttl=0 bypasses cache. is_truncated=true + total_extracted_chars tells you exactly how much remains.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2093,7 +2093,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Web search via TinyFish. Free key at tinyfish.ai. Results cached 5min (cache_ttl to adjust).",
+            "description": "Web search via TinyFish. Returns URLs with short descriptions. Search finds links — descriptions are NOT enough to answer questions. ALWAYS fetch the result URL with smart_fetch for full content. Free key at tinyfish.ai. Results cached 5min (cache_ttl to adjust).",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
