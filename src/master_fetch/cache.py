@@ -7,6 +7,7 @@ connection per operation.
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -67,6 +68,20 @@ async def _ensure_db(cache_dir: Path | None = None) -> Path:
                 )
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_fetched_at ON cache(fetched_at)")
+
+            # v3.5.3 schema upgrade: add content_type and total_size_bytes columns.
+            # Idempotent — ALTER TABLE raises "duplicate column" if already added.
+            # SQLite reuses the same error class as aiosqlite wraps; we catch via sqlite3.
+            for ddl in (
+                "ALTER TABLE cache ADD COLUMN content_type TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE cache ADD COLUMN total_size_bytes INTEGER NOT NULL DEFAULT 0",
+            ):
+                try:
+                    await db.execute(ddl)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
+
             await db.commit()
 
         _db_initialized[db_path] = True
@@ -102,6 +117,8 @@ async def get_cached(
             "status": row["status"],
             "content": json.loads(row["content"]),
             "url": row["url"],
+            "content_type": row["content_type"],
+            "total_size_bytes": row["total_size_bytes"],
         }
 
 
@@ -113,16 +130,25 @@ async def set_cached(
     css_selector: str | None = None,
     ttl: int = DEFAULT_TTL,
     cache_dir: Path | None = None,
+    content_type: str = "",
+    total_size_bytes: int = 0,
 ) -> None:
-    """Store a response in cache."""
+    """Store a response in cache.
+
+    v3.5.3+: content_type and total_size_bytes round-trip through cache so
+    agents preserve MIME info on hits instead of always seeing empty/0.
+    """
     key = _cache_key(url, extraction_type, css_selector)
     db_path = await _ensure_db(cache_dir)
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
-            """INSERT OR REPLACE INTO cache (key, url, extraction_type, content, status, fetched_at, ttl)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (key, url, extraction_type, json.dumps(content), status, time.time(), ttl),
+            """INSERT OR REPLACE INTO cache
+               (key, url, extraction_type, content, status, fetched_at, ttl,
+                content_type, total_size_bytes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (key, url, extraction_type, json.dumps(content), status,
+             time.time(), ttl, content_type, total_size_bytes),
         )
         await db.commit()
 

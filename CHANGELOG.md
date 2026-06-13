@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.5.3] - 2026-06-13
+
+### Fixed
+- **Cache schema upgrade**: `content_type` and `total_size_bytes` now persist through the SQLite cache (previously returned as empty string / 0 on cache hits, even though the live fetch populated them). `_ensure_db()` runs an idempotent `ALTER TABLE ADD COLUMN` migration on first access so users upgrading from 3.5.2 do not lose any cached entries — old rows get the new columns defaulted to `''` and `0`. Migration is safe to re-run; a `try/except` on `duplicate column name` makes it idempotent.
+
+### Notes
+- No behavior change for the live fetch path (HTTP/stealthy already populated these fields correctly). Cache hits and `cache_clear` descriptions are unchanged from a user-experience standpoint. New columns carry the existing `ResponseModel.content_type` / `ResponseModel.total_size_bytes` fields exactly.
+- Backwards-compatible: `set_cached(...)` accepts `content_type=""`, `total_size_bytes=0` defaults; old callers that omit the new kwargs keep working unchanged.
+
 ## [3.5.2] - 2026-06-13
 
 ### Fixed

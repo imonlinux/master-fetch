@@ -690,7 +690,12 @@ class MasterFetchServer:
         """
         result = _annotate_quality(result)
         if cache_ttl > 0 and result.status > 0:
-            await set_cached(url, extraction_type, result.content, result.status, css_selector, cache_ttl)
+            await set_cached(
+                url, extraction_type, result.content, result.status,
+                css_selector, cache_ttl,
+                content_type=result.content_type,
+                total_size_bytes=result.total_size_bytes,
+            )
         return _apply_chunking(result, offset=offset)
 
     def _validate_smart_fetch_params(
@@ -1621,6 +1626,8 @@ class MasterFetchServer:
                     url=cached["url"], status=cached["status"], content=cached["content"],
                     cached=True, fetcher_used="cache", duration_ms=0,
                     extracted_type=extraction_type,
+                    content_type=cached.get("content_type", ""),
+                    total_size_bytes=cached.get("total_size_bytes", 0),
                 ), offset=offset)
 
         # 3. Force specific fetcher
