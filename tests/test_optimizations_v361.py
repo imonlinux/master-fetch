@@ -31,6 +31,7 @@ from master_fetch.server import (
     _spawn_detached_updater,
     _looks_like_file_lock_error,
     _do_update,
+    _corrupted_install_message,
 )
 
 
@@ -425,3 +426,50 @@ class TestSelfUpdatePosix:
         assert mock_stage.called, "staging helper is consulted but no-ops on POSIX"
         assert mock_run.called, "pip must run synchronously on POSIX"
         assert "old launcher" not in out, "POSIX must not mention Windows .old cleanup"
+
+
+class TestCorruptedInstallDiagnosis:
+    """When hound-mcp metadata is missing (interrupted previous update),
+    `hound -v` must print a clear recovery message instead of 'Hound vunknown',
+    and `hound -u` must self-heal by reinstalling.
+    """
+
+    def test_corrupted_message_names_hound_mcp_not_hound(self):
+        msg = _corrupted_install_message()
+        assert "hound-mcp" in msg, "must steer users to the real package name"
+        assert "--force-reinstall" in msg
+        # The message must explicitly warn about the unrelated 'hound' package.
+        assert "NOT 'hound'" in msg or "not 'hound'" in msg.lower()
+
+    def test_version_command_diagnoses_corrupted_install(self, capsys, monkeypatch):
+        import master_fetch.server as srv_mod
+        # Simulate missing metadata: installed='unknown', latest retrievable.
+        monkeypatch.setattr(srv_mod, "_check_version",
+                           lambda: ("unknown", "3.6.4", False))
+        argv = ["hound", "-v"]
+        monkeypatch.setattr(sys, "argv", argv)
+        srv_mod.main()
+        out = capsys.readouterr().out
+        assert "corrupted" in out.lower()
+        assert "hound-mcp" in out, "recovery command must use the real package name"
+        assert "vunknown" not in out, "must not print the useless 'vunknown'"
+        assert "3.6.4" in out, "must surface the latest known version"
+
+    def test_do_update_self_heals_corrupted_install(self, monkeypatch, capsys):
+        # installed='unknown' -> _do_update should proceed to reinstall (self-heal)
+        # rather than bail out, since this binary has the working updater.
+        import master_fetch.server as srv_mod
+
+        class OkResult:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        cv = MagicMock(side_effect=[("unknown", "3.6.4", False), ("3.6.4", "3.6.4", True)])
+        with patch.object(srv_mod, "_check_version", side_effect=cv.side_effect), \
+             patch.object(srv_mod, "_stage_running_launcher", return_value=None), \
+             patch("subprocess.run", return_value=OkResult()):
+            srv_mod._do_update()
+        out = capsys.readouterr().out
+        assert "metadata is missing" in out.lower() or "reinstalling" in out.lower()
+        assert "Hound v3.6.4" in out

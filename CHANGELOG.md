@@ -1,5 +1,20 @@
 # Changelog
 
+## [3.6.4] - 2026-06-17
+
+### Fixed
+- **Self-diagnosis for a corrupted install.** If a previous `hound -u` was interrupted mid-update (WinError 32 before the fix), pip could delete the `hound-mcp` package metadata without replacing `hound.exe`, leaving the launcher orphaned. `importlib.metadata.version("hound-mcp")` then raises `PackageNotFoundError`, so `hound -v` printed the useless `Hound vunknown`. Now:
+  - `hound -v` detects the missing-metadata case and prints a clear recovery message naming the **real package** (`hound-mcp`) and the exact reinstall command, plus an explicit warning to install `hound-mcp` and **not** the unrelated `hound` PyPI package ("A FireCloud database extension", v1.0.1) that shadows our `hound` console script in search results.
+  - `hound -u` (on 3.6.3+ binaries) self-heals: when metadata is missing it prints "reinstalling to recover" and proceeds with `pip install --upgrade`, which restores both the metadata and the launcher.
+
+### Notes
+- No new features. No public API changes. 3 new tests cover the corrupted-install message content, the `hound -v` diagnosis path, and the `hound -u` self-heal path.
+- **Recovery for users already in the corrupted state on an old (<=3.6.1) binary** (whose `hound -u` is still the broken one): run pip directly once:
+  ```bash
+  pip install --force-reinstall --no-deps hound-mcp==3.6.4
+  ```
+  If you accidentally installed the wrong `hound` package, remove it first: `pip uninstall hound -y`.
+
 ## [3.6.3] - 2026-06-17
 
 ### Fixed

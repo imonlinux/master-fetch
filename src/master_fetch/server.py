@@ -2319,6 +2319,26 @@ def _spawn_detached_updater(pip_cmd: list) -> bool:
         return False
 
 
+def _corrupted_install_message() -> str:
+    """Message shown when hound-mcp package metadata is missing.
+
+    This happens when a previous `hound -u` (or a manual pip operation) was
+    interrupted mid-uninstall: pip deleted the dist-info but could not
+    overwrite hound.exe (WinError 32), leaving the launcher orphaned from its
+    package metadata. importlib.metadata then can't find the version, so
+    `hound -v` prints 'vunknown'. Tell the user exactly how to recover.
+    """
+    return (
+        "Hound install is corrupted: package metadata is missing (a previous\n"
+        "update was interrupted before it could finish). The launcher still\n"
+        "works, but pip no longer knows which version is installed. Recover with:\n"
+        "  pip install --force-reinstall --no-deps hound-mcp==<latest>\n"
+        "(find <latest> at https://pypi.org/project/hound-mcp/).\n"
+        "Also make sure you install 'hound-mcp' (the package), NOT 'hound'\n"
+        "(an unrelated PyPI package)."
+    )
+
+
 def _print_pip_failure(result) -> None:
     """Print the most useful line from a failed pip run, plus the recovery hint."""
     err = (result.stderr or "").strip() if result is not None else ""
@@ -2351,6 +2371,12 @@ def _do_update():
     """
     import subprocess
     installed, latest, is_current = _check_version()
+
+    if installed == "unknown":
+        # Metadata missing (interrupted previous update). A reinstall fixes it;
+        # since this binary already has the working updater, just proceed —
+        # pip install --upgrade will restore the metadata and the launcher.
+        print("Hound install metadata is missing; reinstalling to recover...")
 
     if not latest:
         print(f"Hound v{installed}: can't check for updates.")
@@ -2429,6 +2455,11 @@ def main():
 
     if args.version:
         installed, latest, is_current = _check_version()
+        if installed == "unknown":
+            print(_corrupted_install_message())
+            if latest:
+                print(f"  Latest known version: v{latest}")
+            return
         if latest and is_current:
             print(f"Hound v{installed} (latest)")
         elif latest:
