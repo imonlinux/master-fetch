@@ -179,19 +179,19 @@ Hound is compared only to other **free** ways to fetch a page for an agent. Free
 
 | | **Hound** | Crawl4AI | Jina Reader | Firecrawl (OSS / free tier) | DIY Playwright |
 |---|---|---|---|---|---|
-| **Price** | $0 forever | $0 (self-host) | free tier, rate-limited | $0 self-host / 1K pages free | $0 (your time) |
-| **Account / API key** | none (search: optional free key) | none | none (rate-limited) | cloud needs account + key | none |
+| **Price** | $0 forever | $0 (self-host) | free, rate-limited | $0 self-host / 1K pages free | $0 (your time) |
+| **Account / API key** | none (search: optional free key) | none | optional free key (20 RPM w/o, 200 RPM w/) | cloud needs account + key | none |
 | **Runs locally** | yes | yes | no (their API) | self-host: yes | yes |
-| **Anti-bot / Cloudflare** | built-in (Patchright) | limited | none | not by default | none |
-| **PDF → structured markdown** | yes (tables, headings, pages subset) | yes | no | yes | build it yourself |
-| **Web search** | yes (free key) | no | yes (MCP) | no | no |
+| **Anti-bot / Cloudflare** | built-in (Patchright) | limited (stealth mode) | none | not by default | none |
+| **PDF → structured markdown** | yes (tables, headings, pages subset) | partial (buggy on some PDFs) | yes (native) | yes (cloud: + OCR) | build it yourself |
+| **Web search** | yes (free key) | no | yes | no | no |
 | **Agent-optimized responses** (`content_ok`, `next_action`, `summary`) | yes | no | no | no | no |
 | **Connect-time `instructions`** | yes | no | no | no | no |
 | **MCP server** | yes (official) | community | yes (official) | yes (official) | build it |
 | **Token cost (tools/list)** | ~1.3K | varies | n/a | varies | n/a |
 | **Languages** | any (MCP) | Python only | any HTTP | Python/JS/Go/Rust/Ruby | Python |
 
-**The takeaway:** Crawl4AI is the closest free competitor (self-hosted Python), but it has no built-in anti-bot bypass, no web search, and no agent-optimized response signals. Jina Reader has no anti-bot and is single-page. Firecrawl's open-source version does not include anti-bot by default. Hound is the only free option that combines built-in Cloudflare bypass, PDF extraction, search, local execution, and a response shape designed for agents.
+**The takeaway:** Crawl4AI is the closest free competitor (self-hosted Python, local, no key), but its anti-bot is basic stealth (not robust Cloudflare bypass), it has no web search, and no agent-optimized response signals. Jina Reader is the easiest (prefix a URL) and does handle PDFs, but it has **no anti-bot**, routes everything through Jina's servers, and is single-page with a tight rate limit unless you grab a free key. Firecrawl's open-source version does not include anti-bot by default (you hit Cloudflare at scale) and the generous features live in the paid cloud. Hound is the only free option that combines **built-in Cloudflare bypass, local execution, no API key, PDF + search, and a response shape designed for agents** (every fetch returns `content_ok` / `next_action` / `summary`, and the server orients the agent at connect time).
 
 ### When a paid service makes sense
 
