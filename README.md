@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-logo.png" alt="hound" width="44"> Hound
+# 🐕 Hound
 
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-hero.png" alt="Hound - web fetch, anti-bot, PDF and search for AI agents" width="896">
 
