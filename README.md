@@ -13,7 +13,8 @@ No accounts. No Docker. No credit card. Runs on your machine.
 [![Downloads](https://img.shields.io/pypi/dm/hound-mcp.svg)](https://pypi.org/project/hound-mcp/)
 
 ```bash
-pip install hound-mcp[all] && playwright install chromium
+pip install hound-mcp[all]
+playwright install chromium (If you dont have this already)
 ```
 
 [Install](#install) · [Tools](#tools) · [Features](#features) · [How it works](#how-it-works) · [Comparison](#comparison-free-fetches) · [Honest limits](#honest-limits)
