@@ -32,7 +32,7 @@ Install the Hound MCP server on this machine. Follow every step. Do not skip any
 1. Figure out which agent harness you are running on (OpenCode, Hermes, OpenClaw, etc). Then find: (a) where the MCP config file lives, and (b) what format it expects for adding a local MCP server. Read the harness docs if needed. Do not guess.
 
 2. Run: pip install hound-mcp[all]
-   Then run: playwright install chromium
+   Then run: playwright install chromium (But only if it isnt installed already, verify first about its existence)
    If either fails, stop and tell the user.
 
 3. Find the MCP config file you identified in step 1 and back it up before editing.
@@ -112,7 +112,7 @@ Paste this into Pi:
 Install the Hound MCP server. Follow every step. Do not skip any.
 
 1. Run: pip install hound-mcp[all]
-   Then run: playwright install chromium
+   Then run: playwright install chromium (But only if it isnt installed already, verify first about its existence)
    If either fails, stop and tell the user.
 
 2. Check pi-mcp-adapter: pi list. If not installed: pi install npm:pi-mcp-adapter
