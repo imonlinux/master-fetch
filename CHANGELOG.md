@@ -1,5 +1,13 @@
 # Changelog
 
+## [4.0.2] - 2026-06-20
+
+### Fixed
+- **`hound -u` ghost-prompt overlap on Windows.** After the parent `hound.exe` exited and PowerShell reclaimed the console (printing its `PS C:\Users\...>` prompt), the detached console updater woke from its 2s wait and printed its first line (`Running pip...`) on top of the prompt, producing overlapping "ghost" text. The updater child now emits a leading newline (`chr(10)`) right after the wait, so its output starts on a fresh line below the prompt instead of overlapping it.
+
+### Notes
+- No API changes. Test added: the generated updater child source must contain the leading-newline write.
+
 ## [4.0.1] - 2026-06-20
 
 ### Fixed

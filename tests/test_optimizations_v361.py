@@ -331,6 +331,10 @@ class TestSpawnConsoleUpdater:
         assert "pip install --force-reinstall --no-deps hound-mcp==3.6.7" in src, "must embed reinstall cmd"
         assert "time.sleep(2)" in src, "must wait for the parent launcher to exit"
         assert "tasklist" in src, "must re-check for a real server after parent exit"
+        assert "sys.stdout.write(chr(10))" in src, (
+            "must emit a leading newline after the sleep to move below the shell "
+            "prompt before printing (ghost-prompt overlap bug)"
+        )
 
     def test_returns_false_on_popen_error(self):
         import subprocess as sp

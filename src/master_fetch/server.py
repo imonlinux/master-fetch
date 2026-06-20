@@ -2633,6 +2633,15 @@ def _spawn_console_updater(pip_cmd: list, target_ver: str) -> bool:
     child_src = f'''import time, subprocess, sys, os
 time.sleep(2)  # let the parent hound.exe launcher exit and release the file
 
+# By now the parent has exited and the shell has reclaimed this console,
+# printing its prompt (e.g. the PowerShell prompt). Move to a fresh line below
+# it BEFORE we print, so our output does not overlap the prompt line (the
+# "ghost prompt" bug where "Running pip..." landed on top of the prompt).
+try:
+    sys.stdout.write(chr(10)); sys.stdout.flush()
+except Exception:
+    pass
+
 def _hound_pids():
     my = os.getpid()
     try:
