@@ -41,6 +41,23 @@ def test_ocr_available_returns_bool():
     assert isinstance(HAS_OCR, bool)
 
 
+def test_all_extra_declares_ocr_deps():
+    """Regression guard: the [all] extra MUST declare every OCR/PDF dep so a real
+    `pip install hound-mcp[all]` actually delivers OCR (the 4.0.0 pdfplumber and
+    5.0.0 onnxruntime bugs were both a missing declaration masked by a
+    locally-installed dep)."""
+    from pathlib import Path
+    import re
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8")
+    # Extract the [all] block.
+    m = re.search(r"all\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    assert m, "[all] extra not found in pyproject.toml"
+    all_block = m.group(1)
+    for dep in ("pdfplumber", "pypdfium2", "rapidocr", "onnxruntime"):
+        assert dep in all_block, f"[all] extra must declare {dep!r} (OCR/PDF dep)"
+
+
 # ─── ocr_pdf ────────────────────────────────────────────────────────────
 
 @skip_if_no_ocr

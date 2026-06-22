@@ -1,6 +1,6 @@
 [project]
 name = "hound-mcp"
-version = "5.0.0"
+version = "5.0.1"
 description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever."
 readme = "README.md"
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
@@ -35,6 +35,7 @@ all = [
     "pdfplumber>=0.11.0",
     "pypdfium2>=4.30",
     "rapidocr>=3.0",
+    "onnxruntime>=1.16",
 ]
 
 [project.urls]

@@ -1,5 +1,11 @@
 # Changelog
 
+## [5.0.1] - 2026-06-22
+
+### Fixed
+- **OCR was broken for real `pip install hound-mcp[all]` users.** `rapidocr` v3 ships without an inference backend; `RapidOCR()` raised `ImportError: onnxruntime is not installed`. The `[all]` extra declared `rapidocr>=3.0` but not `onnxruntime`, so a clean install got the core package without the backend. The dev venv had onnxruntime installed manually, which masked it (same class of bug as the 4.0.0 pdfplumber miss). `[all]` now also declares `onnxruntime>=1.16`. Verified with a clean `pip install hound-mcp[all]` from PyPI: `RapidOCR()` instantiates and OCR runs.
+- Added a regression test asserting the `[all]` extra declares every OCR/PDF dep (pdfplumber, pypdfium2, rapidocr, onnxruntime) so a missing declaration fails CI instead of shipping.
+
 ## [5.0.0] - 2026-06-22
 
 The flagship release. Hound goes from a fetch+search tool to a complete $0 local web-research server for AI agents: **crawl, fetch, anti-bot, PDF/OCR, page interaction, query-focused extraction, search+research, and agent-optimized responses** in one lean MCP install (6 tools, ~2K tokens). Free alternatives stop being comparable; only paid services (Bright Data, ZenRows, Firecrawl paid) can compete, and only on hard anti-bot at scale.
