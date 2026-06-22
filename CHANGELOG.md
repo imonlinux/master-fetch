@@ -1,5 +1,44 @@
 # Changelog
 
+## [5.0.0] - 2026-06-22
+
+The flagship release. Hound goes from a fetch+search tool to a complete $0 local web-research server for AI agents: **crawl, fetch, anti-bot, PDF/OCR, page interaction, query-focused extraction, search+research, and agent-optimized responses** in one lean MCP install (6 tools, ~2K tokens). Free alternatives stop being comparable; only paid services (Bright Data, ZenRows, Firecrawl paid) can compete, and only on hard anti-bot at scale.
+
+### Added — `smart_crawl` (new tool)
+- **Deep same-domain crawl.** BFS from a start URL up to a depth/page/token budget, returns each page as clean markdown with `content_ok`/`summary`. `discover_only=true` returns the URL map. `path_include`/`path_exclude` scope it. `focus` makes it a query-prioritized crawl (most relevant pages first within the budget, each page focus-filtered). Concurrency via a semaphore; one fetch per page reusing `smart_fetch`'s anti-bot + cache.
+
+### Added — OCR (scanned PDFs + image pages)
+- Scanned/image-only PDFs are auto-OCR'd with `rapidocr` v3 + `pypdfium2` (pure-pip, no system binary, Python 3.13-supported). Image-only web pages (`content-type: image/*`) are OCR'd to text. Auto-caps at the first 10 pages when no `pages` spec to avoid hangs on huge scanned PDFs. `[all]` extra += `pypdfium2>=4.30`, `rapidocr>=3.0`.
+
+### Added — query-focused extraction (`smart_fetch` `focus`)
+- `smart_fetch(url, focus="...")` returns only the BM25-relevant blocks. Runs post-cache (one cached page serves any focus query), so it never triggers a re-fetch. 80%+ context cut on long pages. Re-pass the same `focus` when paginating.
+
+### Added — `smart_search` filters + research mode
+- Filters: `site`/`exclude_sites` (domain include/exclude via native TinyFish `site:`/`-site:` operators), `location`/`language` (geo), `page` (0-10). Cache key includes every filter.
+- **Research mode** (`fetch_content=true`): searches AND bulk-fetches the top-N high-relevance results' full content in one call (each via `smart_fetch`, so anti-bot/PDF/OCR/cache apply), returning a `ResearchResponseModel` with per-result `content_ok` + relevance. Replaces the 3-5 call search→fetch loop.
+
+### Added — page interaction (`smart_fetch` `actions`)
+- `actions=[{click},{fill},{press},{wait},{scroll},{wait_selector}]` run on the stealthy browser after load, before extraction. Reaches content behind a click, search form, "load more", or infinite scroll. Forces the stealthy tier, bypasses cache. Max 20 actions, per-action error isolation.
+
+### Added — metadata on every response
+- Every HTML fetch carries structured `metadata`: title, description, site_name, type, image, canonical, lang, published_time, author (OpenGraph + JSON-LD + canonical + `<title>`).
+
+### Added — opt-in media
+- `include_media=true` populates `response.media` with up to 20 page image URLs (for multimodal agents). Empty by default to keep responses lean.
+
+### Changed
+- Tool count 5 → 6 (`smart_crawl` added). Connect-time `instructions` teach the 4-tool mental model (fetch / crawl / search / screenshot). tools/list ~1.3K → ~2K tokens (still far under competitors' 3-5K / 12-19 tools).
+- Scanned-PDF dead-end removed: `hound-mcp[all]` now auto-OCRs instead of returning "needs OCR".
+- README overhauled: 6-tool table, feature deep-dives, hand-authored SVG pipeline + token-comparison diagrams, updated free-tools comparison (crawl/OCR/interact/research/metadata/focus rows), honest limits.
+
+### Fixed
+- `_apply_chunking` now preserves `metadata`/`media` (it previously rebuilt the ResponseModel and dropped them).
+- Removed em-dashes from all public-facing strings (tool descriptions, `instructions`, `next_action`, error/content messages, Field descriptions, `fetch_hint`) per the voice rule.
+
+### Notes
+- No breaking API changes to existing tools; `smart_fetch`/`smart_search` gain opt-in params. Full suite 528 tests pass (was 442). All features live-verified: OCR (scanned PDF + image), focus (87% reduction), search filters + research (real TinyFish), crawl (books.toscrape.com), metadata (Wikipedia), interact (quotes.toscrape.com navigation), media.
+- Deferred (future releases): conditional revalidation (ETag/304), MCP progress notifications for crawl, shadow-DOM piercing, hardened fingerprint rotation, cache-stats.
+
 ## [4.0.3] - 2026-06-20
 
 ### Added
