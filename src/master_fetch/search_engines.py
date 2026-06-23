@@ -511,6 +511,34 @@ async def peek_many(urls: list[str], *, timeout: int = 6, max_chars: int = 2000,
     return out
 
 
+async def fetch_source_for_similar(url: str, *, timeout: int = 10, max_chars: int = 4000
+                                    ) -> tuple[str, str]:
+    """Fetch a URL for find_similar: returns (title, body_text). Uses impersonated
+    HTTP (no stealthy escalation; find_similar works on the page text, and a block
+    just means we cannot seed the similarity search for that URL)."""
+    try:
+        text, _status, blocked = await _impersonated_get(url, timeout=timeout)
+    except Exception:
+        return "", ""
+    if not text or blocked:
+        return "", ""
+    title = ""
+    try:
+        soup = BeautifulSoup(text[:60000], "lxml")
+        title_el = soup.find("title")
+        if title_el:
+            title = title_el.get_text(" ", strip=True)
+    except Exception:
+        pass
+    try:
+        import trafilatura
+        body = (trafilatura.extract(text[:60000], include_comments=False,
+                                    include_tables=False) or "")
+    except Exception:
+        body = ""
+    return title, body[:max_chars]
+
+
 async def multi_search(
     query: str,
     max_results: int = 10,

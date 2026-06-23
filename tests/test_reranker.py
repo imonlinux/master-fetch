@@ -30,6 +30,12 @@ def _stub_multi(monkeypatch, results):
                          region, freshness, server):
         return results, [EngineReport("duckduckgo", ok=True)]
     monkeypatch.setattr(search_mod, "multi_search", fake_multi)
+    # Default reranker path to unavailable; neural/deep tests override below.
+    monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
+
+    async def _no_deep(q, r, peek_n=15):
+        return None
+    monkeypatch.setattr(search_mod, "deep_rerank", _no_deep)
 
 
 # ─── _validate_mode ──────────────────────────────────────────────────────────
@@ -43,8 +49,8 @@ def test_validate_mode_accepts_implemented():
 
 
 def test_validate_mode_rejects_unimplemented():
-    # find_similar (Phase 4) is not wired yet; deep is now implemented (Phase 3).
-    for bad in ("find_similar", "semantic", "magic", ""):
+    # All v7 modes (auto/keyword/neural/deep/find_similar) are now implemented.
+    for bad in ("semantic", "magic", "", "autox"):
         with pytest.raises(SecurityError):
             _validate_mode(bad)
 
@@ -148,8 +154,8 @@ def test_neural_and_keyword_cache_keys_differ(monkeypatch):
     asyncio.run(_ss(srv, "python asyncio", mode="neural", cache_ttl=60))
     types = [t for (_u, t) in store.keys()]
     assert len(set(types)) == 2
-    assert any(t.endswith(":keyword") for t in types)
-    assert any(t.endswith(":neural") for t in types)
+    assert any(":keyword:" in t for t in types)
+    assert any(":neural:" in t for t in types)
 
 
 # ─── reranker module contract (no network) ───────────────────────────────────
@@ -306,3 +312,140 @@ def test_deep_rerank_returns_none_when_no_reranker(monkeypatch):
     import master_fetch.reranker as rer
     monkeypatch.setattr(rer, "get_reranker", lambda: None)
     assert asyncio.run(rer.deep_rerank("q", [_raw("a", "https://a.com")])) is None
+
+
+# ─── Phase 4: find_similar + autoretrieval (expand) ───────────────────────────
+
+def test_validate_expand_accepts_and_rejects():
+    from master_fetch.search import _validate_expand
+    assert _validate_expand(None) == 1
+    assert _validate_expand(3) == 3
+    for bad in (0, 6, -1, True, "2"):
+        with pytest.raises(SecurityError):
+            _validate_expand(bad)
+
+
+def test_expand_query_generates_distinct_variants():
+    from master_fetch.search import _expand_query
+    out = _expand_query("transformer attention", 3)
+    assert len(out) == 3
+    assert out[0] == "transformer attention"
+    assert len(set(out)) == 3
+    assert _expand_query("x", 1) == ["x"]
+
+
+def _stub_for_expand(monkeypatch, fake_multi):
+    monkeypatch.setattr(search_mod, "multi_search", fake_multi)
+    monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
+
+    async def _no_deep(q, r, peek_n=15):
+        return None
+    monkeypatch.setattr(search_mod, "deep_rerank", _no_deep)
+
+
+def test_expand_runs_subqueries_and_merges(monkeypatch):
+    seen = []
+
+    async def fake_multi(query, max_results, *, engines, site, exclude_sites,
+                         region, freshness, server):
+        seen.append(query)
+        return [_raw(query, f"https://{abs(hash(query)) % 9999}.com", snip=query)
+                ], [EngineReport("duckduckgo", ok=True)]
+    _stub_for_expand(monkeypatch, fake_multi)
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "transformer attention", expand=3, mode="keyword", cache_ttl=0))
+    assert len(seen) == 3
+    assert seen[0] == "transformer attention"
+    assert len(set(seen)) == 3  # 3 distinct sub-query variants
+    # Results from all 3 subqueries merged (distinct URLs -> not deduped away).
+    assert resp.total_results >= 2
+
+
+def test_expand_one_is_no_expansion(monkeypatch):
+    seen = []
+
+    async def fake_multi(query, max_results, **kw):
+        seen.append(query)
+        return [_raw("a", "https://a.com")], [EngineReport("duckduckgo", ok=True)]
+    _stub_for_expand(monkeypatch, fake_multi)
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    asyncio.run(_ss(srv, "python", expand=1, mode="keyword", cache_ttl=0))
+    assert len(seen) == 1  # no expansion
+
+
+def test_find_similar_fetches_source_and_reranks_vs_source(monkeypatch):
+    candidates = [
+        _raw("A", "https://a.com", snip="asyncio event loop"),
+        _raw("B", "https://b.com", snip="transformer attention"),
+        _raw("C", "https://c.com", snip="cooking recipes"),
+    ]
+
+    async def fake_source(url):
+        return ("Asyncio Guide", "this page is about asyncio event loops in python")
+    monkeypatch.setattr(search_mod, "fetch_source_for_similar", fake_source)
+
+    async def fake_gather(query, expand, max_results, engines, site, exclude_sites,
+                          region, freshness, server):
+        return candidates, [EngineReport("duckduckgo", ok=True)]
+    monkeypatch.setattr(search_mod, "_gather", fake_gather)
+
+    class FakeRer:
+        def score(self, q, docs):
+            # q is the source page text; score favors the asyncio candidate.
+            return [0.9, 0.2, 0.1]
+    monkeypatch.setattr(search_mod, "get_reranker", lambda: FakeRer())
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "ignored", mode="find_similar",
+                           url="https://src.com/x", cache_ttl=0))
+    assert resp.rerank_mode == "find_similar"
+    assert resp.query == "https://src.com/x"  # response query is the source URL
+    assert resp.results[0].url == "https://a.com"  # asyncio candidate ranked first
+    assert "find_similar to https://src.com/x" in resp.fetch_hint
+
+
+def test_find_similar_requires_url(monkeypatch):
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "not a url", mode="find_similar", cache_ttl=0))
+    assert resp.results == []
+    assert "requires a url" in resp.error
+
+
+def test_find_similar_source_unfetchable(monkeypatch):
+    async def fake_source(url):
+        return "", ""
+    monkeypatch.setattr(search_mod, "fetch_source_for_similar", fake_source)
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "https://src.com/x", mode="find_similar", cache_ttl=0))
+    assert resp.results == []
+    assert "could not fetch" in resp.error
+
+
+def test_find_similar_falls_back_to_keyword_when_no_reranker(monkeypatch):
+    candidates = [
+        _raw("python asyncio", "https://a.com", snip="python asyncio event loop"),
+        _raw("cooking", "https://b.com", snip="food recipes"),
+    ]
+
+    async def fake_source(url):
+        return ("Python Asyncio", "python asyncio event loop content")
+    monkeypatch.setattr(search_mod, "fetch_source_for_similar", fake_source)
+
+    async def fake_gather(query, expand, max_results, engines, site, exclude_sites,
+                          region, freshness, server):
+        return candidates, [EngineReport("duckduckgo", ok=True)]
+    monkeypatch.setattr(search_mod, "_gather", fake_gather)
+    monkeypatch.setattr(search_mod, "get_reranker", lambda: None)
+    monkeypatch.setattr(search_mod, "unavailable_reason", lambda: "needs hound-mcp[all]")
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "x", mode="find_similar",
+                           url="https://src.com/x", cache_ttl=0))
+    assert resp.rerank_mode == "find_similar"
+    # BM25 on derived query "Python Asyncio" -> a.com (python asyncio) first.
+    assert resp.results[0].url == "https://a.com"
+    assert "keyword BM25" in resp.fetch_hint  # the fallback note

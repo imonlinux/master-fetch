@@ -77,6 +77,14 @@ def _stub_multi(monkeypatch, results, reports):
         return results, reports
 
     monkeypatch.setattr(search_mod, "multi_search", fake_multi)
+    # Default the reranker path to 'unavailable' so mode=auto deterministically
+    # falls back to keyword BM25 (no real model load / network in tests). Tests
+    # that want neural/deep override these after calling _stub_multi.
+    monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
+
+    async def _no_deep(q, r, peek_n=15):
+        return None
+    monkeypatch.setattr(search_mod, "deep_rerank", _no_deep)
     return captured
 
 

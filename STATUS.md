@@ -551,7 +551,30 @@ Phases (each tested + live-verified, no push until all done + Dondai approves):
       exposes real-content peeks (e.g. 'Every HTTPS connection begins with a TLS
       handshake...'). Latency ~6-11s for 8 real-page peeks (honest: real fetches
       dominate; off by default, opt-in + auto in research mode).
-- [ ] Phase 4 — find_similar + autoretrieval (expand=N) + niche multi-query.
+- [x] **Phase 4 — find_similar + autoretrieval + niche (DONE, live-verified).**
+      - `mode=find_similar` (pass `url=`): fetches the source page
+        (`fetch_source_for_similar` in search_engines.py: title + trafilatura body),
+        derives a query from the title, runs the engines, then reranks candidates
+        against the SOURCE page content with the cross-encoder (Exa find-similar,
+        local). Response `query` = the source URL; `fetch_hint` notes the derived
+        query. Falls back to keyword BM25 on the derived query (with a note) when
+        the reranker is unavailable. Returns a clear error if no url / source
+        unfetchable.
+      - `expand=N` (1-5, default 1=off): autoretrieval. `_expand_query` generates
+        N sub-query variants locally (intent suffixes + prefixes, NO external LLM),
+        `_gather` runs all variants × engines in parallel, merges + dedups. Boosts
+        recall for niche queries (the 'Exa for niche' angle). Ignored for
+        find_similar.
+      - `engines_used`/`engine_blocked` deduped (expand ran engines N times →
+        dedup to a clean list).
+      - New params on `smart_search`: `expand`, `url`. `_IMPLEMENTED_MODES` +=
+        `find_similar`. Cache key += `expand` + `cache_query` (find_similar keyed
+        on the source URL). Tests: +8 (validate_expand, _expand_query variants,
+        expand runs subqueries + merges, expand=1 no-op, find_similar fetches+
+        reranks vs source, find_similar requires url, source unfetchable, keyword
+        fallback). 599 pass. LIVE-VERIFIED: find_similar on a Wikipedia page
+        returned genuinely similar pages ranked vs its content (7.4s incl source
+        fetch); expand=3 ran 3 sub-queries across all engines in parallel.
 - [ ] Phase 5 — integration, research-mode rerank, README, clean-venv verify,
       bump 6.0.0 -> 7.0.0, publish.
 

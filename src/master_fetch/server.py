@@ -126,7 +126,7 @@ HOUND_INSTRUCTIONS = (
     "  - Behind a click/form/load-more/infinite-scroll? pass actions=[{click:'button.load-more'},{scroll:3},...] (forces the stealthy browser; runs after load, before extraction; bypasses cache).\n"
     "• smart_search(query) - find pages. Local + keyless (no API key, no account). Scrapes DuckDuckGo + Bing + Wikipedia in parallel and ranks by relevance. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low): smart_fetch the 'high' ones first (1-2), then 'med' if needed. Skip 'low'.\n"
     "  - Research mode: options={fetch_content:true} auto-fetches the top 3 results' full content in the same call (one call instead of 4). Good for quick factual answers.\n"
-    "  - Rerank: options={mode:'neural'} uses a local neural cross-encoder (needs hound-mcp[all]; auto-detects). 'deep' peeks real page content and reranks on it (research mode auto-uses deep). Default 'auto' picks neural if available else keyword BM25.\n"
+    "  - Rerank: options={mode:'neural'} uses a local neural cross-encoder (needs hound-mcp[all]; auto-detects). 'deep' peeks real page content and reranks on it (research mode auto-uses deep). mode='find_similar' + url=<a page> finds pages similar to it (fetches the source, reranks candidates vs its content). expand=N runs N sub-query variants in parallel for niche recall. Default 'auto' picks neural if available else keyword BM25.\n"
     "  - Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','wikipedia','google']}.\n"
     "• smart_crawl(url) - read a whole site/section. Best-first same-domain crawl; returns each page as markdown with content_ok + page_type (article/list/js_shell). List pages (HN/aggregators) come back as a structured link list. options: max_pages (default 10), max_depth (default 2), path_include (scope to ['/docs']), discover_only=true (URL map only), focus query (crawl relevant pages first + focus-filter), crawl_urls list (fetch a chosen subset after discover_only). Check next_action if it stopped early.\n"
     "• screenshot(url) - image capture. Multimodal agents only (content rendered as images/canvas/visual layout). Text agents: use smart_fetch instead. Session is auto-managed.\n"
@@ -2342,7 +2342,9 @@ class MasterFetchServer:
         max_results: int = 10,
         cache_ttl: int = 300,
         mode: str = "auto",
+        expand: int = 1,
         engines: Optional[List[str]] = None,
+        url: Optional[str] = None,
         site: Optional[str] = None,
         exclude_sites: Optional[List[str]] = None,
         location: Optional[str] = None,
@@ -2375,7 +2377,8 @@ class MasterFetchServer:
             from master_fetch.search import smart_search as _smart_search
             return await _smart_search(
                 self, query, max_results, cache_ttl,
-                mode=mode, engines=engines, site=site, exclude_sites=exclude_sites,
+                mode=mode, expand=expand, engines=engines, url=url,
+                site=site, exclude_sites=exclude_sites,
                 location=location, language=language, region=region,
                 page=page, freshness=freshness, fetch_content=fetch_content,
                 fetch_top=fetch_top, max_content_chars_per=max_content_chars_per,
@@ -2496,7 +2499,7 @@ class MasterFetchServer:
                 "type": "object", "required": ["query"],
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "options": {"type": "object", "description": "max_results (1-50, default 10), cache_ttl (seconds, default 300), mode (auto|keyword|neural|deep; default auto = neural rerank if hound-mcp[all]+model present else keyword BM25; deep peeks each result's real fetched page content and reranks on it - best ranking, costs N cheap peeks; research mode auto-uses deep), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google'), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), fetch_content (bool, default false: research mode, auto-fetch top results' full content in this call), fetch_top (1-5, default 3: how many to fetch in research mode), max_content_chars_per (default 8000: per-result content cap in research mode)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "max_results (1-50, default 10), cache_ttl (seconds, default 300), mode (auto|keyword|neural|deep; default auto = neural rerank if hound-mcp[all]+model present else keyword BM25; deep peeks each result's real fetched page content and reranks on it - best ranking, costs N cheap peeks; research mode auto-uses deep), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google'), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), fetch_content (bool, default false: research mode, auto-fetch top results' full content in this call), fetch_top (1-5, default 3: how many to fetch in research mode), max_content_chars_per (default 8000: per-result content cap in research mode), expand (1-5, default 1: autoretrieval sub-query count for niche recall; 1=off), url (for mode='find_similar': the source URL to find pages similar to)", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
@@ -2662,7 +2665,7 @@ class MasterFetchServer:
 
         elif name == "mcp_smart_search":
             kw = {k: v for k, v in options.items() if k in (
-                "max_results", "cache_ttl", "mode", "engines",
+                "max_results", "cache_ttl", "mode", "expand", "engines", "url",
                 "site", "exclude_sites", "location", "language", "region", "page",
                 "freshness", "fetch_content", "fetch_top", "max_content_chars_per",
             )}

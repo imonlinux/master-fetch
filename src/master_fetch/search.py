@@ -23,11 +23,14 @@ from typing import Optional, Union
 from pydantic import BaseModel, Field
 
 from master_fetch.cache import get_cached, set_cached
-from master_fetch.security import validate_search_query, redact_api_key, SecurityError
+from master_fetch.security import validate_search_query, validate_url, redact_api_key, SecurityError
 from master_fetch.search_engines import (
     RawResult, multi_search, EngineReport, DEFAULT_ENGINES, bm25_rerank,
+    merge_dedupe, fetch_source_for_similar,
 )
-from master_fetch.reranker import rerank as neural_rerank, deep_rerank, unavailable_reason
+from master_fetch.reranker import (
+    rerank as neural_rerank, deep_rerank, unavailable_reason, get_reranker,
+)
 
 logger = logging.getLogger("master-fetch.search")
 
@@ -160,15 +163,71 @@ def _validate_freshness(freshness):
 # Implemented rerank modes. deep (Phase 3) and find_similar (Phase 4) are added
 # in later phases; until then they are rejected here so the schema does not
 # advertise a mode that is not wired.
-_IMPLEMENTED_MODES = ("auto", "keyword", "neural", "deep")
+_IMPLEMENTED_MODES = ("auto", "keyword", "neural", "deep", "find_similar")
 
 
 def _validate_mode(mode):
     if mode is None:
         return "auto"
     if not isinstance(mode, str) or mode.lower() not in _IMPLEMENTED_MODES:
-        raise SecurityError(f"Invalid mode: {mode!r} (auto|keyword|neural|deep)")
+        raise SecurityError(f"Invalid mode: {mode!r} (auto|keyword|neural|deep|find_similar)")
     return mode.lower()
+
+
+def _validate_expand(expand):
+    if expand is None:
+        return 1
+    if isinstance(expand, bool) or not isinstance(expand, int) or expand < 1 or expand > 5:
+        raise SecurityError(f"Invalid expand: {expand!r} (1-5; 1 = no query expansion)")
+    return expand
+
+
+def _expand_query(query: str, n: int) -> list[str]:
+    """Local autoretrieval (no external LLM): generate up to n sub-query variants
+    by appending intent suffixes / prefixes. Boosts recall for niche queries by
+    hitting corners a single phrasing misses. n<=1 returns just the original."""
+    if n <= 1 or not query:
+        return [query]
+    q = query.strip()
+    variants = [q]
+    suffixes = [" explained", " how to", " tutorial", " example", " guide", " in depth"]
+    prefixes = ["what is ", "how does ", "why is ", "understanding "]
+    pool = [q + s for s in suffixes] + [p + q for p in prefixes]
+    for p in pool:
+        if len(variants) >= n:
+            break
+        if p not in variants:
+            variants.append(p)
+    return variants[:n]
+
+
+async def _gather(query: str, expand: int, max_results: int, engines, site,
+                  exclude_sites, region, freshness, server):
+    """Run multi_search, with autoretrieval (expand>1): run sub-query variants in
+    parallel across engines, then merge + dedup + filter. Returns (ranked, reports)."""
+    if expand <= 1:
+        return await multi_search(query, max_results, engines=engines, site=site,
+                                  exclude_sites=exclude_sites, region=region,
+                                  freshness=freshness, server=server)
+    sub_queries = _expand_query(query, expand)
+    subs = await asyncio.gather(*[
+        multi_search(sq, max_results, engines=engines, site=site,
+                     exclude_sites=exclude_sites, region=region,
+                     freshness=freshness, server=server)
+        for sq in sub_queries
+    ], return_exceptions=True)
+    all_results: list[RawResult] = []
+    all_reports: list[EngineReport] = []
+    for sub in subs:
+        if isinstance(sub, BaseException):
+            all_reports.append(EngineReport("expand", error=str(sub)[:80]))
+            continue
+        rs, reps = sub
+        all_results.extend(rs)
+        all_reports.extend(reps)
+    merged = merge_dedupe([(all_results, EngineReport("expanded"))], max_results,
+                          site=site, exclude_sites=exclude_sites)
+    return merged, all_reports
 
 
 def _rank(query: str, ranked: list[RawResult], mode: str):
@@ -218,7 +277,9 @@ async def smart_search(
     max_results: int = 10,
     cache_ttl: int = SEARCH_CACHE_TTL,
     mode: str = "auto",
+    expand: int = 1,
     engines: Optional[list[str]] = None,
+    url: Optional[str] = None,
     site: Optional[str] = None,
     exclude_sites: Optional[list[str]] = None,
     location: Optional[str] = None,
@@ -230,12 +291,18 @@ async def smart_search(
     fetch_top: int = 3,
     max_content_chars_per: int = 8000,
 ) -> Union[SearchResponseModel, ResearchResponseModel]:
-    """Search the web with hound's local keyless engine layer and return ranked results.
+    """Local keyless web search (no API key, no account). Engines (default
+    duckduckgo+bing+wikipedia, add 'google') are scraped in parallel, merged,
+    deduped, and ranked. Each result has relevance_score + fetch_relevance so the
+    agent smart_fetches the right 1-2. Research mode (fetch_content=True)
+    bulk-fetches the reranked top-N.
 
-    No API key, no account. Engines (default duckduckgo+bing+wikipedia) are
-    scraped in parallel, merged, deduped, and BM25-ranked. Each result carries
-    relevance_score + fetch_relevance so the agent smart_fetches the right 1-2.
-    Research mode (fetch_content=True) bulk-fetches the reranked top-N.
+    mode: auto (neural if [all]+model present else keyword), keyword (BM25),
+    neural (cross-encoder on snippets), deep (peek real page content, rerank on
+    it; research mode auto-uses deep), find_similar (pass url= ; fetches the
+    source page, derives a query, and reranks candidates against the source
+    content - Exa find-similar, local). expand (1-5): autoretrieval sub-query
+    count (1 = off); boosts recall for niche queries. Not used by find_similar.
     """
     t0 = time()
 
@@ -245,6 +312,7 @@ async def smart_search(
         engines = _validate_engines(engines)
         freshness = _validate_freshness(freshness)
         mode = _validate_mode(mode)
+        expand = _validate_expand(expand)
     except Exception as e:
         return SearchResponseModel(
             query=query, results=[], total_results=0,
@@ -255,11 +323,25 @@ async def smart_search(
     fetch_top = max(1, min(int(fetch_top) if not isinstance(fetch_top, bool) else 3, 5))
     max_content_chars_per = max(1000, min(int(max_content_chars_per), 50000))
     fetch_content = bool(fetch_content)
-    # Research mode auto-enables deep rerank: it already pays the full fetches, so
-    # the cheap content peek that powers deep mode is effectively free here, and
-    # the agent gets the best-ranked content fetched for it.
+    # Research mode auto-enables deep rerank (it already pays the full fetches, so
+    # the cheap content peek that powers deep mode is effectively free here).
     if fetch_content and mode == "auto":
         mode = "deep"
+
+    # find_similar: the target is a URL, not a query. Derive it early so the cache
+    # key is keyed on the source URL. expand is ignored for find_similar.
+    find_sim_url = ""
+    if mode == "find_similar":
+        cand = (url or "").strip() or (query if query.startswith("http") else "")
+        try:
+            find_sim_url = validate_url(cand) if cand else ""
+        except Exception:
+            find_sim_url = ""
+        if not find_sim_url:
+            return SearchResponseModel(
+                query=query, results=[], total_results=0,
+                duration_ms=(time() - t0) * 1000,
+                error="find_similar requires a url (pass url=, or the URL as query).")
 
     # region derives from location/language if not given (e.g. "US" -> "us-en").
     if region is None:
@@ -267,18 +349,19 @@ async def smart_search(
         lang = (language or "en").lower()
         region = f"{loc}-{lang}" if len(loc) == 2 else "us-en"
 
-    # Cache key includes max_results + every filter + engines + freshness.
+    cache_query = find_sim_url or query
     cache_type = (f"search:v2:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"
-                  f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:{freshness or ''}:{mode}")
+                  f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"
+                  f"{freshness or ''}:{mode}:{expand}:{cache_query}")
     if cache_ttl > 0:
-        cached = await get_cached(query, cache_type, None, ttl=cache_ttl)
+        cached = await get_cached(cache_query, cache_type, None, ttl=cache_ttl)
         if cached and cached.get("content"):
             try:
                 data = json.loads(cached["content"][0])
                 results_list = [SearchResult(**r) for r in data.get("results", [])]
                 if fetch_content:
                     return await _research_fetch(
-                        server, query, results_list, fetch_top, max_content_chars_per,
+                        server, cache_query, results_list, fetch_top, max_content_chars_per,
                         cache_ttl, cached=True, t0=t0, error="",
                         engines_used=data.get("engines_used", []),
                         engine_blocked=data.get("engine_blocked", []),
@@ -286,7 +369,7 @@ async def smart_search(
                         fetch_hint=compute_fetch_hint(results_list),
                     )
                 return SearchResponseModel(
-                    query=query, results=results_list,
+                    query=cache_query, results=results_list,
                     total_results=len(results_list), cached=True,
                     engines_used=data.get("engines_used", []),
                     engine_blocked=data.get("engine_blocked", []),
@@ -295,51 +378,94 @@ async def smart_search(
                     fetch_hint=compute_fetch_hint(results_list),
                 )
             except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning(f"Corrupt search cache for '{query[:50]}': {e}")
+                logger.warning(f"Corrupt search cache for '{cache_query[:50]}': {e}")
 
     # Live local search
     error = ""
     ranked: list[RawResult] = []
     reports: list[EngineReport] = []
-    try:
-        ranked, reports = await multi_search(
-            query, max_results, engines=engines, site=site,
-            exclude_sites=exclude_sites, region=region,
-            freshness=freshness, server=server,
-        )
-    except Exception as e:
-        error = redact_api_key(str(e)[:200])
-
-    engines_used = [r.name for r in reports if r.ok]
-    engine_blocked = [r.name for r in reports if r.blocked]
-    if not ranked and not error:
-        blocked_any = bool(engine_blocked)
-        error = (
-            "No results from any engine. " +
-            ("Engines were rate-limited/CAPTCHA'd; retry in a moment or rephrase. "
-             if blocked_any else "Try rephrasing the query.")
-        )
-
+    rerank_used = "keyword"
     peeks: dict[str, str] = {}
     rerank_note = ""
-    if mode == "deep":
-        dr = await deep_rerank(query, ranked)
-        if dr is not None:
-            pairs, peeks = dr
-            ranked_list = [r for r, _ in pairs]
-            scores = [s for _, s in pairs]
-            rerank_used = "deep"
+
+    if mode == "find_similar":
+        src_title, src_text = await fetch_source_for_similar(find_sim_url)
+        if not src_text:
+            return SearchResponseModel(
+                query=find_sim_url, results=[], total_results=0,
+                duration_ms=(time() - t0) * 1000,
+                error="could not fetch the source URL for find_similar (blocked or offline).")
+        derived_query = src_title or " ".join(src_text.split()[:8]) or query
+        try:
+            ranked, reports = await _gather(
+                derived_query, 1, max_results, engines, site, exclude_sites,
+                region, freshness, server,
+            )
+        except Exception as e:
+            error = redact_api_key(str(e)[:200])
+        # Rerank candidates against the SOURCE page content (Exa find-similar,
+        # local: the cross-encoder scores (source_content, candidate)).
+        rer = get_reranker()
+        if rer is not None and ranked:
+            docs = [f"{r.title} {r.snippet}" for r in ranked]
+            try:
+                scores = rer.score(src_text[:2000], docs)
+                pairs = sorted(zip(ranked, scores), key=lambda rs: (-rs[1], rs[0].position))
+                ranked_list = [r for r, _ in pairs]
+                scores = [s for _, s in pairs]
+                rerank_used = "find_similar"
+            except Exception:
+                ranked_list, scores, _, _ = _rank(derived_query, ranked, "keyword")
+                rerank_used = "find_similar"
         else:
-            # deep needs the reranker; fall back to neural (-> keyword) with a note.
-            ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, "neural")
-            rerank_note = ("deep rerank unavailable - used " + rerank_used + ". " +
-                           (unavailable_reason() or "install hound-mcp[all] and retry"))
+            ranked_list, scores, _, _ = _rank(derived_query, ranked, "keyword")
+            rerank_used = "find_similar"
+            if ranked and get_reranker() is None:
+                rerank_note = ("find_similar used keyword BM25 (neural unavailable). " +
+                               (unavailable_reason() or "install hound-mcp[all]"))
+        results_list = _build_results(cache_query, ranked_list, scores, peeks=peeks)
+        sim_note = f"find_similar to {find_sim_url} (searched: {derived_query[:60]!r})"
+        fetch_hint = compute_fetch_hint(results_list)
+        fetch_hint = (fetch_hint + " | " + sim_note) if fetch_hint else sim_note
+        if rerank_note:
+            fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note
     else:
-        ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
-    results_list = _build_results(query, ranked_list, scores, peeks=peeks)
-    fetch_hint = compute_fetch_hint(results_list)
-    if rerank_note:
-        fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note
+        try:
+            ranked, reports = await _gather(
+                query, expand, max_results, engines, site, exclude_sites,
+                region, freshness, server,
+            )
+        except Exception as e:
+            error = redact_api_key(str(e)[:200])
+
+        if not ranked and not error:
+            blocked_any = bool([r for r in reports if r.blocked])
+            error = (
+                "No results from any engine. " +
+                ("Engines were rate-limited/CAPTCHA'd; retry in a moment or rephrase. "
+                 if blocked_any else "Try rephrasing the query.")
+            )
+
+        if mode == "deep":
+            dr = await deep_rerank(query, ranked)
+            if dr is not None:
+                pairs, peeks = dr
+                ranked_list = [r for r, _ in pairs]
+                scores = [s for _, s in pairs]
+                rerank_used = "deep"
+            else:
+                ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, "neural")
+                rerank_note = ("deep rerank unavailable - used " + rerank_used + ". " +
+                               (unavailable_reason() or "install hound-mcp[all] and retry"))
+        else:
+            ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
+        results_list = _build_results(query, ranked_list, scores, peeks=peeks)
+        fetch_hint = compute_fetch_hint(results_list)
+        if rerank_note:
+            fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note
+
+    engines_used = list(dict.fromkeys(r.name for r in reports if r.ok))
+    engine_blocked = list(dict.fromkeys(r.name for r in reports if r.blocked))
 
     # Cache successful results (+ engine metadata for cache hits)
     if cache_ttl > 0 and results_list:
@@ -349,18 +475,18 @@ async def smart_search(
             "engine_blocked": engine_blocked,
             "rerank_mode": rerank_used,
         })
-        await set_cached(query, cache_type, [cache_data], 200, None, cache_ttl)
+        await set_cached(cache_query, cache_type, [cache_data], 200, None, cache_ttl)
 
     if fetch_content and results_list:
         return await _research_fetch(
-            server, query, results_list, fetch_top, max_content_chars_per,
+            server, cache_query, results_list, fetch_top, max_content_chars_per,
             cache_ttl, cached=False, t0=t0, error=error,
             engines_used=engines_used, engine_blocked=engine_blocked,
             rerank_mode=rerank_used, fetch_hint=fetch_hint,
         )
 
     return SearchResponseModel(
-        query=query, results=results_list, total_results=len(results_list),
+        query=cache_query, results=results_list, total_results=len(results_list),
         engines_used=engines_used, engine_blocked=engine_blocked,
         rerank_mode=rerank_used,
         duration_ms=(time() - t0) * 1000, error=error,
