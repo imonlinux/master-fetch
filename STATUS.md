@@ -575,8 +575,33 @@ Phases (each tested + live-verified, no push until all done + Dondai approves):
         fallback). 599 pass. LIVE-VERIFIED: find_similar on a Wikipedia page
         returned genuinely similar pages ranked vs its content (7.4s incl source
         fetch); expand=3 ran 3 sub-queries across all engines in parallel.
-- [ ] Phase 5 — integration, research-mode rerank, README, clean-venv verify,
-      bump 6.0.0 -> 7.0.0, publish.
+- [x] **Phase 5 — integration + docs + verify (DONE; NOT shipped — awaiting
+      Dondai approval before publish).** Version bumped 6.0.0 -> 7.0.0
+      (pyproject + __init__). CHANGELOG 7.0.0 entry. README rewritten: search is
+      now keyless local (TinyFish removed from every section + install blocks +
+      comparison table + the referral disclosure); new Local keyless search
+      feature section (modes keyword/neural/deep/find_similar, expand, anti-bot
+      engine scraping, honest engine-rate-limit posture); honest limits updated
+      (search engine rate-limits, neural/deep need [all]); install comments fixed
+      (lean install now HAS keyless keyword search). Clean-venv verify PASSED
+      (the v4.0.0/v5.0.0 regression class): built the 7.0.0 wheel, fresh venv,
+      `pip install hound-mcp[all]` delivered tokenizers-0.23.1 + onnxruntime-1.27.0
+      + rapidocr-3.9.0 + pypdfium2-5.10.1 + pdfplumber-0.11.10; `RapidOCR()`
+      instantiates; `get_reranker()` READY (model loads from the shared cache);
+      reranker score sanity = 1.0 (asyncio doc) vs 0.0 (pizza) for "what is
+      asyncio" (perfect discrimination); live keyword `smart_search` works in the
+      clean venv (engines DDG+Bing+Wikipedia, no dev-venv leakage). 599 tests
+      pass. **NOT pushed, NOT uploaded to PyPI, NO GitHub release — Dondai
+      approves before shipping.**
+
+### v7 status: READY FOR DONDAI REVIEW (built + tested + verified, not shipped)
+
+All 5 phases done locally on master (commits 4c24c08, bb6c030, 77e18d8,
+3a4a922, + this phase). To ship after approval: rebase (Dondai edits README on
+GitHub), push, GitHub release v7.0.0, `python -m build && twine upload`, verify
+on PyPI + CI green. The Reddit post at C:/Users/Dondai/hound-reddit-post.md
+still says "Web search takes a free TinyFish key" + has TinyFish referral lines —
+UPDATE it before posting (search is now 100% local keyless).
 
 ## Dev notes / API quirks
 
