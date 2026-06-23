@@ -178,25 +178,28 @@ class TestSearchCacheKey:
         return store
 
     @pytest.fixture(autouse=True)
-    def _api_key(self, monkeypatch):
-        monkeypatch.setenv("TINYFISH_API_KEY", "sk-tinyfish-test")
+    def _no_op(self):
+        # (TinyFish env no longer used; local search is keyless.)
+        return None
 
     @pytest.mark.asyncio
     async def test_different_max_results_do_not_collide(self, dict_cache):
         """max_results=2 and max_results=3 must use separate cache keys."""
-        from master_fetch.search import smart_search as _ss, SearchResult
+        from master_fetch.search import smart_search as _ss
+        from master_fetch.search_engines import RawResult, EngineReport
         calls = []
 
-        async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
+        async def fake_multi(query, max_results, *, engines, site, exclude_sites,
+                             region, freshness, server):
             calls.append(max_results)
             return [
-                SearchResult(title=f"t{i}", url=f"u{i}", snippet="s", source="tinyfish",
-                             position=i + 1, fetch_relevance="high")
+                RawResult(title=f"t{i}", url=f"https://u{i}.com", snippet="python asyncio",
+                          source="duckduckgo", position=i + 1)
                 for i in range(max_results)
-            ]
+            ], [EngineReport("duckduckgo", ok=True)]
 
         monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
+        monkeypatch.setattr(search_mod, "multi_search", fake_multi)
         srv = MasterFetchServer()
         try:
             await _ss(srv, "python", max_results=2, cache_ttl=60)   # live -> cache key max=2
@@ -204,10 +207,10 @@ class TestSearchCacheKey:
             await _ss(srv, "python", max_results=2, cache_ttl=60)   # same key -> cache hit
         finally:
             monkeypatch.undo()
-        # fake_tinyfish called for the first max=2 and the max=3, NOT the second max=2
+        # fake_multi called for the first max=2 and the max=3, NOT the second max=2
         assert calls == [2, 3], f"expected [2, 3], got {calls}"
-        # Both keys stored separately. The cache key now includes every filter
-        # (site/exclude/location/language/page); with none set they collapse to
-        # empty segments, so the key is search:v1:{max}::::0.
-        assert ("python", "search:v1:2:::::0") in dict_cache
-        assert ("python", "search:v1:3:::::0") in dict_cache
+        # Two distinct cache keys stored (v2 key includes max_results + filters + engines + freshness).
+        keys = [t for (_u, t) in dict_cache.keys()]
+        assert len(set(keys)) == 2
+        assert any(":2:" in k for k in keys)
+        assert any(":3:" in k for k in keys)

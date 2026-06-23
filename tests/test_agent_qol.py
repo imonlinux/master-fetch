@@ -27,7 +27,7 @@ from master_fetch.server import (
 from master_fetch.search import (
     SearchResult,
     SearchResponseModel,
-    compute_fetch_relevance,
+    _tier,
     compute_fetch_hint,
 )
 
@@ -284,26 +284,21 @@ class TestScreenshotAutoSession:
 # ─── smart_search fetch_relevance + fetch_hint ────────────────────────────
 
 class TestFetchRelevance:
-    def test_high_for_top_result_with_title_overlap(self):
-        # query terms "python" "asyncio" both in title, position 1
-        rel = compute_fetch_relevance("python asyncio guide", "Python Asyncio Guide", "snippet", 1)
-        assert rel == "high"
+    def test_tier_high_for_top_score(self):
+        assert _tier(1.0, 1, 5) == "high"  # rank 1 is always high
 
-    def test_med_for_position_le_3_with_some_overlap(self):
-        rel = compute_fetch_relevance("python web scraping", "A Python Tutorial", "snippet", 3)
-        assert rel == "med"
+    def test_tier_high_for_strong_score(self):
+        assert _tier(0.6, 3, 5) == "high"
 
-    def test_low_for_no_overlap_late_position(self):
-        rel = compute_fetch_relevance("kubernetes deployment", "Best Pizza Recipes", "yum", 8)
-        assert rel == "low"
+    def test_tier_med_for_moderate_score(self):
+        assert _tier(0.2, 4, 8) == "med"
 
-    def test_falls_back_to_position_for_stopwords_only(self):
-        rel = compute_fetch_relevance("what is the best", "Some Title", "snippet", 1)
-        assert rel in ("high", "med", "low")
-        rel1 = compute_fetch_relevance("what is the best", "Some Title", "snippet", 1)
-        rel8 = compute_fetch_relevance("what is the best", "Some Title", "snippet", 8)
-        assert rel1 != "low"  # position 1 -> high
-        assert rel8 == "low"  # position 8 -> low
+    def test_tier_top_result_never_low(self):
+        # rank 1 is high even with a zero score (it is the best we have).
+        assert _tier(0.0, 1, 5) == "high"
+
+    def test_tier_low_for_weak_score_late_rank(self):
+        assert _tier(0.0, 7, 10) == "low"
 
     def test_compute_fetch_hint_counts(self):
         results = [
@@ -324,34 +319,31 @@ class TestFetchRelevance:
     @pytest.mark.asyncio
     async def test_search_response_carries_fetch_hint_and_relevance(self):
         """End-to-end: a SearchResponseModel built by smart_search has fetch_hint
-        and every result has a fetch_relevance tier."""
+        and every result has a fetch_relevance tier (derived from BM25 score)."""
         from master_fetch.search import smart_search as _ss
+        from master_fetch.search_engines import RawResult, EngineReport
         srv = MasterFetchServer()
-        # Stub the network layer to avoid hitting TinyFish.
+        # Stub the engine layer so no real engine is hit.
         import master_fetch.search as search_mod
-        async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
+        async def fake_multi(query, max_results, *, engines, site, exclude_sites,
+                             region, freshness, server):
             return [
-                SearchResult(title="Python Asyncio Guide", url="https://a.com",
-                             snippet="snip", source="tinyfish", position=1,
-                             fetch_relevance=compute_fetch_relevance(query, "Python Asyncio Guide", "snip", 1)),
-                SearchResult(title="Unrelated Pizza Blog", url="https://b.com",
-                             snippet="yum", source="tinyfish", position=2,
-                             fetch_relevance=compute_fetch_relevance(query, "Unrelated Pizza Blog", "yum", 2)),
-            ]
-        orig = search_mod._tinyfish_search
-        search_mod._tinyfish_search = fake_tinyfish
-        # Bypass cache so the live path runs.
-        import os
-        os.environ["TINYFISH_API_KEY"] = "sk-tinyfish-test"
+                RawResult(title="Python Asyncio Guide", url="https://a.com",
+                          snippet="python asyncio tutorial", source="duckduckgo", position=1),
+                RawResult(title="Unrelated Pizza Blog", url="https://b.com",
+                          snippet="yum food recipes", source="bing", position=1),
+            ], [EngineReport("duckduckgo", ok=True), EngineReport("bing", ok=True)]
+        orig = search_mod.multi_search
+        search_mod.multi_search = fake_multi
         try:
             resp = await _ss(srv, "python asyncio", max_results=5, cache_ttl=0)
         finally:
-            search_mod._tinyfish_search = orig
-            os.environ.pop("TINYFISH_API_KEY", None)
+            search_mod.multi_search = orig
         assert resp.fetch_hint
         assert "smart_fetch" in resp.fetch_hint
         assert all(r.fetch_relevance in ("high", "med", "low") for r in resp.results)
         assert resp.results[0].fetch_relevance == "high"
+        assert resp.results[0].url == "https://a.com"
 
 
 # ─── MCP initialize instructions + tool-def schema ────────────────────────

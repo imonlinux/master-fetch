@@ -124,9 +124,9 @@ HOUND_INSTRUCTIONS = (
     "  - Cache: cache_ttl=0 forces a fresh fetch (default 1hr).\n"
     "  - Long page, one topic? pass focus='...' to get only the BM25-relevant blocks (post-cache, no re-fetch; re-pass it when paginating with offset).\n"
     "  - Behind a click/form/load-more/infinite-scroll? pass actions=[{click:'button.load-more'},{scroll:3},...] (forces the stealthy browser; runs after load, before extraction; bypasses cache).\n"
-    "• smart_search(query) - find pages. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low): smart_fetch the 'high' ones first (1-2), then 'med' if needed. Skip 'low'.\n"
+    "• smart_search(query) - find pages. Local + keyless (no API key, no account). Scrapes DuckDuckGo + Bing + Wikipedia in parallel and ranks by relevance. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low): smart_fetch the 'high' ones first (1-2), then 'med' if needed. Skip 'low'.\n"
     "  - Research mode: options={fetch_content:true} auto-fetches the top 3 results' full content in the same call (one call instead of 4). Good for quick factual answers.\n"
-    "  - Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', page:0}.\n"
+    "  - Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','wikipedia','google']}.\n"
     "• smart_crawl(url) - read a whole site/section. Best-first same-domain crawl; returns each page as markdown with content_ok + page_type (article/list/js_shell). List pages (HN/aggregators) come back as a structured link list. options: max_pages (default 10), max_depth (default 2), path_include (scope to ['/docs']), discover_only=true (URL map only), focus query (crawl relevant pages first + focus-filter), crawl_urls list (fetch a chosen subset after discover_only). Check next_action if it stopped early.\n"
     "• screenshot(url) - image capture. Multimodal agents only (content rendered as images/canvas/visual layout). Text agents: use smart_fetch instead. Session is auto-managed.\n"
     "\n"
@@ -2340,22 +2340,26 @@ class MasterFetchServer:
         query: str,
         max_results: int = 10,
         cache_ttl: int = 300,
-        api_key: str = "",
+        engines: Optional[List[str]] = None,
         site: Optional[str] = None,
         exclude_sites: Optional[List[str]] = None,
         location: Optional[str] = None,
         language: Optional[str] = None,
+        region: Optional[str] = None,
         page: int = 0,
+        freshness: Optional[str] = None,
         fetch_content: bool = False,
         fetch_top: int = 3,
         max_content_chars_per: int = 8000,
     ) -> Union[SearchResponseModel, "ResearchResponseModel"]:
-        """Search the web via TinyFish API and return structured results.
+        """Local keyless web search (no API key, no account, no third-party service).
 
-        Filters: site/exclude_sites (domain include/exclude via site: operators),
-        location/language (geo), page (0-10). Research mode (fetch_content=True)
-        auto-fetches the top-N high-relevance results' full content in this call.
-        Requires TINYFISH_API_KEY env var (free key at tinyfish.ai).
+        Scrapes DuckDuckGo + Bing + Wikipedia in parallel (engines= to choose, add
+        'google'), merges + dedups + BM25-ranks. Each result has relevance_score +
+        fetch_relevance. Research mode (fetch_content=True) bulk-fetches the
+        reranked top-N. Filters: site/exclude_sites (domain include/exclude on the
+        final URL), location/language/region (geo), page (0-10), freshness
+        (day|week|month|year). Results cached 5min.
         """
         try:
             query = validate_search_query(query)
@@ -2365,24 +2369,14 @@ class MasterFetchServer:
                 duration_ms=0, error=str(e),
             )
 
-        # Redact API key from loggable context
-        safe_api_key = api_key.strip() if api_key and isinstance(api_key, str) else ""
-
         try:
             from master_fetch.search import smart_search as _smart_search
             return await _smart_search(
-                self, query, max_results, cache_ttl, safe_api_key,
-                site=site, exclude_sites=exclude_sites, location=location,
-                language=language, page=page, fetch_content=fetch_content,
+                self, query, max_results, cache_ttl,
+                engines=engines, site=site, exclude_sites=exclude_sites,
+                location=location, language=language, region=region,
+                page=page, freshness=freshness, fetch_content=fetch_content,
                 fetch_top=fetch_top, max_content_chars_per=max_content_chars_per,
-            )
-        except ImportError as e:
-            return SearchResponseModel(
-                query=query, results=[], total_results=0,
-                error=(
-                    f"Search dependencies not installed. "
-                    f"Run: pip install hound-mcp[all] ({e})"
-                ),
             )
         except Exception as e:
             return SearchResponseModel(
@@ -2495,12 +2489,12 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Web search via TinyFish (free key). Returns URLs with titles + snippets; each result has fetch_relevance (high/med/low). NEVER answer from snippets alone: either smart_fetch the 'high' results, OR set fetch_content=true (research mode) to auto-fetch the top-N results' full content in THIS one call (saves round-trips). Filters in options: site/exclude_sites (domain include/exclude), location/language (geo), page (0-10). Results cached 5min.",
+            "description": "Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks by relevance. Each result has relevance_score + fetch_relevance (high/med/low). NEVER answer from snippets alone: either smart_fetch the 'high' results, OR set fetch_content=true (research mode) to auto-fetch the top-N results' full content in THIS one call (saves round-trips). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google' to use Google via the stealthy browser). Results cached 5min.",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "options": {"type": "object", "description": "max_results (1-50, default 10), cache_ttl (seconds, default 300), api_key, site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (2-letter country code, e.g. 'US'), language (2-letter code, e.g. 'en'), page (0-10, pagination), fetch_content (bool, default false: research mode, auto-fetch top results' full content in this call), fetch_top (1-5, default 3: how many to fetch in research mode), max_content_chars_per (default 8000: per-result content cap in research mode)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "max_results (1-50, default 10), cache_ttl (seconds, default 300), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google'), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), fetch_content (bool, default false: research mode, auto-fetch top results' full content in this call), fetch_top (1-5, default 3: how many to fetch in research mode), max_content_chars_per (default 8000: per-result content cap in research mode)", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
@@ -2666,9 +2660,9 @@ class MasterFetchServer:
 
         elif name == "mcp_smart_search":
             kw = {k: v for k, v in options.items() if k in (
-                "max_results", "cache_ttl", "api_key",
-                "site", "exclude_sites", "location", "language", "page",
-                "fetch_content", "fetch_top", "max_content_chars_per",
+                "max_results", "cache_ttl", "engines",
+                "site", "exclude_sites", "location", "language", "region", "page",
+                "freshness", "fetch_content", "fetch_top", "max_content_chars_per",
             )}
             result = await self.smart_search(query=args["query"], **kw)
             return [TextContent(type="text", text=result.model_dump_json())], result.model_dump()

@@ -525,144 +525,44 @@ class TestDispatchErrorHandling:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestSearchSecurityErrorConsistency:
-    """TinyFish API errors must raise SecurityError, not plain Exception."""
+    """Local search error contract: engine failures never crash smart_search;
+    they surface as engine_blocked + an error string on the response. Validation
+    errors (bad filters/engines/freshness) return a response with error, not raise."""
 
     @pytest.mark.asyncio
-    async def test_tinyfish_429_raises_security_error(self):
-        """Rate limiting (429) should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
+    async def test_engine_exception_surfaces_error_not_raise(self):
+        from master_fetch.search import smart_search as _ss
         import master_fetch.search as search_mod
+        srv = MasterFetchServer()
 
-        # Mock the requests.get to return 429
-        mock_resp = MagicMock()
-        mock_resp.status_code = 429
-        mock_resp.ok = False
+        async def boom(query, max_results, *, engines, site, exclude_sites,
+                       region, freshness, server):
+            raise RuntimeError("engine exploded")
 
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError, match="rate limited"):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
+        orig = search_mod.multi_search
+        search_mod.multi_search = boom
+        try:
+            resp = await _ss(srv, "query", cache_ttl=0)
+        finally:
+            search_mod.multi_search = orig
+        assert resp.results == []
+        assert resp.error and "exploded" in resp.error
 
     @pytest.mark.asyncio
-    async def test_tinyfish_401_raises_security_error(self):
-        """Invalid API key (401) should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
-        import master_fetch.search as search_mod
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 401
-        mock_resp.ok = False
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError, match="API key invalid"):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
+    async def test_bad_site_filter_returns_response_not_raise(self):
+        from master_fetch.search import smart_search as _ss
+        srv = MasterFetchServer()
+        resp = await _ss(srv, "query", cache_ttl=0, site="not a domain")
+        assert resp.results == []
+        assert resp.error  # validation SecurityError surfaced as response.error
 
     @pytest.mark.asyncio
-    async def test_tinyfish_403_raises_security_error(self):
-        """Forbidden (403) should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
-        import master_fetch.search as search_mod
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 403
-        mock_resp.ok = False
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError, match="lacks permission"):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
-
-    @pytest.mark.asyncio
-    async def test_tinyfish_500_raises_security_error(self):
-        """Other HTTP errors (500) should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
-        import master_fetch.search as search_mod
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.ok = False
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError, match="HTTP 500"):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
-
-    @pytest.mark.asyncio
-    async def test_tinyfish_invalid_json_raises_security_error(self):
-        """Invalid JSON from TinyFish should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
-        import master_fetch.search as search_mod
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.ok = True
-        mock_resp.json.side_effect = ValueError("Invalid JSON")
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError, match="invalid JSON"):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
-
-    @pytest.mark.asyncio
-    async def test_tinyfish_network_error_raises_security_error(self):
-        """Network errors from TinyFish should raise SecurityError."""
-        from master_fetch.search import _tinyfish_search, SecurityError as SErr
-        import master_fetch.search as search_mod
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.side_effect = ConnectionError("Network unreachable")
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                with pytest.raises(SecurityError):
-                    await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
-
-    @pytest.mark.asyncio
-    async def test_valid_response_does_not_raise(self):
-        """A valid 200 response with results should work fine."""
-        from master_fetch.search import _tinyfish_search
-        import master_fetch.search as search_mod
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.ok = True
-        mock_resp.json.return_value = {
-            "results": [
-                {"url": "https://example.com", "title": "Example", "snippet": "A test"}
-            ]
-        }
-
-        with patch.object(search_mod, "_get_requests") as mock_get_req:
-            mock_requests = MagicMock()
-            mock_requests.get.return_value = mock_resp
-            mock_get_req.return_value = mock_requests
-
-            with patch.object(search_mod, "_validate_api_key", return_value="sk-tinyfish-fake"):
-                results = await _tinyfish_search("test query", api_key="sk-tinyfish-fake")
-                assert len(results) == 1
-                assert results[0].url == "https://example.com"
+    async def test_bad_engine_returns_response_not_raise(self):
+        from master_fetch.search import smart_search as _ss
+        srv = MasterFetchServer()
+        resp = await _ss(srv, "query", cache_ttl=0, engines=["altavista"])
+        assert resp.results == []
+        assert resp.error
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

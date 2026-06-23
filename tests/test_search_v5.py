@@ -1,63 +1,39 @@
-"""Tests for v5 search: domain/geo filters + research mode.
-
-Mocked (no TinyFish key needed): _tinyfish_search is stubbed to return canned
-results, and server.smart_fetch is stubbed for research mode so no network
-runs. Verifies filter wiring, URL/operator building, validation, research-mode
-fetch bundling + relevance-based selection, and filter-aware cache keys.
-"""
+"""Tests for v7 local search: filter wiring, engine selection, research mode,
+cache keys, and the new agent-facing fields (relevance_score, engines_used,
+engine_blocked). The network layer (multi_search) is stubbed so no real engine
+is hit; server.smart_fetch is stubbed for research mode."""
 
 import asyncio
-import os
 
 import pytest
 
 import master_fetch.search as search_mod
 from master_fetch.search import (
     SearchResult, SearchResponseModel, ResearchResponseModel,
-    compute_fetch_relevance, _append_site_operators, _validate_filters,
+    _validate_filters, _validate_engines, _validate_freshness,
     smart_search as _ss,
 )
+from master_fetch.search_engines import RawResult, EngineReport
 from master_fetch.security import SecurityError
 
 
-@pytest.fixture(autouse=True)
-def _api_key(monkeypatch):
-    monkeypatch.setenv("TINYFISH_API_KEY", "sk-tinyfish-test")
+def _raw(title, url, src="duckduckgo", pos=1, snip="python asyncio"):
+    return RawResult(title=title, url=url, snippet=snip, source=src, position=pos)
 
 
-def _result(title, url, pos, rel="high"):
-    return SearchResult(title=title, url=url, snippet="s", source="tinyfish",
-                        position=pos, fetch_relevance=rel)
-
-
-# ─── _append_site_operators ─────────────────────────────────────────────
-
-def test_append_site_operator():
-    assert _append_site_operators("python asyncio", "docs.python.org", None) == \
-        "python asyncio site:docs.python.org"
-
-
-def test_append_exclude_operators():
-    assert _append_site_operators("python", None, ["pinterest.com", "facebook.com"]) == \
-        "python -site:pinterest.com -site:facebook.com"
-
-
-def test_append_none_unchanged():
-    assert _append_site_operators("python", None, None) == "python"
-
-
-# ─── _validate_filters ──────────────────────────────────────────────────
+# ─── validation ──────────────────────────────────────────────────────────────
 
 def test_validate_filters_accepts_valid():
     _validate_filters("docs.python.org", ["x.com"], "US", "en", 0)
-    _validate_filters(None, None, None, None, None)  # all-None is valid
+    _validate_filters(None, None, None, None, None)
+    _validate_filters("docs.python.org", ["x.com"], "us-en", "en", 0)  # region-style location
 
 
 @pytest.mark.parametrize("bad", [
-    {"site": "no dot"},          # not a domain
-    {"site": "a b.com"},         # spaces
-    {"location": "usa"},         # not 2-letter upper
-    {"language": "EN"},          # not 2-letter lower
+    {"site": "no dot"},
+    {"site": "a b.com"},
+    {"location": "usa"},
+    {"language": "EN"},
     {"page": -1}, {"page": 11}, {"page": "x"},
     {"exclude_sites": "notalist"},
 ])
@@ -67,138 +43,213 @@ def test_validate_filters_rejects_bad(bad):
                           bad.get("location"), bad.get("language"), bad.get("page"))
 
 
-# ─── _tinyfish_search builds filtered URL ───────────────────────────────
-
-class _FakeResp:
-    ok = True
-    status_code = 200
-    def json(self): return {"results": [
-        {"title": "T", "url": "https://x.com", "snippet": "s"}]}
-class _FakeRequests:
-    def __init__(self): self.captured_url = None
-    def get(self, url, headers=None, timeout=None):
-        self.captured_url = url
-        return _FakeResp()
-
-def test_tinyfish_url_carries_filters(monkeypatch):
-    fr = _FakeRequests()
-    monkeypatch.setattr(search_mod, "_get_requests", lambda: fr)
-    monkeypatch.setattr(search_mod, "_validate_api_key", lambda k: "sk-tinyfish-test")
-    async def run():
-        return await search_mod._tinyfish_search(
-            "python", 5, "sk-tinyfish-test",
-            site="docs.python.org", exclude_sites=["pinterest.com"],
-            location="GB", language="fr", page=2,
-        )
-    asyncio.run(run())
-    url = fr.captured_url
-    assert "site%3Adocs.python.org" in url or "site:docs.python.org" in url
-    assert "-site%3Apinterest.com" in url or "-site:pinterest.com" in url
-    assert "location=GB" in url
-    assert "language=fr" in url
-    assert "page=2" in url
+def test_validate_engines_lowercases_and_accepts():
+    assert _validate_engines(["DuckDuckGo", "Bing"]) == ["duckduckgo", "bing"]
+    assert _validate_engines(None) is None
 
 
-# ─── smart_search passes filters through ────────────────────────────────
+def test_validate_engines_rejects_unknown():
+    with pytest.raises(SecurityError):
+        _validate_engines(["altavista"])
+    with pytest.raises(SecurityError):
+        _validate_engines([])
 
-def test_smart_search_passes_filters_to_tinyfish(monkeypatch):
+
+def test_validate_freshness_accepts():
+    assert _validate_freshness("day") == "day"
+    assert _validate_freshness(None) is None
+
+
+def test_validate_freshness_rejects():
+    with pytest.raises(SecurityError):
+        _validate_freshness("hour")
+
+
+# ─── smart_search builds agent-facing fields ─────────────────────────────────
+
+def _stub_multi(monkeypatch, results, reports):
     captured = {}
-    async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
-        captured.update(kwargs)
-        return [_result("T", "https://x.com", 1)]
-    monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
+
+    async def fake_multi(query, max_results, *, engines, site, exclude_sites,
+                         region, freshness, server):
+        captured.update(engines=engines, site=site, exclude_sites=exclude_sites,
+                        region=region, freshness=freshness)
+        return results, reports
+
+    monkeypatch.setattr(search_mod, "multi_search", fake_multi)
+    return captured
+
+
+def test_smart_search_builds_relevance_score_and_tiers(monkeypatch):
+    results = [
+        _raw("python asyncio guide", "https://b.com", "duckduckgo", 1, "asyncio event loop python"),
+        _raw("cooking recipes", "https://a.com", "bing", 1, "food recipes cooking"),
+    ]
+    reports = [EngineReport("duckduckgo", ok=True), EngineReport("bing", ok=True)]
+    cap = _stub_multi(monkeypatch, results, reports)
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "python asyncio", max_results=5, cache_ttl=0))
+    assert isinstance(resp, SearchResponseModel)
+    assert resp.engines_used == ["duckduckgo", "bing"]
+    assert resp.engine_blocked == []
+    assert resp.rerank_mode == "keyword"
+    # BM25 ranks the python/asyncio doc first; its score is normalized to 1.0.
+    assert resp.results[0].url == "https://b.com"
+    assert resp.results[0].relevance_score == 1.0
+    assert resp.results[0].fetch_relevance == "high"
+    assert resp.fetch_hint.startswith("1 high") or "high" in resp.fetch_hint
+
+
+def test_smart_search_passes_filters_and_engines_to_multi(monkeypatch):
+    results = [_raw("t", "https://x.com", "duckduckgo", 1)]
+    reports = [EngineReport("duckduckgo", ok=True)]
+    cap = _stub_multi(monkeypatch, results, reports)
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     asyncio.run(_ss(srv, "python", max_results=5, cache_ttl=0,
-                    site="docs.python.org", location="GB", language="fr", page=1))
-    assert captured["site"] == "docs.python.org"
-    assert captured["location"] == "GB"
-    assert captured["language"] == "fr"
-    assert captured["page"] == 1
+                    engines=["duckduckgo", "google"], site="docs.python.org",
+                    exclude_sites=["pinterest.com"], location="GB",
+                    language="fr", freshness="week", page=1))
+    assert cap["engines"] == ["duckduckgo", "google"]
+    assert cap["site"] == "docs.python.org"
+    assert cap["exclude_sites"] == ["pinterest.com"]
+    assert cap["region"] == "gb-fr"  # derived from location GB + language fr
+    assert cap["freshness"] == "week"
 
 
-# ─── Research mode ──────────────────────────────────────────────────────
-
-def test_research_mode_fetches_top_results(monkeypatch):
-    """fetch_content=True returns a ResearchResponseModel with the top-N results'
-    content attached, picked by relevance (high first)."""
-    async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
-        return [
-            _result("High match A", "https://a.com", 1, "high"),
-            _result("Low match B", "https://b.com", 2, "low"),
-            _result("Med match C", "https://c.com", 3, "med"),
-        ]
-    monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
-
+def test_smart_search_surfaces_engine_blocked_and_error_when_all_empty(monkeypatch):
+    results = []
+    reports = [EngineReport("duckduckgo", blocked=True, error="captcha"),
+               EngineReport("bing", blocked=True, error="captcha")]
+    _stub_multi(monkeypatch, results, reports)
     from master_fetch.server import MasterFetchServer
-    from master_fetch.server import ResponseModel
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "obscure query", cache_ttl=0))
+    assert resp.results == []
+    assert resp.engine_blocked == ["duckduckgo", "bing"]
+    assert resp.error and "rate-limited" in resp.error.lower()
+
+
+# ─── research mode ───────────────────────────────────────────────────────────
+
+def test_research_mode_fetches_top_by_tier(monkeypatch):
+    # Two high-relevance + one low; fetch_top=2 -> the two highs are fetched.
+    results = [
+        _raw("High A", "https://a.com", "duckduckgo", 1, "python asyncio"),
+        _raw("High B", "https://b.com", "bing", 1, "python asyncio"),
+        _raw("Low C", "https://c.com", "wikipedia", 1, "unrelated cooking"),
+    ]
+    reports = [EngineReport("duckduckgo", ok=True), EngineReport("bing", ok=True),
+               EngineReport("wikipedia", ok=True)]
+    _stub_multi(monkeypatch, results, reports)
+    from master_fetch.server import MasterFetchServer, ResponseModel
     srv = MasterFetchServer()
     fetched = []
+
     async def fake_smart_fetch(url, cache_ttl=3600, max_content_chars=8000, **kw):
         fetched.append(url)
         return ResponseModel(status=200, content=[f"content for {url}"],
                              url=url, content_ok=True, summary="200 OK")
-    srv.smart_fetch = fake_smart_fetch  # type: ignore
 
-    resp = asyncio.run(_ss(srv, "query", max_results=10, cache_ttl=0,
+    srv.smart_fetch = fake_smart_fetch  # type: ignore
+    resp = asyncio.run(_ss(srv, "python asyncio", cache_ttl=0,
                            fetch_content=True, fetch_top=2))
     assert isinstance(resp, ResearchResponseModel)
     assert resp.fetched_count == 2
-    # Relevance ordering: high first, then med (low skipped because fetch_top=2).
-    assert [r.url for r in resp.results] == ["https://a.com", "https://c.com"]
+    assert set(r.url for r in resp.results) == {"https://a.com", "https://b.com"}
     assert all(r.content_ok for r in resp.results)
-    assert all(r.content for r in resp.results)
     assert resp.summary
-    # fetch_top caps at 5
-    assert resp.total_results == 3
 
 
 def test_research_mode_caps_fetch_top_at_5(monkeypatch):
-    async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
-        return [_result(f"t{i}", f"https://x{i}.com", i + 1, "high") for i in range(8)]
-    monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
+    results = [_raw(f"t{i}", f"https://x{i}.com", "duckduckgo", 1, "python asyncio") for i in range(8)]
+    reports = [EngineReport("duckduckgo", ok=True)]
+    _stub_multi(monkeypatch, results, reports)
     from master_fetch.server import MasterFetchServer, ResponseModel
     srv = MasterFetchServer()
+
     async def fake_smart_fetch(url, cache_ttl=3600, max_content_chars=8000, **kw):
         return ResponseModel(status=200, content=["c"], url=url, content_ok=True, summary="ok")
+
     srv.smart_fetch = fake_smart_fetch  # type: ignore
-    resp = asyncio.run(_ss(srv, "q", cache_ttl=0, fetch_content=True, fetch_top=99))
-    assert resp.fetched_count == 5  # capped
+    resp = asyncio.run(_ss(srv, "python asyncio", cache_ttl=0, fetch_content=True, fetch_top=99))
+    assert resp.fetched_count == 5
 
 
 def test_research_mode_fetch_failure_sets_content_ok_false(monkeypatch):
-    async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
-        return [_result("t", "https://x.com", 1, "high")]
-    monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
+    results = [_raw("t", "https://x.com", "duckduckgo", 1, "python asyncio")]
+    reports = [EngineReport("duckduckgo", ok=True)]
+    _stub_multi(monkeypatch, results, reports)
     from master_fetch.server import MasterFetchServer, ResponseModel
     srv = MasterFetchServer()
+
     async def fake_smart_fetch(url, cache_ttl=3600, max_content_chars=8000, **kw):
         return ResponseModel(status=0, content=["[blocked]"], url=url, content_ok=False, error="blocked")
+
     srv.smart_fetch = fake_smart_fetch  # type: ignore
-    resp = asyncio.run(_ss(srv, "q", cache_ttl=0, fetch_content=True, fetch_top=1))
+    resp = asyncio.run(_ss(srv, "python asyncio", cache_ttl=0, fetch_content=True, fetch_top=1))
     assert resp.results[0].content_ok is False
     assert resp.results[0].fetch_error == "blocked"
 
 
-# ─── Filter-aware cache key ─────────────────────────────────────────────
+# ─── filter + engine + freshness aware cache key ─────────────────────────────
 
-def test_filtered_and_unfiltered_search_do_not_collide(monkeypatch):
-    keys = []
-    async def fake_tinyfish(query, max_results=10, api_key="", **kwargs):
-        return [_result("t", "https://x.com", 1)]
-    monkeypatch.setattr(search_mod, "_tinyfish_search", fake_tinyfish)
+def test_cache_keys_differ_by_engine_and_freshness(monkeypatch):
+    results = [_raw("t", "https://x.com", "duckduckgo", 1)]
+    reports = [EngineReport("duckduckgo", ok=True)]
+    _stub_multi(monkeypatch, results, reports)
     store = {}
+
     async def mock_get(url, etype, css=None, ttl=300, cache_dir=None, **kw):
         return None
+
     async def mock_set(url, etype, content, status, css=None, ttl=300, cache_dir=None, **kw):
         store[(url, etype)] = True
+
     monkeypatch.setattr(search_mod, "get_cached", mock_get)
     monkeypatch.setattr(search_mod, "set_cached", mock_set)
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     asyncio.run(_ss(srv, "python", cache_ttl=60))
+    asyncio.run(_ss(srv, "python", cache_ttl=60, engines=["google"]))
+    asyncio.run(_ss(srv, "python", cache_ttl=60, freshness="day"))
     asyncio.run(_ss(srv, "python", cache_ttl=60, site="docs.python.org"))
     types = [t for (_u, t) in store.keys()]
-    assert any("docs.python.org" in t for t in types)
-    assert any("docs.python.org" not in t for t in types)
-    assert len(set(types)) == 2  # two distinct cache keys
+    assert len(set(types)) == 4  # four distinct cache keys
+
+
+def test_cache_hit_returns_results_without_calling_multi(monkeypatch):
+    # multi_search must NOT be called on a cache hit.
+    called = {"n": 0}
+
+    async def fake_multi(*a, **k):
+        called["n"] += 1
+        return [], []
+
+    monkeypatch.setattr(search_mod, "multi_search", fake_multi)
+
+    cached_payload = {
+        "results": [SearchResult(title="T", url="https://x.com", snippet="s",
+                                 source="duckduckgo", position=1,
+                                 relevance_score=1.0, fetch_relevance="high").model_dump()],
+        "engines_used": ["duckduckgo"], "engine_blocked": [],
+        "rerank_mode": "keyword",
+    }
+    import json
+
+    async def mock_get(url, etype, css=None, ttl=300, cache_dir=None, **kw):
+        return {"content": [json.dumps(cached_payload)]}
+
+    async def mock_set(*a, **k):
+        return None
+
+    monkeypatch.setattr(search_mod, "get_cached", mock_get)
+    monkeypatch.setattr(search_mod, "set_cached", mock_set)
+    from master_fetch.server import MasterFetchServer
+    srv = MasterFetchServer()
+    resp = asyncio.run(_ss(srv, "python", cache_ttl=60))
+    assert called["n"] == 0
+    assert resp.cached is True
+    assert resp.results[0].url == "https://x.com"
+    assert resp.engines_used == ["duckduckgo"]
