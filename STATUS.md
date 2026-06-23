@@ -507,8 +507,30 @@ Phases (each tested + live-verified, no push until all done + Dondai approves):
     generic Rust low), full server.smart_search path works, engines_used/
     engine_blocked/fetch_hint correct. Bing title spacing fixed (h2 has nested
     spans -> use get_text(" ", strip=True)).
-- [ ] Phase 2 — neural rerank (mode=neural): ONNX ms-marco-MiniLM-L-6-v2 on the
-      already-shipped onnxruntime + `tokenizers` dep + model download-on-first-use.
+- [x] **Phase 2 — neural rerank (DONE, live-verified).** New module
+      `src/master_fetch/reranker.py`: ONNX `cross-encoder/ms-marco-MiniLM-L-6-v2`
+      (Apache-2.0, 22.7M params, MS MARCO passage reranking) on the onnxruntime
+      we ALREADY ship for OCR. Model + tokenizer downloaded ONCE on first neural
+      search into `~/.master_fetch_cache/models/msmarco-minilm-l6-v2/` (pinned to
+      HF rev `c5ee24cb16...`, sha256 sidecar, ~80MB, NOT bundled in the wheel).
+      `tokenizers>=0.20` added to `[all]` (the only new optional dep; onnxruntime
+      reused). `get_reranker()` is a warm singleton that NEVER raises — returns
+      None if onnxruntime/tokenizers missing (lean install) or download/load
+      fails, and the caller falls back to BM25. `smart_search` gained a `mode`
+      param (auto|keyword|neural; deep/find_similar rejected until their phases).
+      `mode=auto` uses neural if available else keyword; `mode=neural` falls back
+      to keyword with a note in `fetch_hint` if unavailable. New helper `_rank`.
+      Cache key includes `mode` (neural vs keyword don't collide). `rerank_mode`
+      on the response reflects what ran. Tests: `tests/test_reranker.py` (11:
+      mode validation, neural-when-available, graceful fallback + note, keyword-
+      never-calls-neural, auto-detect, mode-aware cache key, reranker contract +
+      deps-missing). `[all]` regression test extended to `tokenizers`. 584 pass.
+      LIVE-VERIFIED: model downloaded + cached, ONNX session loads, `mode=neural`
+      reorders results vs keyword end-to-end through `server.smart_search`.
+      Note: ms-marco-MiniLM sigmoid saturates (~1.0) for clearly-relevant
+      snippets, so fine discrimination among top snippet-results is weak —
+      Phase 3 deep mode reranks on full page content (richer signal) where it
+      discriminates better.
 - [ ] Phase 3 — deep content-aware rerank (mode=deep): peek top-N candidates'
       real content via HTTP, rerank on (query, page_peek). The flagship.
 - [ ] Phase 4 — find_similar + autoretrieval (expand=N) + niche multi-query.

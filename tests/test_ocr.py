@@ -54,8 +54,8 @@ def test_all_extra_declares_ocr_deps():
     m = re.search(r"all\s*=\s*\[(.*?)\]", text, re.DOTALL)
     assert m, "[all] extra not found in pyproject.toml"
     all_block = m.group(1)
-    for dep in ("pdfplumber", "pypdfium2", "rapidocr", "onnxruntime"):
-        assert dep in all_block, f"[all] extra must declare {dep!r} (OCR/PDF dep)"
+    for dep in ("pdfplumber", "pypdfium2", "rapidocr", "onnxruntime", "tokenizers"):
+        assert dep in all_block, f"[all] extra must declare {dep!r} (OCR/PDF/search dep)"
 
 
 # ─── ocr_pdf ────────────────────────────────────────────────────────────

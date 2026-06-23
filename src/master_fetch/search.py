@@ -27,6 +27,7 @@ from master_fetch.security import validate_search_query, redact_api_key, Securit
 from master_fetch.search_engines import (
     RawResult, multi_search, EngineReport, DEFAULT_ENGINES, bm25_rerank,
 )
+from master_fetch.reranker import rerank as neural_rerank, unavailable_reason
 
 logger = logging.getLogger("master-fetch.search")
 
@@ -155,6 +156,39 @@ def _validate_freshness(freshness):
     return freshness
 
 
+# Implemented rerank modes. deep (Phase 3) and find_similar (Phase 4) are added
+# in later phases; until then they are rejected here so the schema does not
+# advertise a mode that is not wired.
+_IMPLEMENTED_MODES = ("auto", "keyword", "neural")
+
+
+def _validate_mode(mode):
+    if mode is None:
+        return "auto"
+    if not isinstance(mode, str) or mode.lower() not in _IMPLEMENTED_MODES:
+        raise SecurityError(f"Invalid mode: {mode!r} (auto|keyword|neural)")
+    return mode.lower()
+
+
+def _rank(query: str, ranked: list[RawResult], mode: str):
+    """Apply the chosen rerank. Returns (ranked_list, scores, mode_used, note).
+
+    mode='auto' uses neural if the reranker is available (hound-mcp[all] + model
+    downloaded), else keyword BM25. mode='neural' tries neural and falls back to
+    keyword with a note if unavailable. mode='keyword' is always BM25.
+    """
+    note = ""
+    if mode in ("neural", "auto"):
+        pairs = neural_rerank(query, ranked)
+        if pairs is not None:
+            return [r for r, _ in pairs], [s for _, s in pairs], "neural", note
+        if mode == "neural":
+            note = ("neural rerank unavailable - used keyword. " +
+                    (unavailable_reason() or "install hound-mcp[all] and retry"))
+    scored = bm25_rerank(query, ranked)
+    return [r for r, _ in scored], [s for _, s in scored], "keyword", note
+
+
 def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None
                    ) -> list[SearchResult]:
     """Convert RawResults (already ranked) into SearchResults with tiers."""
@@ -177,6 +211,7 @@ async def smart_search(
     query: str,
     max_results: int = 10,
     cache_ttl: int = SEARCH_CACHE_TTL,
+    mode: str = "auto",
     engines: Optional[list[str]] = None,
     site: Optional[str] = None,
     exclude_sites: Optional[list[str]] = None,
@@ -203,6 +238,7 @@ async def smart_search(
         _validate_filters(site, exclude_sites, location, language, page)
         engines = _validate_engines(engines)
         freshness = _validate_freshness(freshness)
+        mode = _validate_mode(mode)
     except Exception as e:
         return SearchResponseModel(
             query=query, results=[], total_results=0,
@@ -221,7 +257,7 @@ async def smart_search(
 
     # Cache key includes max_results + every filter + engines + freshness.
     cache_type = (f"search:v2:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"
-                  f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:{freshness or ''}")
+                  f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:{freshness or ''}:{mode}")
     if cache_ttl > 0:
         cached = await get_cached(query, cache_type, None, ttl=cache_ttl)
         if cached and cached.get("content"):
@@ -234,6 +270,8 @@ async def smart_search(
                         cache_ttl, cached=True, t0=t0, error="",
                         engines_used=data.get("engines_used", []),
                         engine_blocked=data.get("engine_blocked", []),
+                        rerank_mode=data.get("rerank_mode", "keyword"),
+                        fetch_hint=compute_fetch_hint(results_list),
                     )
                 return SearchResponseModel(
                     query=query, results=results_list,
@@ -270,8 +308,11 @@ async def smart_search(
              if blocked_any else "Try rephrasing the query.")
         )
 
-    scored = bm25_rerank(query, ranked)
-    results_list = _build_results(query, [r for r, _ in scored], [s for _, s in scored])
+    ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
+    results_list = _build_results(query, ranked_list, scores)
+    fetch_hint = compute_fetch_hint(results_list)
+    if rerank_note:
+        fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note
 
     # Cache successful results (+ engine metadata for cache hits)
     if cache_ttl > 0 and results_list:
@@ -279,7 +320,7 @@ async def smart_search(
             "results": [r.model_dump() for r in results_list],
             "engines_used": engines_used,
             "engine_blocked": engine_blocked,
-            "rerank_mode": "keyword",
+            "rerank_mode": rerank_used,
         })
         await set_cached(query, cache_type, [cache_data], 200, None, cache_ttl)
 
@@ -288,14 +329,15 @@ async def smart_search(
             server, query, results_list, fetch_top, max_content_chars_per,
             cache_ttl, cached=False, t0=t0, error=error,
             engines_used=engines_used, engine_blocked=engine_blocked,
+            rerank_mode=rerank_used, fetch_hint=fetch_hint,
         )
 
     return SearchResponseModel(
         query=query, results=results_list, total_results=len(results_list),
         engines_used=engines_used, engine_blocked=engine_blocked,
-        rerank_mode="keyword",
+        rerank_mode=rerank_used,
         duration_ms=(time() - t0) * 1000, error=error,
-        fetch_hint=compute_fetch_hint(results_list),
+        fetch_hint=fetch_hint,
     )
 
 
@@ -304,6 +346,7 @@ async def _research_fetch(
     fetch_top: int, max_content_chars_per: int, cache_ttl: int,
     cached: bool, t0: float, error: str,
     engines_used: list[str], engine_blocked: list[str],
+    rerank_mode: str = "keyword", fetch_hint: str = "",
 ) -> ResearchResponseModel:
     """Research mode: bulk-fetch the top-N high-relevance results' content."""
     rank = {"high": 3, "med": 2, "low": 1, "": 0}
@@ -343,7 +386,7 @@ async def _research_fetch(
         query=query, results=fetched, total_results=len(results),
         fetched_count=len(fetched), cached=cached,
         engines_used=engines_used, engine_blocked=engine_blocked,
-        rerank_mode="keyword",
+        rerank_mode=rerank_mode,
         duration_ms=(time() - t0) * 1000, error=error,
-        fetch_hint=compute_fetch_hint(results), summary=summary,
+        fetch_hint=fetch_hint or compute_fetch_hint(results), summary=summary,
     )

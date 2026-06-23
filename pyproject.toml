@@ -36,6 +36,7 @@ all = [
     "pypdfium2>=4.30",
     "rapidocr>=3.0",
     "onnxruntime>=1.16",
+    "tokenizers>=0.20",
 ]
 
 [project.urls]
