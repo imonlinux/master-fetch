@@ -469,6 +469,48 @@ def bm25_rerank(query: str, results: list[RawResult], *, k1: float = 1.5, b: flo
     return scored
 
 
+async def peek_content(url: str, *, timeout: int = 6, max_chars: int = 2000) -> str:
+    """Cheap HTTP peek: fetch a URL (browser-impersonated, no stealthy escalation
+    so it stays fast) and return a short trafilatura text extract of its real
+    content. Returns '' on any failure / block so the deep-rerank caller falls
+    back to the engine snippet for that result. This is the Phase 3 'live content
+    peek' that lets hound rerank on ACTUAL page text, not just engine snippets."""
+    try:
+        text, _status, blocked = await _impersonated_get(url, timeout=timeout)
+    except Exception:
+        return ""
+    if not text or blocked:
+        return ""
+    try:
+        import trafilatura
+        extracted = (trafilatura.extract(text[:60000], include_comments=False,
+                                          include_tables=False) or "")
+    except Exception:
+        extracted = ""
+    return extracted[:max_chars]
+
+
+async def peek_many(urls: list[str], *, timeout: int = 6, max_chars: int = 2000,
+                    concurrency: int = 8) -> dict[str, str]:
+    """Peek many URLs in parallel (bounded). Returns {url: peek_text} (failed
+    peeks are omitted so the caller falls back to snippets for those URLs)."""
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(u):
+        async with sem:
+            return u, await peek_content(u, timeout=timeout, max_chars=max_chars)
+
+    pairs = await asyncio.gather(*[_one(u) for u in urls], return_exceptions=True)
+    out: dict[str, str] = {}
+    for p in pairs:
+        if isinstance(p, BaseException):
+            continue
+        u, txt = p
+        if txt:
+            out[u] = txt
+    return out
+
+
 async def multi_search(
     query: str,
     max_results: int = 10,
