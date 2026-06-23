@@ -1,15 +1,15 @@
 """Hound local web search (v7 flagship: keyless, no-account, fully local).
 
 Scrapes public search engines (DuckDuckGo, Bing, Google, Wikipedia) via the
-hound-native engine layer in search_engines.py — no third-party API, no key, no
+hound-native engine layer in search_engines.py - no third-party API, no key, no
 account. Results are merged across engines, deduped by normalized URL, and
 ranked by BM25 over (title + snippet). Every result carries a relevance_score
 and a fetch_relevance tier so the agent fetches the right 1-2 URLs via
 smart_fetch. Research mode (fetch_content=True) bulk-fetches the reranked top-N.
 
-Phase 1 (this file): keyword BM25 rerank over engine snippets. Neural rerank
-(mode=neural) and content-aware deep rerank (mode=deep) arrive in later phases
-on the same onnxruntime we already ship for OCR.
+Rerank modes: keyword (BM25, always available, even on the lean install), neural
+(local ONNX cross-encoder on snippets, needs [all]), find_similar (pass url=,
+find pages similar to it). Research mode bulk-fetches the reranked top-N.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from master_fetch.search_engines import (
     merge_dedupe, fetch_source_for_similar,
 )
 from master_fetch.reranker import (
-    rerank as neural_rerank, deep_rerank, unavailable_reason, get_reranker,
+    rerank as neural_rerank, unavailable_reason, get_reranker,
 )
 
 logger = logging.getLogger("master-fetch.search")
@@ -45,9 +45,8 @@ class SearchResult(BaseModel):
     snippet: str = Field(default="", description="Result snippet from the engine")
     source: str = Field(default="", description="Engine that returned this result (duckduckgo/bing/google/wikipedia)")
     position: int = Field(default=0, description="1-indexed rank after merge + rerank")
-    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (BM25 over title+snippet, or neural cross-encoder score in neural/deep mode). 1.0 = most relevant in this set.")
+    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (BM25 over title+snippet, or neural cross-encoder score in neural mode). 1.0 = most relevant in this set.")
     fetch_relevance: str = Field(default="", description="high|med|low - fetch 'high' first (1-2), then 'med' if needed, skip 'low'.")
-    peek: str = Field(default="", description="Deep mode only: a short extract of the page's real fetched content (top 3 results) so you can judge relevance before smart_fetching. Empty in keyword/neural modes.")
 
 
 class SearchResponseModel(BaseModel):
@@ -56,7 +55,7 @@ class SearchResponseModel(BaseModel):
     total_results: int = Field(default=0, description="Results returned")
     engines_used: list[str] = Field(default=[], description="Engines that returned results")
     engine_blocked: list[str] = Field(default=[], description="Engines that were rate-limited/CAPTCHA'd (results still came from the others)")
-    rerank_mode: str = Field(default="keyword", description="Rerank used: keyword (BM25). neural/deep arrive in later phases.")
+    rerank_mode: str = Field(default="keyword", description="Rerank used: keyword|neural|find_similar.")
     cached: bool = Field(default=False, description="Served from cache?")
     duration_ms: float = Field(default=0, description="Duration ms")
     error: str = Field(default="", description="Error message (empty = ok)")
@@ -160,17 +159,16 @@ def _validate_freshness(freshness):
     return freshness
 
 
-# Implemented rerank modes. deep (Phase 3) and find_similar (Phase 4) are added
-# in later phases; until then they are rejected here so the schema does not
-# advertise a mode that is not wired.
-_IMPLEMENTED_MODES = ("auto", "keyword", "neural", "deep", "find_similar")
+# Implemented rerank modes (find_similar = URL->similar). Unknown modes are
+# rejected so the schema does not advertise a mode that is not wired.
+_IMPLEMENTED_MODES = ("auto", "keyword", "neural", "find_similar")
 
 
 def _validate_mode(mode):
     if mode is None:
         return "auto"
     if not isinstance(mode, str) or mode.lower() not in _IMPLEMENTED_MODES:
-        raise SecurityError(f"Invalid mode: {mode!r} (auto|keyword|neural|deep|find_similar)")
+        raise SecurityError(f"Invalid mode: {mode!r} (auto|keyword|neural|find_similar)")
     return mode.lower()
 
 
@@ -249,22 +247,17 @@ def _rank(query: str, ranked: list[RawResult], mode: str):
     return [r for r, _ in scored], [s for _, s in scored], "keyword", note
 
 
-def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None,
-                   peeks: Optional[dict] = None, peek_top: int = 3) -> list[SearchResult]:
-    """Convert RawResults (already ranked) into SearchResults with tiers (+ optional deep peeks)."""
+def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None
+                   ) -> list[SearchResult]:
+    """Convert RawResults (already ranked) into SearchResults with tiers."""
     total = len(ranked)
     out: list[SearchResult] = []
     for i, r in enumerate(ranked):
         score = scores[i] if scores and i < len(scores) else 0.0
-        peek = ""
-        if peeks and i < peek_top:
-            p = peeks.get(r.url, "")
-            if p:
-                peek = " ".join(p[:200].split())
         out.append(SearchResult(
             title=r.title, url=r.url, snippet=r.snippet, source=r.source,
             position=i + 1, relevance_score=round(score, 4),
-            fetch_relevance=_tier(score, i + 1, total), peek=peek,
+            fetch_relevance=_tier(score, i + 1, total),
         ))
     return out
 
@@ -298,11 +291,11 @@ async def smart_search(
     bulk-fetches the reranked top-N.
 
     mode: auto (neural if [all]+model present else keyword), keyword (BM25),
-    neural (cross-encoder on snippets), deep (peek real page content, rerank on
-    it; research mode auto-uses deep), find_similar (pass url= ; fetches the
-    source page, derives a query, and reranks candidates against the source
-    content - Exa find-similar, local). expand (1-5): autoretrieval sub-query
-    count (1 = off); boosts recall for niche queries. Not used by find_similar.
+    neural (cross-encoder on snippets; better for semantic/ambiguous queries),
+    find_similar (pass url=; fetches the source page, derives a query, and reranks
+    candidates against the source content - Exa find-similar, local). expand
+    (1-5, default 1=off): autoretrieval sub-query count for niche recall. Ignored
+    for find_similar.
     """
     t0 = time()
 
@@ -323,10 +316,6 @@ async def smart_search(
     fetch_top = max(1, min(int(fetch_top) if not isinstance(fetch_top, bool) else 3, 5))
     max_content_chars_per = max(1000, min(int(max_content_chars_per), 50000))
     fetch_content = bool(fetch_content)
-    # Research mode auto-enables deep rerank (it already pays the full fetches, so
-    # the cheap content peek that powers deep mode is effectively free here).
-    if fetch_content and mode == "auto":
-        mode = "deep"
 
     # find_similar: the target is a URL, not a query. Derive it early so the cache
     # key is keyed on the source URL. expand is ignored for find_similar.
@@ -385,7 +374,6 @@ async def smart_search(
     ranked: list[RawResult] = []
     reports: list[EngineReport] = []
     rerank_used = "keyword"
-    peeks: dict[str, str] = {}
     rerank_note = ""
 
     if mode == "find_similar":
@@ -423,7 +411,7 @@ async def smart_search(
             if ranked and get_reranker() is None:
                 rerank_note = ("find_similar used keyword BM25 (neural unavailable). " +
                                (unavailable_reason() or "install hound-mcp[all]"))
-        results_list = _build_results(cache_query, ranked_list, scores, peeks=peeks)
+        results_list = _build_results(cache_query, ranked_list, scores)
         sim_note = f"find_similar to {find_sim_url} (searched: {derived_query[:60]!r})"
         fetch_hint = compute_fetch_hint(results_list)
         fetch_hint = (fetch_hint + " | " + sim_note) if fetch_hint else sim_note
@@ -446,20 +434,8 @@ async def smart_search(
                  if blocked_any else "Try rephrasing the query.")
             )
 
-        if mode == "deep":
-            dr = await deep_rerank(query, ranked)
-            if dr is not None:
-                pairs, peeks = dr
-                ranked_list = [r for r, _ in pairs]
-                scores = [s for _, s in pairs]
-                rerank_used = "deep"
-            else:
-                ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, "neural")
-                rerank_note = ("deep rerank unavailable - used " + rerank_used + ". " +
-                               (unavailable_reason() or "install hound-mcp[all] and retry"))
-        else:
-            ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
-        results_list = _build_results(query, ranked_list, scores, peeks=peeks)
+        ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
+        results_list = _build_results(query, ranked_list, scores)
         fetch_hint = compute_fetch_hint(results_list)
         if rerank_note:
             fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note

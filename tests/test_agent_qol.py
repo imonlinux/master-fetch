@@ -335,19 +335,13 @@ class TestFetchRelevance:
             ], [EngineReport("duckduckgo", ok=True), EngineReport("bing", ok=True)]
         orig = search_mod.multi_search
         orig_neural = search_mod.neural_rerank
-        orig_deep = search_mod.deep_rerank
         search_mod.multi_search = fake_multi
         search_mod.neural_rerank = lambda q, r: None  # force keyword BM25 (no model)
-
-        async def _no_deep(q, r, peek_n=15):
-            return None
-        search_mod.deep_rerank = _no_deep
         try:
             resp = await _ss(srv, "python asyncio", max_results=5, cache_ttl=0)
         finally:
             search_mod.multi_search = orig
             search_mod.neural_rerank = orig_neural
-            search_mod.deep_rerank = orig_deep
         assert resp.fetch_hint
         assert "smart_fetch" in resp.fetch_hint
         assert all(r.fetch_relevance in ("high", "med", "low") for r in resp.results)

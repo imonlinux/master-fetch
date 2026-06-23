@@ -531,26 +531,16 @@ Phases (each tested + live-verified, no push until all done + Dondai approves):
       snippets, so fine discrimination among top snippet-results is weak —
       Phase 3 deep mode reranks on full page content (richer signal) where it
       discriminates better.
-- [x] **Phase 3 — deep content-aware rerank (DONE, live-verified).** The
-      flagship. `mode=deep` peeks each candidate's REAL fetched page content
-      (cheap impersonated HTTP + trafilatura, `peek_content`/`peek_many` in
-      search_engines.py, parallel + bounded, 6s timeout) and reranks with the
-      neural cross-encoder on (query, page_peek) instead of snippets. Only
-      possible because hound owns the fetch layer. Results whose peek fails
-      (blocked/timeout) fall back to title+snippet for scoring. New `peek`
-      field on SearchResult (top-3 only, 200 chars, deep-mode only) gives the
-      agent a real-content preview before it smart_fetches. Research mode
-      (`fetch_content=True`) auto-upgrades `mode=auto` -> `deep` (it already
-      pays the fetches, so the peek is effectively free + the agent gets the
-      best-ranked content fetched). `deep_rerank` in reranker.py; returns None
-      if the reranker is unavailable -> falls back to neural->keyword with a
-      note. `_build_results` takes `peeks`. Tests: +7 (deep uses deep_rerank +
-      peeks attached, deep fallback, research auto-deep, peek_content extract,
-      peek empty on block, peek_many drops failures, deep_rerank None when no
-      reranker). 591 pass. LIVE-VERIFIED: `mode=deep` peeks real pages, reranks,
-      exposes real-content peeks (e.g. 'Every HTTPS connection begins with a TLS
-      handshake...'). Latency ~6-11s for 8 real-page peeks (honest: real fetches
-      dominate; off by default, opt-in + auto in research mode).
+- [x] **Phase 3 — deep content-aware rerank: BUILT then CUT per Dondai review.**
+      Built `mode=deep` (peek real page content + rerank on it + `peek` field), but
+      Dondai correctly judged it over-built: for modern LLMs, snippet + neural
+      rerank + smart_fetch is enough; deep's content-peek cost 6-11s + N fetches
+      for marginal gain, and the model fetches the real pages anyway. CUT: removed
+      `deep` from modes, removed `deep_rerank` from reranker.py, removed
+      `peek_content`/`peek_many` from search_engines.py, removed the `peek` field,
+      removed the research-mode auto-deep (research now uses neural). The real
+      flagship is neural (local keyless semantic rerank reusing onnxruntime) +
+      the keyless multi-engine scraping itself. Tests: -9 deep tests; 590 pass.
 - [x] **Phase 4 — find_similar + autoretrieval + niche (DONE, live-verified).**
       - `mode=find_similar` (pass `url=`): fetches the source page
         (`fetch_source_for_similar` in search_engines.py: title + trafilatura body),

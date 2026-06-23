@@ -201,10 +201,6 @@ class TestSearchCacheKey:
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(search_mod, "multi_search", fake_multi)
         monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
-
-        async def _no_deep(q, r, peek_n=15):
-            return None
-        monkeypatch.setattr(search_mod, "deep_rerank", _no_deep)
         srv = MasterFetchServer()
         try:
             await _ss(srv, "python", max_results=2, cache_ttl=60)   # live -> cache key max=2

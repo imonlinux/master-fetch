@@ -3,7 +3,7 @@
 Runs an ONNX cross-encoder (Apache-2.0 `cross-encoder/ms-marco-MiniLM-L-6-v2`,
 22.7M params, trained on MS MARCO passage reranking = query/document relevance)
 on the `onnxruntime` we ALREADY ship for OCR. No new runtime. The model + tokenizer
-are downloaded ONCE on first neural/deep search into
+are downloaded ONCE on first neural search into
 `~/.master_fetch_cache/models/msmarco-minilm-l6-v2/` (pinned to a specific HF
 revision + hash-checked), NOT bundled in the wheel, so the lean install stays small.
 
@@ -256,35 +256,3 @@ def unavailable_reason() -> str:
     return _reranker_unavailable_reason
 
 
-async def deep_rerank(query: str, results: list, peek_n: int = 15):
-    """Phase 3 flagship: rerank on REAL fetched page content, not snippets.
-
-    Peeks the top `peek_n` candidates' actual page text (cheap impersonated HTTP
-    + trafilatura), scores each (query, page_peek) with the neural cross-encoder,
-    and returns (sorted_pairs, peeks_map). Results beyond peek_n (or whose peek
-    failed) are scored on title+snippet as a fallback. Returns None if the
-    reranker is unavailable (caller falls back to keyword/neural)."""
-    rer = get_reranker()
-    if rer is None or not results:
-        return None
-    from master_fetch.search_engines import peek_many
-    urls = [r.url for r in results[:peek_n]]
-    try:
-        peeks = await peek_many(urls)
-    except Exception as e:
-        logger.warning(f"deep peek failed: {e}")
-        peeks = {}
-    docs = []
-    for r in results:
-        p = peeks.get(r.url)
-        docs.append(p if p else f"{r.title} {r.snippet}")
-    try:
-        scores = rer.score(query, docs)
-    except Exception as e:
-        logger.warning(f"deep rerank inference failed: {e}")
-        return None
-    if len(scores) != len(results):
-        return None
-    pairs = list(zip(results, scores))
-    pairs.sort(key=lambda rs: (-rs[1], rs[0].position))
-    return pairs, peeks

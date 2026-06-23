@@ -30,11 +30,6 @@ someone else's cloud.
   `onnxruntime` Hound already ships for OCR. The model + tokenizer download once
   on first use (~80MB, pinned HF revision + sha256-checked, cached, NOT bundled).
   Exa-style semantic ranking, $0, local.
-- **`deep`** (the flagship): peeks each candidate's REAL fetched page content
-  (cheap impersonated HTTP + trafilatura) and reranks on the actual page text, not
-  the engine snippet. Only possible because Hound owns the fetch layer. Top
-  results include a `peek` (a short content extract) so the agent can judge
-  relevance before fetching. Research mode auto-uses `deep`.
 - **`find_similar`** (pass `url=`): fetches a page you like, derives a query from
   it, and reranks candidates against that source page's content. Exa's
   find-similar, local.
@@ -42,13 +37,12 @@ someone else's cloud.
   variants locally (no external LLM) and runs them in parallel across engines,
   then merges + dedups. Boosts recall for niche queries.
 - Graceful fallback throughout: if the reranker is unavailable (lean install /
-  offline / download failed), `neural`/`deep`/`find_similar` fall back to keyword
+  offline / download failed), `neural`/`find_similar` fall back to keyword
   BM25 with a note in `fetch_hint`.
 
 #### New agent-facing search fields
 - `relevance_score` (0-1, BM25 or neural), `fetch_relevance` (high/med/low),
-  `engines_used`, `engine_blocked`, `rerank_mode` (keyword|neural|deep|find_similar),
-  `peek` (deep mode, top results).
+  `engines_used`, `engine_blocked`, `rerank_mode` (keyword|neural|find_similar),
 - Cache key bumped to `search:v2` and now includes `mode` + `expand` + the source
   URL (for find_similar), so different modes/filters never collide.
 
@@ -70,7 +64,7 @@ someone else's cloud.
 - 599 tests pass (was 549 at 6.0.0). New: `tests/test_search_engines.py` (24),
   `tests/test_reranker.py` (29). All TinyFish tests removed; replaced with the
   local-search error contract. Live-verified against the real web: all engines
-  return clean real URLs, neural reranks vs keyword, deep peeks real page content,
+  return clean real URLs, neural reranks vs keyword,
   find_similar returns pages ranked vs a source URL, expand runs sub-queries.
 
 ## [6.0.0] - 2026-06-23

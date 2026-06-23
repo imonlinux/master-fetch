@@ -4,7 +4,7 @@
 
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-hero.png" alt="Hound - web fetch, anti-bot, PDF, crawl and search for AI agents" width="896">
 
-**Give your AI agent the web. $0. Two commands. ~2K tokens.**
+**Give your AI agent the web. $0. Two commands. ~2.5K tokens.**
 
 Fetch, crawl, bypass bot walls, read PDFs (even scanned), interact with pages, search the web.
 No accounts. No Docker. No API keys. Runs on your machine.
@@ -41,7 +41,7 @@ Most MCP servers dump 3 to 5K tokens of tool schema into the agent's context jus
 
 - **Connect-time mastery.** On `initialize`, Hound sends a concise `instructions` block (paid once, not per turn) that gives the agent the 4-tool mental model, the #1 workflow (search → fetch the high-relevance results → synthesize), and the known limits. The agent is effective on turn one.
 - **Every response is actionable.** Each fetch returns `content_ok` (trust the content only if true), `next_action` (the obvious next call: paginate, bypass robots, switch sources), `summary` (a one-line status), `fetched_at`, and structured `metadata` (title, author, date, canonical). Each search result returns `relevance_score` + `fetch_relevance`. Agents branch on structured fields instead of guessing from error text.
-- **~2K tokens for all 6 tools.** Hand-crafted tool definitions, no Pydantic schema bloat. More capability than tools shipping 5K+ tokens.
+- **~2.5K tokens for all 6 tools.** Hand-crafted tool definitions, no Pydantic schema bloat. More capability than tools shipping 5K+ tokens.
 
 ---
 
@@ -51,7 +51,7 @@ Most MCP servers dump 3 to 5K tokens of tool schema into the agent's context jus
 |------|--------------|
 | `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk via `urls`. PDFs auto-extracted to structured markdown with `quality_score` + `table_of_contents`; scanned PDFs AND CID-corrupted fonts auto-OCR. Narrow with `css_selector`. Focus with `focus`. Interact with `actions` (click/fill/scroll). Paginate with `offset`. |
 | `smart_crawl` | Best-first same-domain crawl: returns each page as markdown with `content_ok` + `page_type` (article/list/js_shell). List/index pages come back as a structured link list. `discover_only=true` for a URL map; `crawl_urls` to fetch a chosen subset. `focus` prioritizes + filters. Caps on pages/depth/tokens/time. |
-| `smart_search` | Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks. `relevance_score` + `fetch_relevance` (high/med/low) per result. Modes: `keyword` (BM25), `neural` (local ONNX cross-encoder), `deep` (peek real page content, rerank on it), `find_similar` (pass `url=`, find pages similar to it). `expand=N` autoretrieval for niche recall. Research mode (`fetch_content=true`) auto-fetches the top results' full content in one call. |
+| `smart_search` | Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks. `relevance_score` + `fetch_relevance` (high/med/low) per result. Modes: `keyword` (BM25), `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`, find pages similar to it). `expand=N` autoretrieval for niche recall. Research mode (`fetch_content=true`) auto-fetches the top results' full content in one call. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
 | `version` | Installed version + update status. |
@@ -69,13 +69,12 @@ Read all the docs on a site, or scrape a section, in one call. `smart_crawl` wal
 ### 🔎 Local keyless search (`smart_search`) + research mode
 No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing + Wikipedia** in parallel (add `google` via `engines=`), merges, dedups by normalized URL, and ranks. Every result carries `relevance_score` (0-1) and `fetch_relevance` (high/med/low) plus a `fetch_hint` so the agent fetches 1 to 2 results instead of all 10. Filters: `site`/`exclude_sites` (domain include/exclude), `location`/`language`/`region` (geo), `page`, `freshness` (day/week/month/year).
 
-Four rerank modes:
+Three rerank modes:
 - **`keyword`** (BM25 over title + snippet) is the baseline, always available, even on the lean install.
 - **`neural`** reranks with a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. The model downloads once on first use (~80MB, cached), not bundled. Exa-style semantic ranking, $0, on your machine.
-- **`deep`** (the flagship) peeks each candidate's REAL fetched page content (cheap HTTP + trafilatura) and reranks on the actual page text, not the engine snippet. Only possible because Hound owns the fetch layer. The top results include a `peek` (a short content extract) so the agent can judge relevance before fetching. `auto` is used by default; research mode auto-uses `deep`.
 - **`find_similar`** (pass `url=`) fetches a page you like, derives a query from it, and reranks candidates against that source page's content. Exa's find-similar, local.
 
-**`expand=N`** (1-5) is autoretrieval: Hound generates N sub-query variants locally (no external LLM) and runs them in parallel across engines, then merges + dedups. Boosts recall for niche queries. **Research mode** (`fetch_content=true`) searches and bulk-fetches the top-N results' full content in this one call (auto-deep reranked), each with `content_ok`, replacing the 3 to 5 call search → fetch loop with one call.
+**`expand=N`** (1-5) is autoretrieval: Hound generates N sub-query variants locally (no external LLM) and runs them in parallel across engines, then merges + dedups. Boosts recall for niche queries. **Research mode** (`fetch_content=true`) searches and bulk-fetches the top-N results' full content in this one call (neural reranked), each with `content_ok`, replacing the 3 to 5 call search → fetch loop with one call.
 
 Honest posture (same as SearXNG/ddgs): public engines may rate-limit or CAPTCHA. Hound mitigates with browser-impersonated TLS, a real user agent, multi-engine fallback, the warm stealthy browser, and result caching. `engine_blocked` in the response tells the agent which engines were blocked.
 
@@ -174,7 +173,7 @@ Install the Hound MCP server. Follow every step. Do not skip any.
 </div>
 
 - `smart_fetch` checks cache + robots, tries HTTP, escalates to the stealthy Patchright browser on a block/JS-shell/403/503, then extracts and enriches. PDFs branch to pdfplumber (with CID-garbage + scanned auto-OCR via pypdfium2+rapidocr, quality_score, ToC). `smart_crawl` reuses the same pipeline across a same-domain best-first walk with content-adaptive per-page extraction.
-- `smart_search` scrapes DuckDuckGo + Bing + Wikipedia in parallel (browser-impersonated HTTP, escalating to the warm stealthy browser if an engine blocks), merges + dedups, then reranks (keyword BM25 / neural ONNX cross-encoder / deep content-aware / find_similar).
+- `smart_search` scrapes DuckDuckGo + Bing + Wikipedia in parallel (browser-impersonated HTTP, escalating to the warm stealthy browser if an engine blocks), merges + dedups, then reranks (keyword BM25 / neural ONNX cross-encoder / find_similar).
 - The stealthy browser is pre-warmed at startup and reused, so escalation is fast.
 - Content over 40KB is chunked; the response gives `next_offset` so the agent pages through with one more call (served instantly from cache).
 
@@ -197,13 +196,13 @@ Hound is compared only to other **free** ways to give an agent web research. The
 | **Page interaction (click/fill/scroll)** | yes (`actions`) | hooks (code) | no | yes (cloud `/interact`) | build it |
 | **Query-focused extraction** | yes (`focus`, BM25) | yes (BM25 filter) | no | no | build it |
 | **Web search** | yes (keyless local, no key) | no | yes | no | no |
-| **Search rerank** | neural + deep (content-aware) + find_similar + autoretrieval | BM25 | none | none | n/a |
+| **Search rerank** | neural + find_similar + autoretrieval | BM25 | none | none | n/a |
 | **Search anti-bot (engine scraping)** | yes (warm stealthy browser) | n/a | n/a | n/a | n/a |
 | **Metadata (OG/JSON-LD/date/author)** | yes | partial | partial | yes | build it |
 | **Agent signals (`content_ok`/`next_action`/`summary`/`relevance_score`)** | yes | no | no | no | no |
 | **Connect-time `instructions`** | yes | no | no | no | no |
 | **MCP server** | yes (official) | community | yes (official) | yes (official) | build it |
-| **Token cost (tools/list)** | ~2K (6 tools) | varies | n/a | varies (12 tools) | n/a |
+| **Token cost (tools/list)** | ~2.5K (6 tools) | varies | n/a | varies (12 tools) | n/a |
 
 **The takeaway:** Crawl4AI is the closest free competitor (self-host Python, local, no key, has crawl + BM25), but it has no web search, no scanned-PDF OCR, no page interaction, no agent-optimized response signals, and it's Apache-2.0 (attribution required) where Hound is MIT. Jina Reader is the easiest (prefix a URL) and handles PDFs, but has **no anti-bot, no crawl, no interaction, no local search**, routes everything through Jina's servers, and is rate-limited. Firecrawl's open-source version has no anti-bot by default and the generous features live in the paid cloud. **Hound is the only free tool that combines crawl, built-in Cloudflare bypass, scanned-PDF OCR, page interaction, query-focused extraction, keyless local search with neural + content-aware + find-similar rerank, and a response shape designed for agents**, all local, MIT, $0, no accounts, no API keys.
 
@@ -219,7 +218,7 @@ Paid scrapers (Bright Data, ZenRows, Firecrawl paid, Spider.cloud) can beat free
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/tokens.svg" alt="MCP tool count comparison: Hound 6 tools vs Firecrawl 12, Jina 19, Bright Data 60+" width="760">
 </div>
 
-Most MCP servers cost 3 to 5K tokens just to exist. Hound's 6 tools cost **~2K tokens**, and the connect-time `instructions` are injected once at handshake, not repeated every turn. Your context window is expensive; Hound respects it.
+Most MCP servers cost 3 to 5K tokens just to exist. Hound's 6 tools cost **~2.5K tokens**, and the connect-time `instructions` are injected once at handshake, not repeated every turn. Your context window is expensive; Hound respects it.
 
 ---
 
@@ -229,7 +228,7 @@ Hound is honest about what it can't do (no free tool can):
 
 - **DataDome, Akamai, Cloudflare Turnstile (interactive)**: not bypassed. If `smart_fetch` fails on one, the `next_action` tells the agent to switch sources instead of retrying.
 - **Search engine rate-limits / CAPTCHAs**: scraping public engines can be rate-limited under heavy use. Hound mitigates with browser-impersonated TLS, multi-engine fallback, the warm stealthy browser, and caching, and reports `engine_blocked`. It is the same gray-area posture as SearXNG/ddgs; no search-engine ToS compliance is claimed.
-- **Neural/deep/find_similar search**: need `hound-mcp[all]` (the ONNX reranker runs on the same `onnxruntime` as OCR; the model downloads once on first use). Lean installs get keyword BM25 search.
+- **Neural/find_similar search**: need `hound-mcp[all]` (the ONNX reranker runs on the same `onnxruntime` as OCR; the model downloads once on first use). Lean installs get keyword BM25 search.
 - **Sites requiring login**: out of scope (Hound does page interaction, not authenticated sessions).
 - **Shadow-DOM / hard SPAs**: `actions` (scroll, click, wait_selector) reach most of it; deep shadow-DOM piercing is not yet wired.
 - **YouTube**: minimal text.
