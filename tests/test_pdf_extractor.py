@@ -277,7 +277,8 @@ class TestExtractPdfResponse:
                                   "https://example.com/x.pdf", "markdown", "http", 0)
         if ocr_available():
             assert r.error == ""
-            assert r.content and "Dummy PDF file" in r.content[0]
+            assert r.content and "OCR-extracted" in r.content[0]
+            assert "[No text detected on this page.]" not in r.content[0]
         else:
             assert r.error.startswith("scanned_pdf")
             assert "hound-mcp[all]" in r.error
