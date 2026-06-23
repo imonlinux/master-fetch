@@ -262,6 +262,9 @@ async def test_auto_escalate_non_pdf_url_still_escalates(mocker):
         return ResponseModel(status=200, content=["real content"], url="https://x.com/article",
                              fetcher_used="stealthy")
     mocker.patch.object(srv, "stealthy_fetch", fake_stealthy)
+    async def fake_session(tier="stealthy"):
+        return "fake-ssid"  # don't launch a real browser in CI
+    mocker.patch.object(srv, "_ensure_auto_session", fake_session)
     async def fake_finalize(result, *a, **kw):
         return result
     mocker.patch.object(srv, "_finalize_result", fake_finalize)
