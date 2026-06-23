@@ -1,5 +1,68 @@
 # Changelog
 
+## [6.0.0] - 2026-06-23
+
+### flagship overhaul: smart_crawl + PDF extraction
+
+Per a thorough external agent bug report (12 crawl issues, 14 PDF issues), both
+features were rebuilt to be best-in-class among free/OSS alternatives.
+
+#### smart_crawl — best-first + content-adaptive + normalized
+- **Best-first priority queue** (was BFS). Discovered URLs are scored by focus
+  relevance + content-likelihood (docs/guide/api boosted; login/submit/cart/
+  admin penalized) + shallow-depth, so content pages are crawled before junk
+  when the budget is tight. `focus` now reorders globally (was per-layer).
+- **Content-adaptive per-page extraction**: article/docs -> trafilatura main
+  content; **list/index pages (HN, aggregators, directories) -> a structured
+  `* [title](url)` link list** (was 0 content_ok); JS shells detected and
+  reported honestly (was silent empty/timeout). New `page_type` field per page.
+- **URL normalization + dedup**: trailing slash, default ports, lowercase host,
+  tracking params (utm_*/fbclid/gclid/ref) stripped; `/docs` and `/docs/` no
+  longer crawled twice. Dedup by normalized, fetch the original.
+- **`same_domain_only` default** (external links dropped).
+- **Two-phase crawl**: new `crawl_urls` param fetches a chosen subset of
+  discovered URLs with no re-discovery (after `discover_only=true`).
+- Network errors report **status `-1`** (was 0). `fetched_at` per page;
+  `cache_ttl=0` forces fresh. Default `max_content_chars_per` 4000 -> 8000.
+- Overall **`deadline_ms`** (default 120000) so one slow page can't hang the
+  crawl; partial results returned with `truncated_by_time`.
+
+#### PDF — CID auto-OCR + honest quality + ToC + metadata
+- **CID-corruption auto-OCR (the flagship trick).** Fonts without a ToUnicode
+  CMap make pdfplumber emit `(cid:71)(cid:302)...` garbage (figures/diagrams/
+  math in academic papers), but the glyphs render correctly. Hound detects
+  CID-garbage pages (ratio >= 0.30), renders them via pypdfium2, and OCRs them
+  with rapidocr (one batched call), recovering the real text. Equations/
+  figures are OCR'd as visible symbols with an honest marker. Reuses OCR deps
+  already shipped; no new heavy deps.
+- **Per-page scanned OCR for MIXED PDFs**: a text body + scanned appendix used
+  to leave the scanned pages empty. Now each image-bearing low-text page is
+  detected and OCR'd alongside CID pages. (All-scanned docs still hit the
+  honest `scanned_pdf` dead-end that the caller OCRs.)
+- **`quality_score` (0.0-1.0) + honest `content_ok`**: a garbled doc reports
+  `content_ok=false` even on HTTP 200 (was `true` despite 85% garbage). Scored
+  from raw page text + OCR status so honest markers don't inflate it.
+  `_agent_hints` respects the PDF verdict (won't let status 200 mask corruption).
+- **`table_of_contents`** from the PDF outline via pypdfium2 `get_toc()`.
+- **`metadata`** populated (title/author/subject/keywords/creator/producer/
+  dates) on the response, not just the markdown header.
+- **`include_media`** -> per-page embedded-image metadata for PDFs.
+- **`.pdf` URLs never escalate to the stealthy browser** (was a 16s waste); a
+  `.pdf` URL returning a login/paywall HTML page returns `auth_required` /
+  `not_a_pdf` instead of extracting the login page.
+
+#### Other
+- README: reliable pepy.tech downloads badge (replaced the fragile shields.io
+  monthly badge that intermittently showed "rate limited by upstream service").
+  Feature sections rewritten for v6.
+- 549 tests pass (was 529). +22 crawl tests, +14 pdf-v6 tests. CI green.
+
+### Deferred (future)
+- MCP progress notifications during long crawl/PDF ops (P8).
+- PDF page labels for `--- Page N ---` (P11).
+- Optional `[ai]` extra pulling marker for SOTA neural math/tables (heavy torch;
+  not a hard dep).
+
 ## [5.0.1] - 2026-06-22
 
 ### Fixed

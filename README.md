@@ -49,8 +49,8 @@ Most MCP servers dump 3 to 5K tokens of tool schema into the agent's context jus
 
 | Tool | What it does |
 |------|--------------|
-| `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk via `urls`. PDFs auto-extracted (scanned PDFs auto-OCR). Narrow with `css_selector`. Focus to a query with `focus`. Interact with `actions` (click/fill/scroll). Paginate with `offset`. |
-| `smart_crawl` | Deep-crawl a site: BFS same-domain from a URL, returns each page as markdown with `content_ok`. `discover_only=true` for a URL map. `focus` prioritizes relevant pages. Caps on pages/depth/token budget. |
+| `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk via `urls`. PDFs auto-extracted to structured markdown with `quality_score` + `table_of_contents`; scanned PDFs AND CID-corrupted fonts auto-OCR. Narrow with `css_selector`. Focus with `focus`. Interact with `actions` (click/fill/scroll). Paginate with `offset`. |
+| `smart_crawl` | Best-first same-domain crawl: returns each page as markdown with `content_ok` + `page_type` (article/list/js_shell). List/index pages come back as a structured link list. `discover_only=true` for a URL map; `crawl_urls` to fetch a chosen subset. `focus` prioritizes + filters. Caps on pages/depth/tokens/time. |
 | `smart_search` | Web search via TinyFish (free key). Domain/geo filters. `fetch_relevance` (high/med/low) per result. Research mode (`fetch_content=true`) auto-fetches the top results' full content in one call. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
@@ -61,13 +61,17 @@ Most MCP servers dump 3 to 5K tokens of tool schema into the agent's context jus
 ## Features
 
 ### 🕷️ Crawl a whole site (`smart_crawl`)
-Read all the docs on a site, or scrape a section, in one call. `smart_crawl` walks same-domain links breadth-first from a start URL up to a depth/page/token budget and returns each page as clean markdown with the same `content_ok` / `summary` signals `smart_fetch` produces. `discover_only=true` returns just the URL map. `path_include`/`path_exclude` scope it (e.g. `["/docs"]`). `focus="query"` turns it into a query-prioritized crawl: the most relevant pages are crawled first within the budget, and each page is focus-filtered. One fetch per page, reusing `smart_fetch`'s anti-bot escalation and cache.
+Read all the docs on a site, or scrape a section, in one call. `smart_crawl` walks same-domain links from a start URL in a **best-first** order: discovered URLs are scored by focus relevance + content-likelihood (docs/guide/api boosted, login/submit/cart penalized) + shallow depth, so content pages are crawled before junk when the budget is tight. Extraction is **content-adaptive** per page: article/docs pages -> trafilatura main content; list/index pages (Hacker News, aggregators, directory pages) -> a structured `* [title](url)` link list (not an empty page); JS shells are detected and reported honestly. URLs are normalized (trailing slash, tracking params) so `/docs` and `/docs/` are never crawled twice. `discover_only=true` returns the URL map; pass `crawl_urls=[...]` to fetch a chosen subset in a second phase. `path_include`/`path_exclude` scope it. `focus="query"` prioritizes relevant pages AND focus-filters each page. Caps on pages/depth/tokens plus an overall time deadline so one slow page can't hang the crawl. Same-domain only by default; network errors report status `-1`; `fetched_at` per page; `cache_ttl=0` forces fresh.
 
 ### 🛡️ Anti-bot, built in
 `smart_fetch` tries plain HTTP first (fast, ~1s). If the site blocks HTTP or serves a JavaScript shell, it auto-escalates to a **Patchright** anti-detect browser with Cloudflare challenge solving. Two tiers, nothing to configure. JS-only SPAs that return an empty shell over HTTP are detected and escalated automatically.
 
-### 📄 PDF + scanned-PDF OCR
-`smart_fetch` detects a PDF (by content-type **or** `%PDF` magic bytes) and extracts it to **structured markdown** using `pdfplumber` (MIT, no AGPL baggage): multi-column reading order, real **tables as markdown tables**, font-size heading detection, de-hyphenated paragraphs, a metadata header, and `--- Page N ---` markers. Pass `pages="1-5"` to extract a subset. **Scanned/image-only PDFs are auto-OCR'd** with `rapidocr` (pure-pip, no system binary) when you install `[all]`; image-only web pages are OCR'd too. Encrypted PDFs accept a `password`.
+### 📄 PDF + scanned-PDF OCR + CID-recovery
+`smart_fetch` detects a PDF (by content-type **or** `%PDF` magic bytes) and extracts it to **structured markdown** using `pdfplumber` (MIT, no AGPL baggage): multi-column reading order, real **tables as markdown tables**, font-size heading detection, de-hyphenated paragraphs, a metadata header, and `--- Page N ---` markers. Pass `pages="1-5"` to extract a subset.
+
+**The flagship trick — CID-corruption auto-OCR.** Academic papers embed font subsets without a Unicode map, so extractors emit `(cid:71)(cid:302)...` garbage for figures/diagrams/math. But the glyphs *render* correctly. Hound detects CID-garbage pages, renders them via `pypdfium2`, and OCRs them with `rapidocr`, recovering the real text automatically. Scanned/image-only PDFs (and image-only web pages) are auto-OCR'd too. Equations/figures are OCR'd as visible symbols with an honest marker (use a vision tool for precise LaTeX). All pure-pip, no system binary, with `[all]`.
+
+**Honest quality signals.** Every PDF response carries `quality_score` (0.0-1.0, readable-char ratio) and a `content_ok` that reflects it, so a garbled extraction is flagged, not silently trusted. `table_of_contents` is populated from the PDF outline when present, and `metadata` (title/author/subject/keywords/creator/producer/dates) is available programmatically. `include_media=true` reports per-page embedded-image metadata for multimodal agents. Encrypted PDFs accept a `password`. A `.pdf` URL that returns a login/paywall page is reported as `auth_required`, not extracted as content.
 
 ### 🎯 Query-focused extraction (`focus`)
 `smart_fetch(url, focus="...")` returns only the BM25-relevant blocks (paragraphs, headings, tables) for your query. On a long page this cuts context 80%+ with no re-fetch (it runs post-cache, so one cached page serves any focus query). Re-pass the same `focus` when paginating with `offset`.
@@ -167,7 +171,7 @@ Install the Hound MCP server. Follow every step. Do not skip any.
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/flow.svg" alt="smart_fetch pipeline: HTTP to stealthy escalation, extract, agent-optimized response; PDF and crawl branches" width="760">
 </div>
 
-- `smart_fetch` checks cache + robots, tries HTTP, escalates to the stealthy Patchright browser on a block/JS-shell/403/503, then extracts and enriches. PDFs branch to pdfplumber (OCR if scanned). `smart_crawl` reuses the same pipeline across a same-domain BFS walk.
+- `smart_fetch` checks cache + robots, tries HTTP, escalates to the stealthy Patchright browser on a block/JS-shell/403/503, then extracts and enriches. PDFs branch to pdfplumber (with CID-garbage + scanned auto-OCR via pypdfium2+rapidocr, quality_score, ToC). `smart_crawl` reuses the same pipeline across a same-domain best-first walk with content-adaptive per-page extraction.
 - The stealthy browser is pre-warmed at startup and reused, so escalation is fast.
 - Content over 40KB is chunked; the response gives `next_offset` so the agent pages through with one more call (served instantly from cache).
 
