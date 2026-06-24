@@ -108,7 +108,8 @@ def _search_next_action(results: list[SearchResult], engine_blocked: list[str],
         return "No results. Rephrase (more specific / different terms) or try mode=neural for semantic matching."
     high = [r for r in results if r.fetch_relevance == "high"]
     if high:
-        base = f"Fetch the {len(high)} high-relevance result(s) via smart_fetch first; then 'med' if you need more."
+        base = ("Fetch the top 1-2 high-relevance result(s) via smart_fetch first "
+                "(rank 1-2 have the highest relevance_score); fetch more only if you need them.")
     elif any(r.fetch_relevance == "med" for r in results):
         base = "No 'high' results; smart_fetch the top 'med' results, or rephrase for better matches."
     else:

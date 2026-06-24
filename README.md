@@ -69,7 +69,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 |------|-----------|
 | `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk, PDFs (with OCR + quality score), `css_selector`, `focus`, `actions`, pagination. |
 | `smart_crawl` | Best-first same-domain crawl. Each page as markdown with `content_ok` + `page_type` (article / list / js_shell). `discover_only`, `crawl_urls`, `focus`, time + token caps. |
-| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks. `relevance_score` + `fetch_relevance` per result. Keyword / neural / find_similar. Research mode bulk-fetches the top-N. |
+| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing in parallel (add `google`/`wikipedia`), merges + ranks. `relevance_score` + `fetch_relevance` per result. Keyword / neural / find_similar. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows engines that didn't contribute. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
 | `version` | Installed version + update status. |
@@ -81,7 +81,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 
 **`smart_crawl`** — Best-first walk of same-domain links. Content-adaptive: article/docs → main content; list/index pages → structured link list; JS shells → detected + reported. `discover_only=true` → URL map. `crawl_urls=[...]` → second-phase selective crawl. `focus` prioritizes + filters. Caps: `max_pages` (10), `max_depth` (2), `max_total_chars`, `deadline_ms` (120000). Per-page `content_ok` + `status` (network error = −1) + `fetched_at`. Reuses `smart_fetch` anti-bot + cache.
 
-**`smart_search`** — Scrapes DuckDuckGo + Bing + Wikipedia in parallel (add `google`), merges, dedups by normalized URL, ranks. Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural if `[all]`+model present else keyword BM25), `keyword`, `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`). `expand=N` autoretrieval. Research mode (`fetch_content=true`) auto-fetches the top-N results' full content in one call. `engine_blocked` lists cooling-down engines.
+**`smart_search`** — Scrapes DuckDuckGo + Bing in parallel (add `google` or `wikipedia`), merges, dedups by normalized URL, ranks. Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural if `[all]`+model present else keyword BM25), `keyword`, `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`). `engine_blocked` lists engines that didn't contribute (rate-limited/timed out/no results).
 
 </details>
 
@@ -93,14 +93,14 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-scene.png" alt="Hound fetches the web and brings it back to your agent" width="820">
 </div>
 
-No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing + Wikipedia** in parallel (add `google`), merges, dedups, and ranks on your machine. Every result carries `relevance_score` (0–1) and `fetch_relevance` (**high** / **med** / **low**) so the agent fetches the 1–2 that matter instead of all 10.
+No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing** in parallel (add `google` or `wikipedia`), merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es the 1–2 that matter instead of all 9. Every result carries `relevance_score` (0–1) and `fetch_relevance` (**high** / **med** / **low**).
 
 **Three rerank modes:**
 - **`keyword`** — BM25 over title + snippet. Baseline, always available, even on the lean install.
 - **`neural`** — a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. Exa-style semantic ranking, $0, on your machine. The model downloads once (~80MB, cached, not bundled).
 - **`find_similar`** — pass `url=`; Hound fetches a page you like, derives a query, and reranks candidates against that source page. Exa's find-similar, local.
 
-**Research mode** (`fetch_content=true`): search + bulk-fetch the top-N results' full content in one call, each with `content_ok`. Replaces the 3-to-5-call search → fetch loop with one call.
+`smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 9 results. `google` is opt-in (it often CAPTCHAs/consents; when it does it shows up in `engine_blocked` so you know, instead of silently contributing nothing). `wikipedia` is opt-in too (off by default — its results were usually tangential).
 
 ### 🛡️ Search Engine Resilience Layer
 
@@ -182,7 +182,7 @@ Hound is compared only to other **free** ways to give an agent web research. Onl
 | **Page interaction** | yes (`actions`) | hooks (code) | no | yes (cloud) | build it |
 | **Query-focused extraction** | yes (`focus`, BM25) | yes (BM25 filter) | no | no | build it |
 | **Web search** | yes (keyless local) | no | yes | no | no |
-| **Search rerank** | neural + find_similar + autoretrieval | BM25 | none | none | n/a |
+| **Search rerank** | neural + find_similar | BM25 | none | none | n/a |
 | **Search anti-bot** | yes (warm stealthy browser) | n/a | n/a | n/a | n/a |
 | **Agent signals** | yes (`content_ok`/`next_action`/`summary`/`relevance_score`) | no | no | no | no |
 | **Connect-time `instructions`** | yes | no | no | no | no |
