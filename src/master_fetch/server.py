@@ -126,9 +126,9 @@ HOUND_INSTRUCTIONS = (
     "  - Cache: cache_ttl=0 forces a fresh fetch (default 1hr).\n"
     "  - Long page, one topic? pass focus='...' to get only the BM25-relevant blocks (post-cache, no re-fetch; re-pass it when paginating with offset).\n"
     "  - Behind a click/form/load-more/infinite-scroll? pass actions=[{click:'button.load-more'},{scroll:3},...] (forces the stealthy browser; runs after load, before extraction; bypasses cache).\n"
-    "• smart_search(query) - find pages. Local + keyless (no API key, no account). Scrapes DuckDuckGo + Bing in parallel (add 'google' or 'wikipedia') and ranks by relevance. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low) + relevance_score; smart_fetch the ones that match what you need - the ranking is a hint, not a directive; a lower-ranked result can be the right one, so use your judgment.\n"
+    "• smart_search(query) - find pages. Local + keyless (no API key, no account). Scrapes DuckDuckGo + Bing + Brave in parallel (three independent indexes; add 'wikipedia' or 'yahoo') and ranks by relevance + cross-engine consensus. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low) + relevance_score + engines_consensus (how many independent indexes returned it); smart_fetch the ones that match what you need - the ranking is a hint, not a directive; a lower-ranked result can be the right one, so use your judgment.\n"
     "  - Rerank: options={mode:'neural'} uses a local neural cross-encoder (needs hound-mcp[all]; auto-detects). mode='find_similar' + url=<a page> finds pages similar to it (fetches the source, reranks candidates vs its content). Default 'auto' picks neural if available else keyword BM25.\n"
-    "  - Response: summary (one-line status) + next_action (the obvious next call: fetch the high results / rephrase / retry / paginate) + engine_blocked (engines that timed out or cooled down; results still came from the others, retry shortly for more recall).  Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','wikipedia','google']}.\n"
+    "  - Response: summary (one-line status) + next_action (the obvious next call: fetch the high results / rephrase / retry / paginate) + engine_blocked (engines that timed out or cooled down; results still came from the others, retry shortly for more recall).  Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','brave','wikipedia','yahoo']}.\n"
     "• smart_crawl(url) - read a whole site/section. Best-first same-domain crawl; returns each page as markdown with content_ok + page_type (article/list/js_shell). List pages (HN/aggregators) come back as a structured link list. options: max_pages (default 10), max_depth (default 2), path_include (scope to ['/docs']), discover_only=true (URL map only), focus query (crawl relevant pages first + focus-filter), crawl_urls list (fetch a chosen subset after discover_only). Check next_action if it stopped early.\n"
     "• screenshot(url) - image capture. Multimodal agents only (content rendered as images/canvas/visual layout). Text agents: use smart_fetch instead. Session is auto-managed.\n"
     "\n"
@@ -2345,7 +2345,7 @@ class MasterFetchServer:
     async def smart_search(
         self,
         query: str,
-        max_results: int = 9,
+        max_results: int = 6,
         cache_ttl: int = 300,
         mode: str = "auto",
         engines: Optional[List[str]] = None,
@@ -2360,11 +2360,14 @@ class MasterFetchServer:
     ) -> SearchResponseModel:
         """Local keyless web search (no API key, no account, no third-party service).
 
-        Scrapes DuckDuckGo + Bing in parallel (engines= to choose, add 'google' or
-        'wikipedia'), merges + dedups + ranks. Returns URLs + ranking, not page
-        content - smart_fetch the results you want. Each result has relevance_score
-        + fetch_relevance. Filters: site/exclude_sites (domain include/exclude on
-        the final URL), location/language/region (geo), page (0-10), freshness
+        Scrapes DuckDuckGo + Bing + Brave in parallel (three independent
+        indexes, all HTTP; engines= to choose, add 'wikipedia' or 'yahoo'), merges + dedups
+        + ranks by relevance + cross-engine consensus (a URL returned by several
+        independent engines is an authority signal). Returns URLs + ranking, not
+        page content - smart_fetch the results you want. Each result has
+        relevance_score + fetch_relevance + engines_consensus. Filters:
+        site/exclude_sites (domain include/exclude on the final URL),
+        location/language/region (geo), page (0-10), freshness
         (day|week|month|year). Results cached 5min.
         """
         try:
@@ -2495,12 +2498,12 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing in parallel (add 'google' or 'wikipedia'), merges + ranks by relevance. Returns URLs + ranking, NOT page content - smart_fetch the results you want. Each result has relevance_score + fetch_relevance (high/med/low); the response carries summary + next_action (the obvious next call: fetch what you need / rephrase / retry) + engine_blocked (engines that did not contribute). NEVER answer from snippets alone: smart_fetch the results that match what you need (ranked by relevance_score + fetch_relevance; the ranking is a hint, use your judgment - a lower-ranked result can be the right one). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year). Rate-limit resilient + bounded latency: engines run in parallel with a hard per-engine deadline, so a slow/blocked engine never hangs the search; engine_blocked lists any engine that cooled down, timed out, or parsed no results (results still come from the others, retry shortly for more recall).",
+            "description": "Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Brave in parallel (three INDEPENDENT indexes, all HTTP; add 'wikipedia' or 'yahoo'), merges + ranks by relevance + cross-engine consensus. Returns URLs + ranking, NOT page content - smart_fetch the results you want. Each result has relevance_score + fetch_relevance (high/med/low) + engines_consensus (how many independent indexes returned it - a free authority signal); the response carries summary + next_action (the obvious next call: fetch what you need / rephrase / retry) + engine_blocked (engines that did not contribute). NEVER answer from snippets alone: smart_fetch the results that match what you need (ranked by relevance + consensus; the ranking is a hint, use your judgment - a lower-ranked result can be the right one). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year). Rate-limit resilient + bounded latency: 3 independent engines run in parallel with a hard per-engine deadline, so a slow/blocked engine never hangs the search and the others carry genuinely different results; engine_blocked lists any engine that cooled down, timed out, or parsed no results (retry shortly for more recall).",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "options": {"type": "object", "description": "max_results (1-50, default 9), cache_ttl (seconds, default 300), mode (auto|keyword|neural|find_similar; default auto = neural rerank if hound-mcp[all]+model present else keyword BM25; neural = local cross-encoder on snippets, better for semantic/ambiguous queries; find_similar needs url= and finds pages similar to it), engines (list, default ['duckduckgo','bing']; add 'google' or 'wikipedia'), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), url (for mode='find_similar': the source URL to find pages similar to)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "max_results (1-50, default 6), cache_ttl (seconds, default 300), mode (auto|keyword|neural|find_similar; default auto = neural rerank if hound-mcp[all]+model present else keyword BM25; neural = local cross-encoder on snippets, better for semantic/ambiguous queries; find_similar needs url= and finds pages similar to it), engines (list, default ['duckduckgo','bing','brave'] - three independent indexes; add 'wikipedia' or 'yahoo'), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), url (for mode='find_similar': the source URL to find pages similar to)", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},

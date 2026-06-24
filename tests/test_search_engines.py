@@ -2,9 +2,10 @@
 
 No network: SERP parsers are fed fixture HTML, the Wikipedia JSON path is fed
 canned JSON, and multi_search is run against stubbed engine funcs. Verifies
-DDG uddg-redirect decoding, Bing <cite> breadcrumb reconstruction, Google
-/url?q= decoding, cross-engine merge+dedup, site filters, BM25 ranking + the
-zero-overlap order-preserving tiebreak, and the multi-engine orchestrator.
+DDG uddg-redirect decoding, Bing <cite> breadcrumb reconstruction,
+Brave/Yahoo parsing, cross-engine consensus merge, site filters, BM25
+ranking + the zero-overlap order-preserving tiebreak, and the multi-engine
+orchestrator.
 """
 
 import asyncio
@@ -15,7 +16,8 @@ import pytest
 from master_fetch import search_engines as se
 from master_fetch.search_engines import (
     RawResult, EngineReport, _ddg_real_url, _bing_real_url, _parse_ddg,
-    _parse_bing, _parse_google, merge_dedupe, bm25_rerank, multi_search,
+    _parse_bing, _parse_brave, _parse_yahoo, _yahoo_real_url,
+    merge_dedupe, bm25_rerank, multi_search,
 )
 
 
@@ -100,33 +102,86 @@ def test_parse_bing_skips_when_no_cite():
     assert _parse_bing(html) == []
 
 
-# ─── Google /url?q= decoding ─────────────────────────────────────────────────
+# ─── Brave (independent index, data-type="web" snippets) ─────────────────────
 
-def test_parse_google_decodes_urlq_and_direct():
+def test_parse_brave_extracts_web_snippets_only():
     html = """
-    <div class="g">
-      <div><a href="/url?q=https://numpy.org/doc/&sa=U&ved=123"><h3>NumPy docs</h3></a></div>
-      <div class="VwiC3b">Numerical Python documentation.</div>
+    <div class="snippet" data-type="web">
+      <a href="https://rust-lang.org/">Rust</a>
+      <div class="snippet-title">The Rust Programming Language</div>
+      <div class="generic-snippet">A language empowering everyone to build reliable software.</div>
     </div>
-    <div class="g">
-      <a href="https://pandas.pydata.org/"><h3>pandas</h3></a>
+    <div class="snippet" data-type="news">
+      <a href="https://news.example.com/">News</a>
+      <div class="snippet-title">News result (must be skipped)</div>
     </div>
     """
-    out = _parse_google(html)
-    titles = {r.title for r in out}
-    assert "NumPy docs" in titles and "pandas" in titles
-    assert any(r.url == "https://numpy.org/doc/" for r in out)
-    assert any(r.url == "https://pandas.pydata.org/" for r in out)
-    assert all(r.source == "google" for r in out)
+    out = _parse_brave(html)
+    assert len(out) == 1  # only data-type="web" is organic
+    assert out[0].title == "The Rust Programming Language"
+    assert out[0].url == "https://rust-lang.org/"
+    assert out[0].source == "brave"
+    assert "reliable software" in out[0].snippet
 
 
-def test_parse_google_dedups_within_engine():
+# ─── Yahoo (Bing-feed; RU= redirect decoding) ────────────────────────────────
+
+def test_yahoo_real_url_decodes_ru():
+    href = "https://r.search.yahoo.com/.../RU=https%3A%2F%2Fexample.com%2Fpage/RK=2/RS=abc"
+    assert _yahoo_real_url(href) == "https://example.com/page"
+
+
+def test_yahoo_real_url_passthrough_direct():
+    assert _yahoo_real_url("https://plain.com/x") == "https://plain.com/x"
+
+
+def test_parse_yahoo_extracts_algo_results():
     html = """
-    <div class="g"><a href="https://dup.com"><h3>Dup</h3></a></div>
-    <div class="g"><a href="https://dup.com"><h3>Dup again</h3></a></div>
+    <div class="algo-sr">
+      <a href="https://r.search.yahoo.com/RU=https%3A%2F%2Fdocs.python.org%2F/RK=2">link</a>
+      <h3 class="title">Python docs</h3>
+      <div class="compText">The Python tutorial.</div>
+    </div>
     """
-    out = _parse_google(html)
+    out = _parse_yahoo(html)
     assert len(out) == 1
+    assert out[0].title == "Python docs"
+    assert out[0].url == "https://docs.python.org/"
+    assert out[0].source == "yahoo"
+
+
+# ─── cross-engine consensus merge ────────────────────────────────────────────
+
+def test_merge_consensus_counts_distinct_index_families():
+    # bing + yahoo both return the same URL = 1 family (Bing feed, correlated).
+    # mojeek + brave agreeing on a different URL = 2 independent families.
+    per = [
+        ([_rr("A", "https://same.com", "bing", 1, "s")], EngineReport("bing", ok=True)),
+        ([_rr("A", "https://same.com", "yahoo", 1, "s")], EngineReport("yahoo", ok=True)),
+        ([_rr("B", "https://diff.com", "mojeek", 1, "s")], EngineReport("mojeek", ok=True)),
+        ([_rr("B", "https://diff.com", "brave", 1, "s")], EngineReport("brave", ok=True)),
+    ]
+    merged = {r.url: r for r in merge_dedupe(per, 10)}
+    # bing+yahoo = 1 distinct family (both map to the 'bing' family).
+    assert merged["https://same.com"].consensus == 1
+    assert set(merged["https://same.com"].sources) == {"bing", "yahoo"}
+    # mojeek+brave = 2 distinct independent families.
+    assert merged["https://diff.com"].consensus == 2
+    assert set(merged["https://diff.com"].sources) == {"mojeek", "brave"}
+
+
+def test_merge_consensus_surfaces_multi_engine_hits_first():
+    # A single-engine result + a 3-engine consensus result: consensus sorts first
+    # even though both have the same engine position.
+    per = [
+        ([_rr("Solo", "https://solo.com", "duckduckgo", 1, "s")], EngineReport("duckduckgo", ok=True)),
+        ([_rr("Big", "https://big.com", "duckduckgo", 1, "s")], EngineReport("duckduckgo", ok=True)),
+        ([_rr("Big", "https://big.com", "bing", 1, "s")], EngineReport("bing", ok=True)),
+        ([_rr("Big", "https://big.com", "mojeek", 1, "s")], EngineReport("mojeek", ok=True)),
+    ]
+    merged = merge_dedupe(per, 10)
+    assert merged[0].url == "https://big.com"  # 3-family consensus surfaces first
+    assert merged[0].consensus == 3
 
 
 # ─── Wikipedia JSON ──────────────────────────────────────────────────────────
@@ -450,64 +505,6 @@ def test_serl_close_all_closes_sessions(fresh_coord):
 
 # ─── multi_search adaptive reserve tier (Google) ─────────────────────────────
 
-def test_multi_search_reserve_google_fires_when_primaries_short(monkeypatch):
-    async def fake_ddg(q, n, *, region, freshness, page=0, server=None):
-        return ([], EngineReport("duckduckgo", blocked=True, error="captcha"))
-    async def fake_bing(q, n, *, region, freshness, page=0, server=None):
-        return ([], EngineReport("bing", blocked=True, error="captcha"))
-    async def fake_wiki(q, n, *, region, freshness, page=0, server=None):
-        return ([_rr("W1", "https://en.wikipedia.org/wiki/A", "wikipedia", 1),
-                 _rr("W2", "https://en.wikipedia.org/wiki/B", "wikipedia", 2)],
-                EngineReport("wikipedia", ok=True))
-    called = {"google": False}
-    async def fake_google(q, n, *, region, freshness, page=0, server=None):
-        called["google"] = True
-        return ([_rr("G", "https://g.com", "google", 1, "g")], EngineReport("google", ok=True))
-    monkeypatch.setitem(se._ENGINES, "duckduckgo", fake_ddg)
-    monkeypatch.setitem(se._ENGINES, "bing", fake_bing)
-    monkeypatch.setitem(se._ENGINES, "wikipedia", fake_wiki)
-    monkeypatch.setattr(se, "search_google", fake_google)
-    ranked, reports = asyncio.run(multi_search("x", 5, server=object()))  # truthy server
-    assert called["google"] is True
-    assert any(r.name == "google" and r.ok for r in reports)
-    assert any(r.url == "https://g.com" for r in ranked)
-
-
-def test_multi_search_reserve_google_skipped_when_server_none(monkeypatch):
-    async def fake_ddg(q, n, *, region, freshness, page=0, server=None):
-        return ([], EngineReport("duckduckgo", blocked=True, error="captcha"))
-    async def fake_wiki(q, n, *, region, freshness, page=0, server=None):
-        return ([_rr("W1", "https://en.wikipedia.org/wiki/A", "wikipedia", 1)],
-                EngineReport("wikipedia", ok=True))
-    called = {"google": False}
-    async def fake_google(q, n, *, region, freshness, page=0, server=None):
-        called["google"] = True
-        return ([_rr("G", "https://g.com", "google", 1)], EngineReport("google", ok=True))
-    monkeypatch.setattr(se, "_ENGINES", {"duckduckgo": fake_ddg, "wikipedia": fake_wiki})
-    monkeypatch.setattr(se, "search_google", fake_google)
-    asyncio.run(multi_search("x", 5, server=None))
-    assert called["google"] is False  # no server -> reserve tier stays off
-
-
-def test_multi_search_reserve_google_skipped_when_results_sufficient(monkeypatch):
-    async def fake_ddg(q, n, *, region, freshness, page=0, server=None):
-        return ([_rr(f"D{i}", f"https://d{i}.com", "duckduckgo", i) for i in range(5)],
-                EngineReport("duckduckgo", ok=True))
-    async def fake_bing(q, n, *, region, freshness, page=0, server=None):
-        return ([], EngineReport("bing", blocked=True, error="captcha"))
-    async def fake_wiki(q, n, *, region, freshness, page=0, server=None):
-        return ([_rr("W", "https://en.wikipedia.org/wiki/W", "wikipedia", 1)],
-                EngineReport("wikipedia", ok=True))
-    called = {"google": False}
-    async def fake_google(q, n, *, region, freshness, page=0, server=None):
-        called["google"] = True
-        return ([_rr("G", "https://g.com", "google", 1)], EngineReport("google", ok=True))
-    monkeypatch.setattr(se, "_ENGINES", {"duckduckgo": fake_ddg, "bing": fake_bing, "wikipedia": fake_wiki})
-    monkeypatch.setattr(se, "search_google", fake_google)
-    asyncio.run(multi_search("x", 5, server=object()))
-    assert called["google"] is False  # primaries returned enough -> reserve not needed
-
-
 # ─── prewarm + hard deadline (cold-start / timeout fix) ──────────────────────
 
 def test_serl_warmup_does_not_touch_circuit_breaker_or_pacer(fresh_coord):
@@ -551,20 +548,20 @@ def test_multi_search_hard_deadline_cuts_slow_engine_returns_partial(monkeypatch
 
 
 def test_multi_search_hard_deadline_cuts_reserve_google_too(monkeypatch):
+    # Reserve Google tier was REMOVED (Google scraping is hopeless). This test now
+    # verifies the replacement behavior: with a blocked primary + thin results and
+    # NO reserve tier, multi_search simply returns the partial results (no google
+    # fan-out happens at all).
     monkeypatch.setattr(se, "SEARCH_ENGINE_DEADLINE", 0.3)
     async def blocked_ddg(q, n, *, region, freshness, page=0, server=None):
         return ([], EngineReport("duckduckgo", blocked=True, error="captcha"))
     async def thin_wiki(q, n, *, region, freshness, page=0, server=None):
         return ([_rr("W", "https://en.wikipedia.org/wiki/A", "wikipedia", 1)], EngineReport("wikipedia", ok=True))
-    async def slow_google(q, n, *, region, freshness, page=0, server=None):
-        await asyncio.sleep(1.0)
-        return ([_rr("G", "https://g.com", "google", 1)], EngineReport("google", ok=True))
     monkeypatch.setattr(se, "_ENGINES", {"duckduckgo": blocked_ddg, "wikipedia": thin_wiki})
-    monkeypatch.setattr(se, "search_google", slow_google)
-    ranked, reports = asyncio.run(multi_search("x", 5, server=object()))
-    # reserve google was triggered (primaries short + ddg blocked) but it timed out
-    g = next((r for r in reports if r.name == "google"), None)
-    assert g is not None and g.blocked is True and "timed out" in g.error
+    ranked, reports = asyncio.run(multi_search("x", 5, engines=["duckduckgo", "wikipedia"], server=object()))
+    # No google engine was fired (reserve tier is gone).
+    assert not any(r.name == "google" for r in reports)
+    assert any(r.url == "https://en.wikipedia.org/wiki/A" for r in ranked)
 
 
 def test_prewarm_search_engines_warms_each_default_engine(monkeypatch):
@@ -574,10 +571,11 @@ def test_prewarm_search_engines_warms_each_default_engine(monkeypatch):
     monkeypatch.setattr(se._ENGINES_COORD, "warmup", fake_warmup)
     asyncio.run(se.prewarm_search_engines())
     names = {n for n, _ in warmed}
-    assert names == {"duckduckgo", "bing"}
+    assert names == {"duckduckgo", "bing", "brave"}  # 3 independent HTTP defaults (mojeek is opt-in)
     # each warmup URL hits the engine's real search host
     assert all("duckduckgo" in u for n, u in warmed if n == "duckduckgo")
     assert all("bing.com" in u for n, u in warmed if n == "bing")
+    assert all("brave" in u for n, u in warmed if n == "brave")
 
 
 def test_prewarm_search_engines_never_raises(monkeypatch):

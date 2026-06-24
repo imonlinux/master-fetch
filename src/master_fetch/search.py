@@ -1,11 +1,13 @@
 """Hound local web search (v7 flagship: keyless, no-account, fully local).
 
-Scrapes public search engines (DuckDuckGo, Bing, Google, Wikipedia) via the
+Scrapes public search engines (DuckDuckGo, Bing, Mojeek, Brave, Wikipedia) via the
 hound-native engine layer in search_engines.py - no third-party API, no key, no
 account. Results are merged across engines, deduped by normalized URL, and
-ranked. Every result carries a relevance_score and a fetch_relevance tier so the
-agent fetches the right 1-2 URLs via smart_fetch itself (search returns URLs +
-ranking, NOT page content - the agent decides what to fetch).
+ranked. Merging INDEPENDENT indexes gives a free authority signal: a URL
+returned by several engines is a consensus hit (engines_consensus field) and
+gets a ranking boost. Every result also carries a relevance_score and a
+fetch_relevance tier so the agent fetches the right URLs via smart_fetch itself
+(search returns URLs + ranking, NOT page content - the agent decides what to fetch).
 
 Rerank modes: keyword (BM25, always available, even on the lean install), neural
 (local ONNX cross-encoder on snippets, needs [all]), find_similar (pass url=,
@@ -26,7 +28,7 @@ from master_fetch.cache import get_cached, set_cached
 from master_fetch.security import validate_search_query, validate_url, redact_api_key, SecurityError
 from master_fetch.search_engines import (
     RawResult, multi_search, EngineReport, DEFAULT_ENGINES, bm25_rerank,
-    fetch_source_for_similar,
+    fetch_source_for_similar, _INDEX_FAMILY,
 )
 from master_fetch.reranker import (
     rerank as neural_rerank, unavailable_reason, get_reranker,
@@ -43,10 +45,11 @@ class SearchResult(BaseModel):
     title: str = Field(description="Result title")
     url: str = Field(description="Result URL")
     snippet: str = Field(default="", description="Result snippet from the engine")
-    source: str = Field(default="", description="Engine that returned this result (duckduckgo/bing/google/wikipedia)")
+    source: str = Field(default="", description="Engine(s) that returned this result (duckduckgo/bing/mojeek/brave/wikipedia/yahoo). Multiple = cross-engine consensus.")
     position: int = Field(default=0, description="1-indexed rank after merge + rerank")
-    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (BM25 over title+snippet, or neural cross-encoder score in neural mode). 1.0 = most relevant in this set.")
+    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (BM25 over title+snippet, or neural cross-encoder score in neural mode), boosted by cross-engine consensus. 1.0 = most relevant in this set.")
     fetch_relevance: str = Field(default="", description="high|med|low - relative relevance hint. smart_fetch what matches your need; the tiers rank results but a lower tier can be the right one - use your judgment.")
+    engines_consensus: str = Field(default="", description="How many independent indexes returned this URL (e.g. '3 of 4'). A free authority signal: a URL returned by several independent engines is more likely authoritative.")
 
 
 class SearchResponseModel(BaseModel):
@@ -111,7 +114,7 @@ def _search_next_action(results: list[SearchResult], engine_blocked: list[str],
                     "or set HOUND_SEARCH_PROXY for sustained heavy use.")
         return "No results. Rephrase (more specific / different terms) or try mode=neural for semantic matching."
     high = [r for r in results if r.fetch_relevance == "high"]
-    base = ("Results are ranked by relevance (relevance_score + fetch_relevance). "
+    base = ("Results are ranked by relevance + cross-engine consensus (engines_consensus = how many independent indexes agree). "
             "smart_fetch the ones that match what you actually need - the ranking is a hint, "
             "not a directive; a lower-ranked result can be the right one, so trust your judgment.")
     if not high:
@@ -153,7 +156,7 @@ def _validate_engines(engines):
         raise SecurityError("engines must be a non-empty list")
     if len(engines) > 6:
         raise SecurityError("engines list too long (max 6)")
-    valid = set(DEFAULT_ENGINES) | {"google", "wikipedia"}
+    valid = set(DEFAULT_ENGINES) | {"wikipedia", "yahoo"}
     for e in engines:
         if not isinstance(e, str) or e.lower() not in valid:
             raise SecurityError(f"Invalid engine: {e!r} (one of {sorted(valid)})")
@@ -200,19 +203,51 @@ def _rank(query: str, ranked: list[RawResult], mode: str):
     return [r for r, _ in scored], [s for _, s in scored], "keyword", note
 
 
-def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None
-                   ) -> list[SearchResult]:
-    """Convert RawResults (already ranked) into SearchResults with tiers."""
+def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None,
+                   total_families: int = 1) -> list[SearchResult]:
+    """Convert RawResults (already ranked) into SearchResults with tiers + consensus."""
     total = len(ranked)
     out: list[SearchResult] = []
     for i, r in enumerate(ranked):
         score = scores[i] if scores and i < len(scores) else 0.0
+        src = ",".join(r.sources) if r.sources else (r.source or "")
+        consensus = f"{max(1, getattr(r, 'consensus', 1))} of {max(1, total_families)}"
         out.append(SearchResult(
-            title=r.title, url=r.url, snippet=r.snippet, source=r.source,
+            title=r.title, url=r.url, snippet=r.snippet, source=src,
             position=i + 1, relevance_score=round(score, 4),
             fetch_relevance=_tier(score, i + 1, total),
+            engines_consensus=consensus,
         ))
     return out
+
+
+def _apply_consensus_boost(ranked: list[RawResult], scores: list[float]
+                           ) -> tuple[list[RawResult], list[float]]:
+    """Boost results returned by multiple independent engines (consensus). A free
+    authority signal from merging independent indexes: a URL returned by N
+    distinct index-families gets score * (1 + 0.25*(N-1)). Consensus AMPLIFIES
+    relevance rather than overriding it (a consensus-but-irrelevant result still
+    ranks low). Also breaks the neural-saturation tie (ms-marco gives ~1.0 for any
+    clearly-relevant snippet; consensus is a discrete 1..N discriminator). Costs
+    zero extra fetches (consensus is stamped during merge). Re-sorts by boosted
+    score and renormalizes to 0..1 (top = 1.0)."""
+    if not ranked:
+        return ranked, scores
+    boosted = []
+    for r, s in zip(ranked, scores):
+        c = max(1, getattr(r, "consensus", 1))
+        boosted.append((r, s * (1 + 0.25 * (c - 1))))
+    order = {id(r): i for i, (r, _) in enumerate(boosted)}
+    boosted.sort(key=lambda rs: (-rs[1], -getattr(rs[0], "consensus", 1), rs[0].position, order[id(rs[0])]))
+    # Keep the field in 0..1: only renormalize when a consensus boost pushed a
+    # score above 1.0. Otherwise preserve the ranker's raw scores (e.g. neural's
+    # absolute sigmoid signal) so the tier derivation + tests stay meaningful.
+    mx = max((s for _, s in boosted), default=0.0)
+    if mx > 1.0:
+        boosted = [(r, round(s / mx, 4)) for r, s in boosted]
+    else:
+        boosted = [(r, round(s, 4)) for r, s in boosted]
+    return [r for r, _ in boosted], [s for _, s in boosted]
 
 
 # ─── main entry ───────────────────────────────────────────────────────────────
@@ -220,7 +255,7 @@ def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[fl
 async def smart_search(
     server,
     query: str,
-    max_results: int = 9,
+    max_results: int = 6,
     cache_ttl: int = SEARCH_CACHE_TTL,
     mode: str = "auto",
     engines: Optional[list[str]] = None,
@@ -234,9 +269,11 @@ async def smart_search(
     freshness: Optional[str] = None,
 ) -> SearchResponseModel:
     """Local keyless web search (no API key, no account). Engines (default
-    duckduckgo+bing; add 'google' or 'wikipedia') are scraped in parallel, merged,
-    deduped, and ranked. Returns URLs + ranking (NOT page content) so the agent
-    smart_fetches the right 1-2 itself.
+    duckduckgo+bing+brave - three independent indexes (all HTTP, no browser);
+    add 'wikipedia' or 'yahoo') are scraped in parallel, merged, deduped, and ranked. A URL returned
+    by several independent engines is a consensus hit (engines_consensus field) and
+    gets a ranking boost - a free authority signal. Returns URLs + ranking (NOT
+    page content) so the agent smart_fetches the ones it wants itself.
 
     mode: auto (neural if [all]+model present else keyword), keyword (BM25),
     neural (cross-encoder on snippets; better for semantic/ambiguous queries),
@@ -282,7 +319,7 @@ async def smart_search(
         region = f"{loc}-{lang}" if len(loc) == 2 else "us-en"
 
     cache_query = find_sim_url or query
-    cache_type = (f"search:v3:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
+    cache_type = (f"search:v4:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
     if cache_ttl > 0:
         cached = await get_cached(cache_query, cache_type, None, ttl=cache_ttl)
         if cached and cached.get("content"):
@@ -350,8 +387,11 @@ async def smart_search(
             if ranked and get_reranker() is None:
                 rerank_note = ("find_similar used keyword BM25 (neural unavailable). " +
                                (unavailable_reason() or "install hound-mcp[all]"))
+        _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
+        total_families = len(_efams) or 1
+        ranked_list, scores = _apply_consensus_boost(ranked_list, scores)
         ranked_list, scores = ranked_list[:max_results], scores[:max_results]
-        results_list = _build_results(cache_query, ranked_list, scores)
+        results_list = _build_results(cache_query, ranked_list, scores, total_families)
         sim_note = f"find_similar to {find_sim_url} (searched: {derived_query[:60]!r})"
         fetch_hint = compute_fetch_hint(results_list)
         fetch_hint = (fetch_hint + " | " + sim_note) if fetch_hint else sim_note
@@ -376,8 +416,11 @@ async def smart_search(
             )
 
         ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
+        _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
+        total_families = len(_efams) or 1
+        ranked_list, scores = _apply_consensus_boost(ranked_list, scores)
         ranked_list, scores = ranked_list[:max_results], scores[:max_results]
-        results_list = _build_results(query, ranked_list, scores)
+        results_list = _build_results(query, ranked_list, scores, total_families)
         fetch_hint = compute_fetch_hint(results_list)
         if rerank_note:
             fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note

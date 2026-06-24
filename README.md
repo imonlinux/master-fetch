@@ -69,7 +69,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 |------|-----------|
 | `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk, PDFs (with OCR + quality score), `css_selector`, `focus`, `actions`, pagination. |
 | `smart_crawl` | Best-first same-domain crawl. Each page as markdown with `content_ok` + `page_type` (article / list / js_shell). `discover_only`, `crawl_urls`, `focus`, time + token caps. |
-| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing in parallel (add `google`/`wikipedia`), merges + ranks. `relevance_score` + `fetch_relevance` per result. Keyword / neural / find_similar. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows engines that didn't contribute. |
+| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing + Brave in parallel (3 independent indexes; add `wikipedia`/`yahoo`), merges + ranks with cross-engine consensus. `relevance_score` + `fetch_relevance` + `engines_consensus` per result. Keyword / neural / find_similar. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows engines that didn't contribute. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
 | `version` | Installed version + update status. |
@@ -81,7 +81,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 
 **`smart_crawl`** — Best-first walk of same-domain links. Content-adaptive: article/docs → main content; list/index pages → structured link list; JS shells → detected + reported. `discover_only=true` → URL map. `crawl_urls=[...]` → second-phase selective crawl. `focus` prioritizes + filters. Caps: `max_pages` (10), `max_depth` (2), `max_total_chars`, `deadline_ms` (120000). Per-page `content_ok` + `status` (network error = −1) + `fetched_at`. Reuses `smart_fetch` anti-bot + cache.
 
-**`smart_search`** — Scrapes DuckDuckGo + Bing in parallel (add `google` or `wikipedia`), merges, dedups by normalized URL, ranks. Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural if `[all]`+model present else keyword BM25), `keyword`, `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`). `engine_blocked` lists engines that didn't contribute (rate-limited/timed out/no results).
+**`smart_search`** — Scrapes DuckDuckGo + Bing + Brave in parallel (three INDEPENDENT indexes — not the same feed twice; add `wikipedia` or `yahoo`), merges, dedups by normalized URL, ranks, and boosts **cross-engine consensus** (a URL returned by several independent engines is an authority signal). Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural if `[all]`+model present else keyword BM25), `keyword`, `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`). `engine_blocked` lists engines that didn't contribute (rate-limited/timed out/no results).
 
 </details>
 
@@ -93,14 +93,14 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-scene.png" alt="Hound fetches the web and brings it back to your agent" width="820">
 </div>
 
-No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing** in parallel (add `google` or `wikipedia`), merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive). Every result carries `relevance_score` (0–1) and `fetch_relevance` (**high** / **med** / **low**).
+No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing + Brave** in parallel — three INDEPENDENT indexes (Brave runs its own 30B-page crawler; DuckDuckGo + Bing are not the same feed twice) — merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive). Every result carries `relevance_score` (0–1), `fetch_relevance` (**high** / **med** / **low**), and `engines_consensus` (how many independent indexes returned that URL — a free authority signal).
 
 **Three rerank modes:**
 - **`keyword`** — BM25 over title + snippet. Baseline, always available, even on the lean install.
 - **`neural`** — a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. Exa-style semantic ranking, $0, on your machine. The model downloads once (~80MB, cached, not bundled).
 - **`find_similar`** — pass `url=`; Hound fetches a page you like, derives a query, and reranks candidates against that source page. Exa's find-similar, local.
 
-`smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 9 results. `google` is opt-in (it often CAPTCHAs/consents; when it does it shows up in `engine_blocked` so you know, instead of silently contributing nothing). `wikipedia` is opt-in too (off by default — its results were usually tangential).
+`smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 6 results. **Google is not scraped** — it CAPTCHAs even via the stealthy browser, so it was removed rather than silently contributing nothing. `wikipedia` + `yahoo` are opt-in (`yahoo` serves Bing's index from a different server, handy when bing.com rate-limits). The three defaults are all HTTP (no browser needed), so search stays fast.
 
 ### 🛡️ Search Engine Resilience Layer
 
@@ -113,7 +113,7 @@ Scraping public engines from your IP can be rate-limited or CAPTCHA'd. No keyles
 | 3 | **Circuit breaker + cooldown** | A blocked engine auto-cools (15 → 120s) while the others keep serving. Results keep flowing. |
 | 4 | **202 / 429 / 503 / 403 + Retry-After** | DDG's HTTP 202 soft rate-limit is detected; `Retry-After` honored. |
 | 5 | **Fingerprint rotation** | A pool of real Chrome / Edge / Firefox / Safari TLS profiles, picked per request. |
-| 6 | **Adaptive Google reserve tier** | Google (most CAPTCHA-prone) fires via the stealthy browser only when the primaries fall short. |
+| 6 | **Diverse independent pool + cross-engine consensus** | Three independent indexes (DuckDuckGo, Bing, Brave) run in parallel — no single engine is a bottleneck, and a URL returned by several of them gets a consensus boost (a free authority signal from merging independent indexes, no extra fetches). |
 | 7 | **`HOUND_SEARCH_PROXY`** | Route all engine requests through your own rotating / residential proxy — the bulletproof path for heavy use. |
 
 `engine_blocked` in the response tells the agent which engines are cooling down (retry shortly). Same gray-area posture as SearXNG / ddgs; no search-engine ToS compliance is claimed.

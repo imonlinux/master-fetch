@@ -112,10 +112,10 @@ def test_smart_search_passes_filters_and_engines_to_multi(monkeypatch):
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     asyncio.run(_ss(srv, "python", max_results=5, cache_ttl=0,
-                    engines=["duckduckgo", "google"], site="docs.python.org",
+                    engines=["duckduckgo", "wikipedia"], site="docs.python.org",
                     exclude_sites=["pinterest.com"], location="GB",
                     language="fr", freshness="week", page=1))
-    assert cap["engines"] == ["duckduckgo", "google"]
+    assert cap["engines"] == ["duckduckgo", "wikipedia"]
     assert cap["site"] == "docs.python.org"
     assert cap["exclude_sites"] == ["pinterest.com"]
     assert cap["region"] == "gb-fr"  # derived from location GB + language fr
@@ -156,7 +156,7 @@ def test_cache_keys_differ_by_engine_and_freshness(monkeypatch):
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     asyncio.run(_ss(srv, "python", cache_ttl=60))
-    asyncio.run(_ss(srv, "python", cache_ttl=60, engines=["google"]))
+    asyncio.run(_ss(srv, "python", cache_ttl=60, engines=["wikipedia"]))
     asyncio.run(_ss(srv, "python", cache_ttl=60, freshness="day"))
     asyncio.run(_ss(srv, "python", cache_ttl=60, site="docs.python.org"))
     types = [t for (_u, t) in store.keys()]

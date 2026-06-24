@@ -643,7 +643,82 @@ env escape hatch for power users w/ a rotating proxy. New `_engine_get` seam
 clean IP, cooldown idle. Honest line: not bulletproof without a proxy, but
 dramatically more robust for single-user real agent work. tools/list ~2.6K tokens.
 
+### v7.2 batch (UNRELEASED, built 2026-06-24) — diverse independent pool + cross-engine consensus
+
+Dondai's ask: Google is hopeless (remove it); DDG+Bing are ~99% the same quality
+but still rate-limit; default 9 -> 6 (5 usually enough); solve rate-limiting once
+and for all WITHOUT trading away speed (no just-add-delays cheating); find other
+free engines. Research found: Brave Search API free tier KILLED Feb 2026 (now
+metered billing + card + attribution) BUT the Brave WEB UI is keyless + an
+independent 30B-page index; Mojeek is an independent index too. Live-tested both:
+
+- **Brave (web) ADDED as a default engine.** Independent index (breaks the
+  DDG≈Bing 99% overlap). BUT curl_cffi/scrapling returns curl error 23 on
+  search.brave.com (every fingerprint) while stdlib urllib returns 200 + 20
+  parseable results (data-type="web" snippets, direct URLs). So Brave rides a
+  URLLIB transport inside the SERL coordinator (`_URLLIB_ENGINES`, `_urllib_fetch`,
+  `asyncio.to_thread`) — still gets the pacer + circuit breaker. urllib is stdlib,
+  so lean installs get Brave too. Selectors: `div.snippet[data-type="web"]` ->
+  `a[href]` (direct), `.snippet-title`/`.title`, `.generic-snippet`. Freshness
+  `&tf=`, pagination `&offset=`, `&safesearch=off`.
+- **Google REMOVED entirely** (engine, reserve tier, advertised option). It
+  CAPTCHAs even via the stealthy browser. `engines=['google']` now rejected with
+  the valid-set error.
+- **Mojeek DROPPED** (was tried as a default then opt-in). 403s ALL HTTP
+  (scrapling + plain requests + Mozilla UA) AND 403s the stealthy Patchright
+  browser (`<title>403 - Forbidden</title>`) — IP-blocked in this environment.
+  Only a real browser on a clean IP would work (the searxng-cli ref used pydoll
+  Chrome at 4 req/min). Unreliable + per-search browser render = speed cost ->
+  cut entirely rather than ship a broken opt-in.
+- **Yahoo ADDED as opt-in** (`engines=['yahoo']`): serves Bing's index from
+  Yahoo's servers (different IP/rate bucket) = redundancy for Bing's index when
+  bing.com rate-limits. RU= redirect decoding. Not a default (same index as bing).
+- **DEFAULT_ENGINES = (duckduckgo, bing, brave)** — 3 independent index families,
+  all HTTP (no browser needed for the default pool -> speed preserved).
+- **Default max_results 9 -> 6.**
+- **Cross-engine consensus ranking (the unique strong feature, zero speed cost):**
+  merge_dedupe now tracks which engines returned each URL + stamps
+  `RawResult.consensus` = number of DISTINCT index-families (`_INDEX_FAMILY`:
+  yahoo counts as the bing family). `_apply_consensus_boost` in search.py:
+  `score *= (1 + 0.25*(consensus-1))` (consensus AMPLIFIES relevance, doesn't
+  override; a consensus-but-irrelevant result still ranks low). Also breaks the
+  neural-saturation tie (ms-marco gives ~1.0 for any clearly-relevant snippet;
+  consensus is a discrete 1..N discriminator). New agent-facing field
+  `engines_consensus` ("N of M independent indexes") + `source` now shows all
+  agreeing engines (e.g. "brave,duckduckgo"). Re-normalizes to 0..1 only when a
+  boost pushes a score >1.0 (preserves raw neural scores otherwise).
+- **Rate-limiting solved without speed cost:** 3 independent engines run in
+  PARALLEL (wall-clock = max(slowest, 8s deadline) ≈ same as 2 engines). When one
+  rate-limits, the circuit breaker rests it (15-120s) + the other 2 INDEPENDENT
+  indexes carry genuinely different results (not the 99%-overlap useless
+  redundancy of ddg+bing-only). Live-verified: 5 rapid searches, Brave blocked on
+  query 4 -> ddg+bing carried, 6 results every time, agent never saw a failure.
+- Cache key bumped `search:v3` -> `search:v4` (consensus field). 617 tests pass.
+- Live-verified: rust/pizza/asyncio/reverse-list queries all return 6 results
+  from ddg+bing+brave with consensus hits surfacing authoritative URLs (tokio.rs,
+  github.com/tokio-rs/tokio) to rank #1-2.
+
 ## Dev notes / API quirks
+
+- **v7.2 engine transport quirks (search_engines.py):**
+  - **Brave (search.brave.com) FAILS under curl_cffi/scrapling** with curl error
+    23 (CURLE_WRITE_ERROR) on EVERY impersonate fingerprint (chrome/edge/safari/
+    firefox), but stdlib `urllib` returns 200 + 20 parseable results (no TLS
+    impersonation needed). So Brave uses a urllib transport (`_URLLIB_ENGINES`,
+    `_urllib_fetch` via `asyncio.to_thread`) INSIDE the SERL coordinator (keeps
+    the pacer + circuit breaker). urllib is stdlib -> lean installs get Brave.
+  - **Mojeek 403s ALL HTTP** (scrapling + plain requests + Mozilla UA) AND 403s
+    the stealthy Patchright browser (`<title>403 - Forbidden</title>`) - IP-blocked
+    in this environment. Dropped entirely; only a real browser on a clean IP works.
+  - **Brave Search API free tier was KILLED Feb 2026** (now metered billing + card
+    + attribution requirement) - that's why hound scrapes the keyless web UI, not
+    the API. Bing Search API was also killed by Microsoft summer 2025.
+  - **Brave selectors** (verified live): `div.snippet[data-type="web"]` -> `a[href]`
+    (direct URL, no redirect), `.snippet-title`/`.title`, `.generic-snippet`. URL
+    params: `q=`, `source=web`, `safesearch=off`, `tf={d|w|m|y}` (freshness),
+    `offset=` (pagination).
+  - **Yahoo selectors**: `div.algo-sr`/`div.algo` -> `a[href]` (RU= redirect,
+    decode `/RU=ENCODED/RK=`), `h3.title`, `.compText`. Bing-feed (redundancy).
 
 - **Dev venv ships a BUILT WHEEL, not an editable install**: master-fetch's dev
   venv (`.venv/`) contains a BUILT WHEEL in `site-packages/`, NOT an editable

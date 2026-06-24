@@ -1,9 +1,18 @@
 """Hound-native keyless search engine scrapers (v7 local search flagship).
 
 No API key, no account, no third-party service. Scrapes public search engines
-(DuckDuckGo, Bing, Google, Wikipedia) over browser-impersonated HTTP (scrapling
-FetcherSession, a CORE dependency, so lean installs get working search), with
-escalation to hound's warm stealthy Patchright browser when an engine blocks.
+(DuckDuckGo, Bing, Brave, Wikipedia) over browser-impersonated HTTP
+(scrapling FetcherSession, a CORE dependency, so lean installs get working
+search), with escalation to hound's warm stealthy Patchright browser when an
+engine blocks. Google is NOT scraped: it CAPTCHAs even via the stealthy browser.
+
+Diversity + consensus (the rate-limit fix that costs zero speed): the default
+pool is three INDEPENDENT indexes (DuckDuckGo, Bing, Brave) run in
+parallel. They rarely all rate-limit at once (different clocks), so if 1-2 block
+the others carry genuinely different results. Merging independent indexes also
+yields a free authority signal: a URL returned by several engines is a CONSENSUS
+hit. merge_dedupe counts the distinct index-families per URL (RawResult.consensus)
+so the ranker can boost consensus hits at zero extra fetch cost.
 
 Built for one job: feed smart_fetch.
 
@@ -20,9 +29,9 @@ per-engine coordinator (_EngineCoordinator) in front of every SERP request:
      rate-limit; this was a missed case before).
   5. Fingerprint rotation: scrapling impersonate list picks a real Chrome/Edge/
      Firefox/Safari TLS fingerprint per request.
-  6. Adaptive reserve tier: Google (most CAPTCHA-prone) is held in reserve and
-     only fires via the stealthy browser when the primary engines fall short AND
-     one was blocked.
+  6. Diverse independent pool + cross-engine consensus: 4 independent indexes
+     run in parallel (no single engine is a bottleneck); a URL returned by N
+     distinct index-families gets a consensus boost (free authority signal).
   7. HOUND_SEARCH_PROXY env: route all engine requests through a user-supplied
      proxy (residential/rotating) for near-unblockable heavy use. Not bundled.
 
@@ -50,14 +59,14 @@ from master_fetch.crawl import normalize_url
 
 logger = logging.getLogger("master-fetch.search_engines")
 
-DEFAULT_ENGINES = ("duckduckgo", "bing")
+DEFAULT_ENGINES = ("duckduckgo", "bing", "brave")
 ENGINE_TIMEOUT = 12  # seconds per engine request
-CAPTCHA_MARKERS = ("captcha", "unusual traffic", "are you a robot", "sorry/image", "ddg-captcha", "blocked", "access denied", "before you continue to google", "to continue, please agree")
+CAPTCHA_MARKERS = ("captcha", "unusual traffic", "are you a robot", "sorry/image", "ddg-captcha", "blocked", "access denied", "to continue, please agree")
 
 # Per-engine pacing: min seconds between successive requests to the SAME engine.
 # Within a single search all engines fire in parallel (each engine sees 1 req),
 # so this only spreads same-engine bursts across successive searches.
-_PACE = {"duckduckgo": 1.2, "bing": 1.5, "wikipedia": 0.3, "google": 2.0}
+_PACE = {"duckduckgo": 1.2, "bing": 1.5, "brave": 1.2, "wikipedia": 0.3, "yahoo": 1.5}
 _COOLDOWN_BASE = 15.0   # seconds; doubles each consecutive block
 _COOLDOWN_CAP = 120.0   # max cooldown
 _RECREATE_EVERY = 3     # recreate the persistent session every N consecutive blocks (burned session)
@@ -82,14 +91,52 @@ except ValueError:
 # makes scrapling pick one at random per request -> fingerprint rotation.
 _IMPERSONATE_POOL = ["chrome131", "chrome136", "chrome142", "edge", "safari184", "firefox147"]
 
+# Engines that curl_cffi/scrapling CANNOT reach (transport error) but stdlib
+# urllib fetches fine (no TLS impersonation needed). Routed through urllib inside
+# the SERL coordinator so they still get the pacer + circuit breaker. Brave is the
+# key one: independent 30B-page index, but curl_cffi returns curl error 23 on
+# search.brave.com while urllib returns 200 + parseable HTML.
+_URLLIB_ENGINES = {"brave"}
+_BRAVE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                 "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _urllib_fetch(url: str, timeout: int = ENGINE_TIMEOUT) -> tuple[Optional[str], int]:
+    """Plain stdlib HTTP GET for engines curl_cffi cannot reach (e.g. Brave).
+    No TLS impersonation, but these engines do not require it. Sync - call via
+    asyncio.to_thread. Returns (text, status); (None, 0) on transport error.
+    An HTTPError (4xx/5xx) still returns its body so _is_blocked can inspect it."""
+    import urllib.request, urllib.error, ssl
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers=_BRAVE_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            body = r.read()
+            charset = r.headers.get_content_charset() or "utf-8"
+            return body.decode(charset, errors="replace"), int(r.status)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        return body, int(e.code)
+    except Exception:
+        return None, 0
+
 
 @dataclass
 class RawResult:
     title: str
     url: str
     snippet: str
-    source: str  # engine name
+    source: str  # engine name (the copy that won the dedup)
     position: int = 0  # 1-indexed within its engine
+    consensus: int = 1       # distinct independent index-families that returned this URL
+    sources: tuple = ()      # all engine names that returned this URL (set by merge_dedupe)
 
 
 @dataclass
@@ -205,6 +252,14 @@ class _EngineCoordinator:
         server startup; errors are swallowed silently."""
         st = self.state(name)
         async with st.lock:
+            if name in _URLLIB_ENGINES:
+                # urllib is stateless (no TLS session to warm); a throwaway GET
+                # only primes DNS. Best-effort.
+                try:
+                    await asyncio.to_thread(_urllib_fetch, url, int(timeout))
+                except Exception:
+                    pass
+                return
             await self._ensure_session(st)
             if st.sess is None:
                 return
@@ -268,34 +323,40 @@ class _EngineCoordinator:
             elapsed = now - st.last_req
             if elapsed < pace:
                 await asyncio.sleep(pace - elapsed + random.uniform(0, 0.35))
-            await self._ensure_session(st)
             st.last_req = time()
 
             text: Optional[str] = None
             status = 0
             try:
-                if st.sess is not None:
-                    if method == "POST" and form is not None:
-                        resp = await st.sess.post(url, data=form, timeout=timeout)
-                    else:
-                        resp = await st.sess.get(url, timeout=timeout)
+                if name in _URLLIB_ENGINES:
+                    # urllib transport (curl_cffi cannot reach these hosts).
+                    text, status = await asyncio.to_thread(_urllib_fetch, url, timeout)
+                    blocked = _is_blocked(status, text or "")
+                    ra = 0.0
                 else:
-                    # Per-request fallback if the persistent session would not create.
-                    cm = self._make_session()
-                    s2 = await cm.__aenter__()
-                    try:
+                    await self._ensure_session(st)
+                    if st.sess is not None:
                         if method == "POST" and form is not None:
-                            resp = await s2.post(url, data=form, timeout=timeout)
+                            resp = await st.sess.post(url, data=form, timeout=timeout)
                         else:
-                            resp = await s2.get(url, timeout=timeout)
-                    finally:
-                        await cm.__aexit__(None, None, None)
-                status = getattr(resp, "status", 0) or 0
-                body = getattr(resp, "body", None)
-                if body:
-                    text = body.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
-                blocked = _is_blocked(status, text or "")
-                ra = _retry_after(resp)
+                            resp = await st.sess.get(url, timeout=timeout)
+                    else:
+                        # Per-request fallback if the persistent session would not create.
+                        cm = self._make_session()
+                        s2 = await cm.__aenter__()
+                        try:
+                            if method == "POST" and form is not None:
+                                resp = await s2.post(url, data=form, timeout=timeout)
+                            else:
+                                resp = await s2.get(url, timeout=timeout)
+                        finally:
+                            await cm.__aexit__(None, None, None)
+                    status = getattr(resp, "status", 0) or 0
+                    body = getattr(resp, "body", None)
+                    if body:
+                        text = body.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
+                    blocked = _is_blocked(status, text or "")
+                    ra = _retry_after(resp)
             except Exception as e:
                 logger.debug(f"engine {name} GET failed: {e}")
                 return None, 0, False, False  # transport error, not a rate-limit
@@ -350,6 +411,7 @@ async def close_search_engines() -> None:
 _WARMUP_URLS = {
     "duckduckgo": "https://html.duckduckgo.com/html/?q=test",
     "bing": "https://www.bing.com/search?q=test",
+    "brave": "https://search.brave.com/search?q=test&source=web",
     "wikipedia": "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=test&srlimit=1&srprop=snippet&format=json&utf8=1",
 }
 
@@ -508,100 +570,125 @@ async def search_bing(query: str, max_results: int, *, region: str = "us-en",
     return results, rep
 
 
-# ─── Google (stealthy-friendly; impersonated HTTP often CAPTCHAs) ────────────
+# ─── Brave (independent 30B-page index, keyless web UI) ──────────────────────
 
-def _parse_google(html: str) -> list[RawResult]:
+def _parse_brave(html: str) -> list[RawResult]:
     soup = BeautifulSoup(html, "lxml")
     out: list[RawResult] = []
-    seen: set[str] = set()
-    # Modern Google wraps each result in div.g (often nested in div.MjjYud) with an
-    # <a> containing an <h3> + a snippet span. Be liberal: try several containers
-    # + a fallback that scans every <a> with an <h3> child, since Google's markup
-    # shifts often.
-    blocks = soup.select("div.g, div._kno, div[data-ved], div.MjjYud")
-    for block in blocks:
-        a = block.select_one("a:has(h3)") or block.select_one("h3 a, a h3")
-        if not a:
-            h3 = block.select_one("h3")
-            if h3:
-                a = h3.find_parent("a")
+    # Brave SERP: each organic result is a div.snippet with data-type="web"; the
+    # result link is a direct http URL (no redirect wrapper). Selectors verified
+    # against the webserp reference impl (MIT) + live.
+    for i, el in enumerate(soup.select('div.snippet[data-type="web"]')):
+        a = el.select_one("a[href]")
         if not a:
             continue
         href = a.get("href", "") or ""
-        if href.startswith("/url?"):
-            qs = parse_qs(urlparse(href).query)
-            href = qs.get("q", [""])[0] or href
         if not href.startswith("http"):
             continue
-        h3 = block.select_one("h3")
-        title = h3.get_text(" ", strip=True) if h3 else a.get_text(" ", strip=True)
+        title_el = el.select_one(".snippet-title") or el.select_one(".title")
+        title = title_el.get_text(" ", strip=True) if title_el else a.get_text(" ", strip=True)
         if not title:
             continue
-        if href in seen:
-            continue
-        seen.add(href)
-        snip = block.select_one(".VwiC3b, [data-sncf], span.aCOpRe, div.IsZvec span, .IsZvec, [style='-webkit-line-clamp']")
-        snippet = snip.get_text(" ", strip=True) if snip else ""
-        out.append(RawResult(title=title, url=href, snippet=snippet, source="google", position=len(out) + 1))
-        if len(out) >= 30:
-            break
-    # Fallback: scan every <a> with an <h3> child (catches layouts the block
-    # selectors miss).
-    if not out:
-        for a in soup.select("a:has(h3)"):
-            href = a.get("href", "") or ""
-            if href.startswith("/url?"):
-                qs = parse_qs(urlparse(href).query)
-                href = qs.get("q", [""])[0] or href
-            if not href.startswith("http") or href in seen:
-                continue
-            h3 = a.select_one("h3")
-            title = h3.get_text(" ", strip=True) if h3 else ""
-            if not title:
-                continue
-            seen.add(href)
-            out.append(RawResult(title=title, url=href, snippet="", source="google", position=len(out) + 1))
-            if len(out) >= 30:
-                break
+        desc_el = el.select_one(".generic-snippet") or el.select_one(".snippet-description")
+        snippet = desc_el.get_text(" ", strip=True) if desc_el else ""
+        out.append(RawResult(title=title, url=href, snippet=snippet, source="brave", position=i + 1))
     return out
 
 
-async def search_google(query: str, max_results: int, *, region: str = "us-en",
-                        freshness: Optional[str] = None, page: int = 0,
-                        server=None) -> tuple[list[RawResult], EngineReport]:
-    params = f"q={quote(query)}&hl=en&num={max(min(max_results * 2, 50), 10)}"
+async def search_brave(query: str, max_results: int, *, region: str = "us-en",
+                       freshness: Optional[str] = None, page: int = 0,
+                       server=None) -> tuple[list[RawResult], EngineReport]:
+    # Brave: independent index (30B pages). The Brave Search API free tier was
+    # KILLED Feb 2026 (now metered billing + card + attribution), so hound scrapes
+    # the keyless web UI (search.brave.com/search) instead. Freshness via &tf=
+    # (d/w/m/y). Pagination via &offset=. safesearch=off for unfiltered results.
+    params = f"q={quote(query)}&source=web&safesearch=off"
     if freshness in ("day", "week", "month", "year"):
-        params += f"&tbs=qdr:{freshness[0]}"
+        params += f"&tf={freshness[0]}"
     if page > 0:
-        params += f"&start={page * max_results + 1}"
-    url = f"https://www.google.com/search?{params}"
-    text, status, blocked, cooling = await _engine_get("google", url)
-    rep = EngineReport(name="google")
-    # Google almost always CAPTCHAs plain impersonated HTTP under any load; if
-    # blocked or empty, escalate to the warm stealthy browser (the flagship move).
-    if (blocked or not text) and not cooling and server is not None:
+        params += f"&offset={page * max_results}"
+    url = f"https://search.brave.com/search?{params}"
+    text, status, blocked, cooling = await _engine_get("brave", url)
+    rep = EngineReport(name="brave")
+    if blocked and not cooling and server is not None:
         escalated = await _stealthy_html(server, url)
         if escalated:
             text, blocked = escalated, False
-            _ENGINES_COORD.reset("google")
+            _ENGINES_COORD.reset("brave")
     if not text:
-        rep.blocked = blocked or (status in (429, 503, 403, 202))
-        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('google'))}s left)"
+        rep.blocked = blocked
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('brave'))}s left)"
                      if cooling else f"no response (status {status})")
         return [], rep
-    # Google often serves a CONSENT / interstitial page (consent.google.com or
-    # "Before you continue to Google") instead of results in many regions. Detect
-    # it so the failure is honest (blocked), not a silent 0-result 200-OK.
-    low = text.lower()
-    if "consent.google.com" in low or "before you continue to google" in low:
-        rep.blocked = True
-        rep.error = "google consent/interstitial page (no results)"
-        return [], rep
-    results = _parse_google(text)[:max_results]
+    results = _parse_brave(text)[:max_results]
     rep.ok = bool(results)
     rep.blocked = (not results) and blocked
     if not results:
-        rep.error = "no results parsed (likely CAPTCHA or layout shift)"
+        rep.error = "no results parsed"
+    return results, rep
+
+
+# ─── Yahoo (Bing-feed index; opt-in redundancy for when Bing rate-limits) ────
+
+def _yahoo_real_url(href: str) -> str:
+    """Decode a Yahoo redirect (r.search.yahoo.com/.../RU=ENCODED/RK=...) to the real URL."""
+    if not href:
+        return ""
+    if "/RU=" in href:
+        raw = href.split("/RU=", 1)[1].split("/RK=", 1)[0].split("/RS=", 1)[0]
+        decoded = unquote(raw)
+        if decoded.startswith("http"):
+            return decoded
+    return href if href.startswith("http") else ""
+
+
+def _parse_yahoo(html: str) -> list[RawResult]:
+    soup = BeautifulSoup(html, "lxml")
+    out: list[RawResult] = []
+    for i, el in enumerate(soup.select("div.algo-sr, div.algo")):
+        a = el.select_one("a[href]")
+        if not a:
+            continue
+        href = _yahoo_real_url(a.get("href", "") or "")
+        if not href:
+            continue
+        title_el = el.select_one("h3.title") or el.select_one(".compTitle a") or a
+        title = title_el.get_text(" ", strip=True)
+        if not title:
+            continue
+        snip = el.select_one(".compText") or el.select_one("p")
+        snippet = snip.get_text(" ", strip=True) if snip else ""
+        out.append(RawResult(title=title, url=href, snippet=snippet, source="yahoo", position=i + 1))
+    return out
+
+
+async def search_yahoo(query: str, max_results: int, *, region: str = "us-en",
+                       freshness: Optional[str] = None, page: int = 0,
+                       server=None) -> tuple[list[RawResult], EngineReport]:
+    # Yahoo serves Bing's index from Yahoo's own servers (a different IP/rate
+    # bucket than bing.com): a redundancy source for Bing's index when bing.com
+    # rate-limits. Not a default (same index as bing -> no diversity); opt-in.
+    params = f"p={quote(query)}&n={max(min(max_results * 2, 50), 10)}"
+    if page > 0:
+        params += f"&b={(page * max_results) + 1}"
+    url = f"https://search.yahoo.com/search?{params}"
+    text, status, blocked, cooling = await _engine_get("yahoo", url)
+    rep = EngineReport(name="yahoo")
+    if blocked and not cooling and server is not None:
+        escalated = await _stealthy_html(server, url)
+        if escalated:
+            text, blocked = escalated, False
+            _ENGINES_COORD.reset("yahoo")
+    if not text:
+        rep.blocked = blocked
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('yahoo'))}s left)"
+                     if cooling else f"no response (status {status})")
+        return [], rep
+    results = _parse_yahoo(text)[:max_results]
+    rep.ok = bool(results)
+    rep.blocked = (not results) and blocked
+    if not results:
+        rep.error = "no results parsed"
     return results, rep
 
 
@@ -649,10 +736,17 @@ async def search_wikipedia(query: str, max_results: int, *, region: str = "us-en
 
 # ─── orchestrator ─────────────────────────────────────────────────────────────
 
+# Each engine's independent index "family". Consensus counts DISTINCT families
+# that returned a URL (a free authority signal): bing+yahoo agreeing = 1 family
+# (correlated Bing feed, weak); bing+brave+wikipedia = 3 families (independent, strong).
+_INDEX_FAMILY = {"duckduckgo": "duckduckgo", "bing": "bing", "yahoo": "bing",
+"brave": "brave", "wikipedia": "wikipedia"}
+
 _ENGINES = {
     "duckduckgo": search_ddg,
     "bing": search_bing,
-    "google": search_google,
+    "brave": search_brave,
+    "yahoo": search_yahoo,
     "wikipedia": search_wikipedia,
 }
 
@@ -670,8 +764,14 @@ def merge_dedupe(per_engine: list[tuple[list[RawResult], EngineReport]], max_res
 
     Same-domain `site:` filter and `-site:` exclusions are applied here (on the
     final URL) so they work regardless of which engine returned the result.
+
+    Cross-engine consensus: tracks which engines returned each URL and stamps
+    RawResult.consensus = number of DISTINCT index-families that returned it (a
+    free authority signal for the ranker). Results are pre-sorted by consensus
+    then engine position so consensus hits surface even on zero-overlap queries.
     """
     seen: dict[str, RawResult] = {}
+    sources_by_key: dict[str, set[str]] = {}
     for results, _rep in per_engine:
         for r in results:
             try:
@@ -683,14 +783,22 @@ def merge_dedupe(per_engine: list[tuple[list[RawResult], EngineReport]], max_res
             if any(d and d.lower() in host for d in (exclude_sites or [])):
                 continue
             key = normalize_url(r.url)
+            sources_by_key.setdefault(key, set()).add(r.source)
             if key in seen:
-                # Keep the higher-ranked / earlier copy; prefer a non-empty snippet.
                 prev = seen[key]
                 if (not prev.snippet and r.snippet) or r.position < prev.position:
                     seen[key] = r
                 continue
             seen[key] = r
-    return list(seen.values())[:max(max_results * 3, max_results)]
+    out: list[RawResult] = []
+    for key, r in seen.items():
+        srcs = sources_by_key.get(key, {r.source})
+        fams = {_INDEX_FAMILY.get(s, s) for s in srcs}
+        r.consensus = len(fams)
+        r.sources = tuple(sorted(srcs))
+        out.append(r)
+    out.sort(key=lambda r: (-r.consensus, r.position))
+    return out[:max(max_results * 3, max_results)]
 
 
 # ─── BM25 keyword rerank (Phase 1 baseline; neural comes in Phase 2) ──────────
@@ -793,13 +901,10 @@ async def multi_search(
 ) -> tuple[list[RawResult], list[EngineReport]]:
     """Run the chosen engines in parallel, merge, dedup, BM25-rerank.
 
-    Returns (ranked_results, engine_reports). engines defaults to
-    (duckduckgo, bing, wikipedia). Unknown engine names are ignored.
-
-    Adaptive reserve tier: if the primary engines returned few results AND one was
-    blocked, fan out to Google via the stealthy browser (Google is CAPTCHA-prone,
-    so it is held in reserve, not hit by default). Skipped when google was already
-    requested or no server is available (the reserve uses the stealthy browser).
+    Returns (ranked_results, engine_reports). engines defaults to the four
+    independent indexes (duckduckgo, bing, brave). Unknown engine names
+    are ignored. A URL returned by several engines carries a consensus boost
+    (see merge_dedupe) - a free authority signal from merging independent indexes.
     """
     names = [e for e in (engines or list(DEFAULT_ENGINES)) if e in _ENGINES]
     if not names:
@@ -833,25 +938,6 @@ async def multi_search(
             reports.append(rep)
             cleaned.append((results, rep))
     merged = merge_dedupe(cleaned, max_results, site=site, exclude_sites=exclude_sites)
-
-    # Adaptive reserve tier (Google) when primaries fell short + one was blocked.
-    if (server is not None and "google" not in names
-            and len(merged) < 3 and any(r.blocked for _, r in cleaned)):
-        try:
-            g_res, g_rep = await asyncio.wait_for(
-                search_google(query, max_results, region=region,
-                              freshness=freshness, page=page, server=server),
-                timeout=SEARCH_ENGINE_DEADLINE,
-            )
-            if g_res:
-                cleaned.append((g_res, g_rep))
-                reports.append(g_rep)
-                merged = merge_dedupe(cleaned, max_results, site=site, exclude_sites=exclude_sites)
-        except asyncio.TimeoutError:
-            reports.append(EngineReport(name="google", blocked=True,
-                                        error=f"timed out ({int(SEARCH_ENGINE_DEADLINE)}s)"))
-        except Exception as e:
-            logger.debug(f"reserve google fan-out failed: {e}")
 
     ranked = bm25_rerank(query, merged)
     return [r for r, _ in ranked], reports
