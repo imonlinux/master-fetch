@@ -736,6 +736,18 @@ accuracy; test the rate-limiting hard.
   'jaguar' (ambiguous) 0.7-1.0, 'rust tokio runtime' (clear) 0.833-1.0 (narrow is
   honest - all results relevant); consensus surfaces tokio.rs + github to #1-2.
 
+### v7.3.1 patch (SHIPPED 2026-06-24) — lazy stealthy browser (no Chrome at startup)
+
+Dondai: a Chrome instance (~150MB) spawned at agent startup even though search
+is all-HTTP. Cause: `_prewarm_stealthy()` (smart_fetch's warm browser) was eager-
+prewarmed at server startup. Fix: removed the startup `_prewarm_stealthy()` calls
+from both the stdio + http startup paths; the browser is now LAZY (launches on
+the first smart_fetch/screenshot/search-all-blocked-last-resort that needs it).
+Startup now warms only the cheap search-engine HTTP sessions + the reranker.
+LIVE-PROVEN: 0 stealthy sessions at startup + after a search. Trade-off: first
+stealthy fetch is a ~3-5s cold launch (subsequent warm); search/HTTP unaffected.
+`_prewarm_stealthy` method kept as an on-demand idempotent helper. 616 tests pass.
+
 ### v7.3 (SHIPPED 2026-06-24 as v7.3.0) — speed + smart rate-limit avoidance + Qwant
 
 Dondai: Brave rate-limits too fast; per-engine stealthy escalation adds a
