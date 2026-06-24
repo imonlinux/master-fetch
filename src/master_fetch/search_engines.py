@@ -801,58 +801,6 @@ def merge_dedupe(per_engine: list[tuple[list[RawResult], EngineReport]], max_res
     return out[:max(max_results * 3, max_results)]
 
 
-# ─── BM25 keyword rerank (Phase 1 baseline; neural comes in Phase 2) ──────────
-
-def _tokenize(text: str) -> list[str]:
-    import re
-    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 1]
-
-
-def bm25_rerank(query: str, results: list[RawResult], *, k1: float = 1.5, b: float = 0.75
-                ) -> list[tuple[RawResult, float]]:
-    """Rank the merged set by BM25 over (title + snippet). Returns (result, score)
-    sorted desc. Score normalized to 0..1 by the max. When scores are all 0
-    (no term overlap, e.g. a purely semantic query), preserves engine order via a
-    position-based tiebreak so results are never randomly shuffled."""
-    q_terms = _tokenize(query)
-    docs = [f"{r.title} {r.snippet}" for r in results]
-    doc_tokens = [_tokenize(d) for d in docs]
-    N = len(doc_tokens)
-    if N == 0 or not q_terms:
-        return [(r, 0.0) for r in results]
-    avgdl = (sum(len(t) for t in doc_tokens) / N) or 1.0
-    df: dict[str, int] = {}
-    for toks in doc_tokens:
-        for t in set(toks):
-            df[t] = df.get(t, 0) + 1
-    scored: list[tuple[RawResult, float]] = []
-    for r, toks in zip(results, doc_tokens):
-        if not toks:
-            scored.append((r, 0.0))
-            continue
-        dl = len(toks)
-        tf: dict[str, int] = {}
-        for t in toks:
-            tf[t] = tf.get(t, 0) + 1
-        score = 0.0
-        for q in q_terms:
-            if q not in tf:
-                continue
-            n_q = df.get(q, 0)
-            idf = max(0.0, ((N - n_q + 0.5) / (n_q + 0.5)) + 1.0)
-            f = tf[q]
-            score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avgdl))
-        scored.append((r, score))
-    max_s = max((s for _, s in scored), default=0.0)
-    # Tiebreak: engine position (lower = better) then original order, so zero-overlap
-    # queries do not get randomly reordered by the merge dict.
-    order = {id(r): i for i, (r, _) in enumerate(scored)}
-    scored.sort(key=lambda rs: (-rs[1], rs[0].position, order[id(rs[0])]))
-    if max_s > 0:
-        scored = [(r, s / max_s) for r, s in scored]
-    return scored
-
-
 async def fetch_source_for_similar(url: str, *, timeout: int = 10, max_chars: int = 4000
                                     ) -> tuple[str, str]:
     """Fetch a URL for find_similar: returns (title, body_text). Uses a one-off
@@ -939,8 +887,8 @@ async def multi_search(
             cleaned.append((results, rep))
     merged = merge_dedupe(cleaned, max_results, site=site, exclude_sites=exclude_sites)
 
-    ranked = bm25_rerank(query, merged)
-    return [r for r, _ in ranked], reports
+    ranked = merged  # merge_dedupe already sorts by cross-engine consensus then engine position
+    return ranked, reports
 
 
 def redact(s: str) -> str:

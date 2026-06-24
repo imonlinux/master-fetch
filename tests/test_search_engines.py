@@ -3,9 +3,8 @@
 No network: SERP parsers are fed fixture HTML, the Wikipedia JSON path is fed
 canned JSON, and multi_search is run against stubbed engine funcs. Verifies
 DDG uddg-redirect decoding, Bing <cite> breadcrumb reconstruction,
-Brave/Yahoo parsing, cross-engine consensus merge, site filters, BM25
-ranking + the zero-overlap order-preserving tiebreak, and the multi-engine
-orchestrator.
+Brave/Yahoo parsing, cross-engine consensus merge, site filters, and the
+multi-engine orchestrator.
 """
 
 import asyncio
@@ -17,7 +16,7 @@ from master_fetch import search_engines as se
 from master_fetch.search_engines import (
     RawResult, EngineReport, _ddg_real_url, _bing_real_url, _parse_ddg,
     _parse_bing, _parse_brave, _parse_yahoo, _yahoo_real_url,
-    merge_dedupe, bm25_rerank, multi_search,
+    merge_dedupe, multi_search,
 )
 
 
@@ -253,38 +252,6 @@ def test_merge_exclude_sites_drops_matching():
              _rr("B", "https://python.org/y", pos=2)], EngineReport("duckduckgo", ok=True))]
     merged = merge_dedupe(per, 10, exclude_sites=["pinterest.com"])
     assert len(merged) == 1 and "python.org" in merged[0].url
-
-
-# ─── BM25 rerank ─────────────────────────────────────────────────────────────
-
-def test_bm25_ranks_relevant_doc_first():
-    results = [
-        _rr("unrelated thing", "https://a.com", snip="cooking recipes food"),
-        _rr("python asyncio guide", "https://b.com", snip="asyncio event loop python"),
-    ]
-    ranked = bm25_rerank("python asyncio", results)
-    assert ranked[0][0].url == "https://b.com"
-    assert ranked[0][1] == 1.0  # top score normalized to 1.0
-    assert ranked[-1][1] < ranked[0][1]
-
-
-def test_bm25_zero_overlap_preserves_order():
-    # No term overlap -> scores all 0 -> must NOT randomly shuffle; preserve
-    # the original merge order via the position tiebreak.
-    results = [
-        _rr("one", "https://1.com", "duckduckgo", 1, "aaa"),
-        _rr("two", "https://2.com", "bing", 1, "bbb"),
-        _rr("three", "https://3.com", "wikipedia", 1, "ccc"),
-    ]
-    ranked = bm25_rerank("zzzqqq", results)
-    assert [r.url for r, _ in ranked] == ["https://1.com", "https://2.com", "https://3.com"]
-    assert all(s == 0.0 for _, s in ranked)
-
-
-def test_bm25_empty_query_preserves_order():
-    results = [_rr("a", "https://a.com", pos=1), _rr("b", "https://b.com", pos=2)]
-    ranked = bm25_rerank("", results)
-    assert [r.url for r, _ in ranked] == ["https://a.com", "https://b.com"]
 
 
 # ─── multi_search orchestrator ───────────────────────────────────────────────

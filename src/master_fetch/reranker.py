@@ -9,8 +9,9 @@ revision + hash-checked), NOT bundled in the wheel, so the lean install stays sm
 
 Graceful fallback: if onnxruntime/tokenizers are missing (lean install) or the
 model download fails / is offline, `get_reranker()` returns None and the caller
-falls back to BM25 keyword rerank. Neural mode is an `[all]` extra; lean installs
-get a fully functional keyword search.
+falls back to cross-engine consensus + engine-position order (no lexical rerank
+- BM25 was removed as redundant; neural matches its speed and ranks better).
+Neural rerank is an `[all]` extra; lean installs get consensus-ordered search.
 """
 
 from __future__ import annotations
@@ -236,18 +237,31 @@ def get_reranker() -> Optional[_Reranker]:
 
 def rerank(query: str, results: list) -> Optional[list[tuple]]:
     """Rerank RawResults with the neural cross-encoder. Returns (result, score)
-    pairs sorted desc, or None if the reranker is unavailable (caller falls back)."""
+    pairs sorted desc, or None if the reranker is unavailable (caller falls back
+    to consensus + engine-position order).
+
+    Scores are min-max normalized across this result set to 0..1. ms-marco
+    sigmoid saturates (~1.0 for any clearly-relevant snippet), so raw scores
+    cluster tightly and can't discriminate among good results; normalizing
+    restores meaningful spread (top=1.0, worst=0.0) for the relevance_score field
+    + tier derivation. Ranking ORDER is unchanged (normalization is monotonic).
+    """
     rer = get_reranker()
     if rer is None or not results:
         return None
     docs = [f"{r.title} {r.snippet}" for r in results]
     try:
-        scores = rer.score(query, docs)
+        raw = rer.score(query, docs)
     except Exception as e:
         logger.warning(f"neural rerank failed: {e}")
         return None
-    if len(scores) != len(results):
+    if len(raw) != len(results):
         return None
+    mn, mx = min(raw), max(raw)
+    if mx > mn:
+        scores = [(s - mn) / (mx - mn) for s in raw]
+    else:
+        scores = [1.0 for _ in raw]  # all equal -> no spread to normalize -> all top
     pairs = list(zip(results, scores))
     pairs.sort(key=lambda rs: (-rs[1], rs[0].position))
     return pairs

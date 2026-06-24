@@ -69,7 +69,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 |------|-----------|
 | `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk, PDFs (with OCR + quality score), `css_selector`, `focus`, `actions`, pagination. |
 | `smart_crawl` | Best-first same-domain crawl. Each page as markdown with `content_ok` + `page_type` (article / list / js_shell). `discover_only`, `crawl_urls`, `focus`, time + token caps. |
-| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing + Brave in parallel (3 independent indexes; add `wikipedia`/`yahoo`), merges + ranks with cross-engine consensus. `relevance_score` + `fetch_relevance` + `engines_consensus` per result. Keyword / neural / find_similar. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows engines that didn't contribute. |
+| `smart_search` | Local keyless web search. Scrapes DuckDuckGo + Bing + Brave in parallel (3 independent indexes; add `wikipedia`/`yahoo`), merges + ranks with cross-engine consensus. `relevance_score` + `fetch_relevance` + `engines_consensus` per result. Neural / find_similar. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows engines that didn't contribute. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
 | `version` | Installed version + update status. |
@@ -81,7 +81,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 
 **`smart_crawl`** — Best-first walk of same-domain links. Content-adaptive: article/docs → main content; list/index pages → structured link list; JS shells → detected + reported. `discover_only=true` → URL map. `crawl_urls=[...]` → second-phase selective crawl. `focus` prioritizes + filters. Caps: `max_pages` (10), `max_depth` (2), `max_total_chars`, `deadline_ms` (120000). Per-page `content_ok` + `status` (network error = −1) + `fetched_at`. Reuses `smart_fetch` anti-bot + cache.
 
-**`smart_search`** — Scrapes DuckDuckGo + Bing + Brave in parallel (three INDEPENDENT indexes — not the same feed twice; add `wikipedia` or `yahoo`), merges, dedups by normalized URL, ranks, and boosts **cross-engine consensus** (a URL returned by several independent engines is an authority signal). Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural if `[all]`+model present else keyword BM25), `keyword`, `neural` (local ONNX cross-encoder on snippets), `find_similar` (pass `url=`). `engine_blocked` lists engines that didn't contribute (rate-limited/timed out/no results).
+**`smart_search`** — Scrapes DuckDuckGo + Bing + Brave in parallel (three INDEPENDENT indexes — not the same feed twice; add `wikipedia` or `yahoo`), merges, dedups by normalized URL, ranks, and boosts **cross-engine consensus** (a URL returned by several independent engines is an authority signal). Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural rerank if `[all]`+model present, else consensus + engine-position order), `neural` (same, explicit), `find_similar` (pass `url=`). `engine_blocked` lists engines that didn't contribute (rate-limited/timed out/no results).
 
 </details>
 
@@ -95,9 +95,8 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 
 No API key, no account, no third-party service. `smart_search` scrapes **DuckDuckGo + Bing + Brave** in parallel — three INDEPENDENT indexes (Brave runs its own 30B-page crawler; DuckDuckGo + Bing are not the same feed twice) — merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive). Every result carries `relevance_score` (0–1), `fetch_relevance` (**high** / **med** / **low**), and `engines_consensus` (how many independent indexes returned that URL — a free authority signal).
 
-**Three rerank modes:**
-- **`keyword`** — BM25 over title + snippet. Baseline, always available, even on the lean install.
-- **`neural`** — a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. Exa-style semantic ranking, $0, on your machine. The model downloads once (~80MB, cached, not bundled).
+**Two rerank modes:**
+- **`neural`** (the only reranker) — a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. Exa-style semantic ranking, $0, on your machine. The model downloads once (~80MB, cached, not bundled). Scores are min-max normalized per query so the `relevance_score` field carries meaningful spread (ms-marco sigmoid saturates ~1.0; normalization restores discrimination). BM25 was removed — neural matches its speed and ranks better. Lean installs (no model) fall back to cross-engine consensus + engine-position order.
 - **`find_similar`** — pass `url=`; Hound fetches a page you like, derives a query, and reranks candidates against that source page. Exa's find-similar, local.
 
 `smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 6 results. **Google is not scraped** — it CAPTCHAs even via the stealthy browser, so it was removed rather than silently contributing nothing. `wikipedia` + `yahoo` are opt-in (`yahoo` serves Bing's index from a different server, handy when bing.com rate-limits). The three defaults are all HTTP (no browser needed), so search stays fast.
@@ -127,7 +126,7 @@ Scraping public engines from your IP can be rate-limited or CAPTCHA'd. No keyles
 </div>
 
 - `smart_fetch` checks cache + robots, tries HTTP, escalates to the stealthy Patchright browser on a block / JS-shell / 403 / 503, then extracts + enriches. PDFs branch to pdfplumber (with CID-garbage + scanned auto-OCR via pypdfium2 + rapidocr, `quality_score`, ToC). `smart_crawl` reuses the same pipeline across a same-domain best-first walk.
-- `smart_search` scrapes engines in parallel (browser-impersonated HTTP, escalating to the warm stealthy browser if blocked), merges + dedups, then reranks (keyword / neural / find_similar).
+- `smart_search` scrapes engines in parallel (browser-impersonated HTTP, escalating to the warm stealthy browser if blocked), merges + dedups, then reranks (neural / find_similar) + applies the cross-engine consensus boost.
 - One stealthy Chrome is pre-warmed at startup and reused, so escalation skips the 3–5s cold start.
 - Content over 40KB is chunked; the response gives `next_offset` so the agent pages through with one more call (served instantly from cache).
 

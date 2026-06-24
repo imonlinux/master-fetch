@@ -9,9 +9,10 @@ gets a ranking boost. Every result also carries a relevance_score and a
 fetch_relevance tier so the agent fetches the right URLs via smart_fetch itself
 (search returns URLs + ranking, NOT page content - the agent decides what to fetch).
 
-Rerank modes: keyword (BM25, always available, even on the lean install), neural
-(local ONNX cross-encoder on snippets, needs [all]), find_similar (pass url=,
-find pages similar to it).
+Rerank: neural (a local ONNX cross-encoder on snippets, needs [all]; the ONLY
+reranker - BM25 was removed as redundant since neural matches its speed and
+ranks better), find_similar (pass url=, find pages similar to it). Lean installs
+without the model fall back to cross-engine consensus + engine-position order.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pydantic import BaseModel, Field
 from master_fetch.cache import get_cached, set_cached
 from master_fetch.security import validate_search_query, validate_url, redact_api_key, SecurityError
 from master_fetch.search_engines import (
-    RawResult, multi_search, EngineReport, DEFAULT_ENGINES, bm25_rerank,
+    RawResult, multi_search, EngineReport, DEFAULT_ENGINES,
     fetch_source_for_similar, _INDEX_FAMILY,
 )
 from master_fetch.reranker import (
@@ -173,7 +174,7 @@ def _validate_freshness(freshness):
 
 # Implemented rerank modes (find_similar = URL->similar). Unknown modes are
 # rejected so the schema does not advertise a mode that is not wired.
-_IMPLEMENTED_MODES = ("auto", "keyword", "neural", "find_similar")
+_IMPLEMENTED_MODES = ("auto", "neural", "find_similar")
 
 
 def _validate_mode(mode):
@@ -185,11 +186,14 @@ def _validate_mode(mode):
 
 
 def _rank(query: str, ranked: list[RawResult], mode: str):
-    """Apply the chosen rerank. Returns (ranked_list, scores, mode_used, note).
+    """Apply neural rerank (the ONLY reranker; BM25 was removed as redundant -
+    neural matches its speed and ranks better). Returns (ranked_list, scores,
+    mode_used, note).
 
-    mode='auto' uses neural if the reranker is available (hound-mcp[all] + model
-    downloaded), else keyword BM25. mode='neural' tries neural and falls back to
-    keyword with a note if unavailable. mode='keyword' is always BM25.
+    mode='auto'/'neural': use the local ONNX cross-encoder if available
+    (hound-mcp[all] + model cached), else fall back to cross-engine consensus +
+    engine-position order (no lexical rerank). 'neural' surfaces a note when
+    unavailable; 'auto' is silent (expected on lean installs).
     """
     note = ""
     if mode in ("neural", "auto"):
@@ -197,10 +201,14 @@ def _rank(query: str, ranked: list[RawResult], mode: str):
         if pairs is not None:
             return [r for r, _ in pairs], [s for _, s in pairs], "neural", note
         if mode == "neural":
-            note = ("neural rerank unavailable - used keyword. " +
+            note = ("neural rerank unavailable - using consensus + engine-position order. " +
                     (unavailable_reason() or "install hound-mcp[all] and retry"))
-    scored = bm25_rerank(query, ranked)
-    return [r for r, _ in scored], [s for _, s in scored], "keyword", note
+    # Fallback (lean install / model missing): no lexical rerank. Score by position
+    # so tiers derive sensibly; the caller's consensus boost adds the authority
+    # signal on top.
+    n = len(ranked)
+    scores = [1.0 - (i / max(n, 1)) for i in range(n)]
+    return list(ranked), scores, "merge", note
 
 
 def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None,
@@ -236,12 +244,11 @@ def _apply_consensus_boost(ranked: list[RawResult], scores: list[float]
     boosted = []
     for r, s in zip(ranked, scores):
         c = max(1, getattr(r, "consensus", 1))
-        boosted.append((r, s * (1 + 0.25 * (c - 1))))
+        boosted.append((r, s + 0.2 * (c - 1)))   # ADDITIVE: each agreeing family +0.2
     order = {id(r): i for i, (r, _) in enumerate(boosted)}
     boosted.sort(key=lambda rs: (-rs[1], -getattr(rs[0], "consensus", 1), rs[0].position, order[id(rs[0])]))
-    # Keep the field in 0..1: only renormalize when a consensus boost pushed a
-    # score above 1.0. Otherwise preserve the ranker's raw scores (e.g. neural's
-    # absolute sigmoid signal) so the tier derivation + tests stay meaningful.
+    # Keep the field in 0..1: renormalize only when an additive consensus bonus
+    # pushed a score above 1.0. Otherwise preserve the ranker's scores.
     mx = max((s for _, s in boosted), default=0.0)
     if mx > 1.0:
         boosted = [(r, round(s / mx, 4)) for r, s in boosted]
@@ -275,8 +282,8 @@ async def smart_search(
     gets a ranking boost - a free authority signal. Returns URLs + ranking (NOT
     page content) so the agent smart_fetches the ones it wants itself.
 
-    mode: auto (neural if [all]+model present else keyword), keyword (BM25),
-    neural (cross-encoder on snippets; better for semantic/ambiguous queries),
+    mode: auto (neural rerank if [all]+model present, else consensus + engine-
+    position order), neural (same, explicit - surfaces a note if unavailable),
     find_similar (pass url=; fetches the source page, derives a query, and reranks
     candidates against the source content - Exa find-similar, local).
     """
@@ -379,13 +386,13 @@ async def smart_search(
                 scores = [s for _, s in pairs]
                 rerank_used = "find_similar"
             except Exception:
-                ranked_list, scores, _, _ = _rank(derived_query, ranked, "keyword")
+                ranked_list, scores, _, _ = _rank(derived_query, ranked, "auto")
                 rerank_used = "find_similar"
         else:
-            ranked_list, scores, _, _ = _rank(derived_query, ranked, "keyword")
+            ranked_list, scores, _, _ = _rank(derived_query, ranked, "auto")
             rerank_used = "find_similar"
             if ranked and get_reranker() is None:
-                rerank_note = ("find_similar used keyword BM25 (neural unavailable). " +
+                rerank_note = ("find_similar used consensus + position order (neural unavailable). " +
                                (unavailable_reason() or "install hound-mcp[all]"))
         _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
         total_families = len(_efams) or 1

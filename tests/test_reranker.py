@@ -2,9 +2,9 @@
 
 The real ONNX model is never downloaded in CI: `neural_rerank` and
 `unavailable_reason` (imported into master_fetch.search) are monkeypatched.
-Verifies mode validation, neural-when-available, graceful keyword fallback with
-a note when neural is requested but unavailable, keyword-never-calls-neural,
-auto-detection, and mode-aware cache keys.
+Verifies mode validation, neural-when-available, graceful consensus fallback
+with a note when neural is requested but unavailable, keyword-rejected, auto-
+detection, and mode-aware cache keys.
 """
 
 import asyncio
@@ -39,14 +39,14 @@ def _stub_multi(monkeypatch, results):
 def test_validate_mode_accepts_implemented():
     assert _validate_mode(None) == "auto"
     assert _validate_mode("auto") == "auto"
-    assert _validate_mode("KEYWORD") == "keyword"
+    assert _validate_mode("NEURAL") == "neural"
     assert _validate_mode("neural") == "neural"
     assert _validate_mode("find_similar") == "find_similar"
 
 
 def test_validate_mode_rejects_unimplemented():
-    # deep was cut (over-built); find_similar stays. auto/keyword/neural/find_similar are valid.
-    for bad in ("deep", "semantic", "magic", "", "autox"):
+    # keyword/bm25 removed (redundant); auto/neural/find_similar are valid.
+    for bad in ("deep", "semantic", "magic", "", "autox", "keyword", "bm25"):
         with pytest.raises(SecurityError):
             _validate_mode(bad)
 
@@ -89,7 +89,7 @@ def test_mode_auto_uses_neural_when_available(monkeypatch):
 
 # ─── graceful keyword fallback ───────────────────────────────────────────────
 
-def test_mode_neural_falls_back_to_keyword_with_note(monkeypatch):
+def test_mode_neural_falls_back_to_merge_with_note(monkeypatch):
     results = [_raw("python asyncio guide", "https://b.com", snip="asyncio event loop python"),
                _raw("cooking", "https://a.com", snip="food recipes")]
     _stub_multi(monkeypatch, results)
@@ -99,41 +99,43 @@ def test_mode_neural_falls_back_to_keyword_with_note(monkeypatch):
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     resp = asyncio.run(_ss(srv, "python asyncio", mode="neural", cache_ttl=0))
-    assert resp.rerank_mode == "keyword"
-    # BM25 order preserved (b.com is the python/asyncio doc).
+    assert resp.rerank_mode == "merge"  # neural unavailable -> consensus+position order
+    # merge order preserved (b.com is first in the stubbed results).
     assert resp.results[0].url == "https://b.com"
     # The note explaining the fallback is surfaced in fetch_hint.
     assert "neural rerank unavailable" in resp.fetch_hint
     assert "hound-mcp[all]" in resp.fetch_hint
 
 
-def test_mode_auto_falls_back_to_keyword_silently_when_unavailable(monkeypatch):
+def test_mode_auto_falls_back_to_merge_silently_when_unavailable(monkeypatch):
     results = [_raw("A", "https://a.com")]
     _stub_multi(monkeypatch, results)
     monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     resp = asyncio.run(_ss(srv, "python asyncio", mode="auto", cache_ttl=0))
-    assert resp.rerank_mode == "keyword"
+    assert resp.rerank_mode == "merge"  # neural unavailable -> consensus+position order
     # auto fallback is silent (no note) since the user did not explicitly ask for neural.
     assert "neural rerank unavailable" not in resp.fetch_hint
 
 
-def test_mode_keyword_never_calls_neural(monkeypatch):
+def test_keyword_mode_rejected(monkeypatch):
+    # keyword mode was REMOVED (redundant; neural matches its speed and ranks
+    # better). Passing it must be rejected, not silently fall back.
     results = [_raw("A", "https://a.com")]
     _stub_multi(monkeypatch, results)
-    called = {"n": 0}
-    monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: called.__setitem__("n", called["n"] + 1) or None)
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
     resp = asyncio.run(_ss(srv, "python asyncio", mode="keyword", cache_ttl=0))
-    assert resp.rerank_mode == "keyword"
-    assert called["n"] == 0  # neural reranker was not invoked
+    assert resp.error and "Invalid mode" in resp.error and "keyword" in resp.error
+    assert resp.results == []
 
 
 # ─── mode-aware cache key ────────────────────────────────────────────────────
 
-def test_neural_and_keyword_cache_keys_differ(monkeypatch):
+def test_neural_and_auto_cache_keys_differ(monkeypatch):
+    # The mode string is part of the cache key, so different valid modes get
+    # different cache entries (even though auto + neural now behave the same).
     results = [_raw("A", "https://a.com")]
     _stub_multi(monkeypatch, results)
     monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
@@ -146,11 +148,11 @@ def test_neural_and_keyword_cache_keys_differ(monkeypatch):
     monkeypatch.setattr(search_mod, "set_cached", mock_set)
     from master_fetch.server import MasterFetchServer
     srv = MasterFetchServer()
-    asyncio.run(_ss(srv, "python asyncio", mode="keyword", cache_ttl=60))
+    asyncio.run(_ss(srv, "python asyncio", mode="auto", cache_ttl=60))
     asyncio.run(_ss(srv, "python asyncio", mode="neural", cache_ttl=60))
     types = [t for (_u, t) in store.keys()]
     assert len(set(types)) == 2
-    assert any(":keyword:" in t for t in types)
+    assert any(":auto:" in t for t in types)
     assert any(":neural:" in t for t in types)
 
 
@@ -214,7 +216,7 @@ def test_find_similar_source_unfetchable(monkeypatch):
     assert "could not fetch" in resp.error
 
 
-def test_find_similar_falls_back_to_keyword_when_no_reranker(monkeypatch):
+def test_find_similar_falls_back_to_merge_when_no_reranker(monkeypatch):
     candidates = [
         _raw("python asyncio", "https://a.com", snip="python asyncio event loop"),
         _raw("cooking", "https://b.com", snip="food recipes"),
@@ -235,9 +237,9 @@ def test_find_similar_falls_back_to_keyword_when_no_reranker(monkeypatch):
     resp = asyncio.run(_ss(srv, "x", mode="find_similar",
                            url="https://src.com/x", cache_ttl=0))
     assert resp.rerank_mode == "find_similar"
-    # BM25 on derived query "Python Asyncio" -> a.com (python asyncio) first.
+    # merge order (consensus + position): a.com is first in the candidates.
     assert resp.results[0].url == "https://a.com"
-    assert "keyword BM25" in resp.fetch_hint  # the fallback note
+    assert "consensus + position" in resp.fetch_hint  # the fallback note
 
 
 # ─── reranker prewarm (no-download-when-absent) ──────────────────────────────

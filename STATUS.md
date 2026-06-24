@@ -698,6 +698,39 @@ independent 30B-page index; Mojeek is an independent index too. Live-tested both
   from ddg+bing+brave with consensus hits surfacing authoritative URLs (tokio.rs,
   github.com/tokio-rs/tokio) to rank #1-2.
 
+### v7.2 add-on (built 2026-06-24) — keyword/BM25 removed; neural-only + optimized
+
+Dondai: keyword (BM25) is the same speed or slower than neural, so remove it
+entirely (simpler); neural is always the top reranker; optimize neural for better
+accuracy; test the rate-limiting hard.
+
+- **BM25 / `keyword` mode REMOVED entirely.** Deleted `bm25_rerank` + `_tokenize`
+  from search_engines.py; `multi_search` now returns the merge order (consensus +
+  engine-position, already sorted by `merge_dedupe`) instead of BM25-ranking.
+  `_IMPLEMENTED_MODES = ("auto", "neural", "find_similar")`. `mode='keyword'` is
+  now REJECTED ("Invalid mode"). Lean installs (no onnxruntime/model) fall back to
+  cross-engine consensus + engine-position order (no lexical rerank) — rerank_mode
+  "merge"; `mode='neural'` surfaces a note when unavailable, `auto` is silent.
+- **Neural optimization — min-max normalize per query** (`reranker.rerank`):
+  ms-marco sigmoid saturates (~1.0 for any clearly-relevant snippet) so raw scores
+  cluster + can't discriminate. Min-max normalize across the result set to 0..1
+  (top=1.0, worst=0.0) restores meaningful `relevance_score` spread. Ranking ORDER
+  unchanged (monotonic); only the score field + tier derivation get real signal.
+- **Consensus boost switched multiplicative -> ADDITIVE** (`_apply_consensus_boost`):
+  `score + 0.2*(consensus-1)` (each agreeing index-family +0.2). Additive reliably
+  surfaces consensus authority WITHOUT overriding strong neural relevance (a
+  strongly-relevant single-engine result still beats a weak consensus hit), and
+  composes cleanly with normalized neural scores. Renormalize to 0..1 only when
+  the additive bonus pushes a score >1.0.
+- 614 tests pass (was 617; -3 removed BM25 tests, +keyword-rejected test).
+- **Rate-limit failover + recovery LIVE-PROVEN (the hard test Dondai asked for):**
+  15 successive distinct searches → Brave blocked on #11 (cooldown 13s) → DDG+Bing
+  carried, 6 results every time, agent never saw a failure. Then waited out the
+  cooldown → Brave REJOINED on the next search (`brave back: True`). Full
+  block -> cooldown -> recovery cycle works without issues. Score spread live:
+  'jaguar' (ambiguous) 0.7-1.0, 'rust tokio runtime' (clear) 0.833-1.0 (narrow is
+  honest - all results relevant); consensus surfaces tokio.rs + github to #1-2.
+
 ## Dev notes / API quirks
 
 - **v7.2 engine transport quirks (search_engines.py):**

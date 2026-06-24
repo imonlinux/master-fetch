@@ -78,8 +78,8 @@ def _stub_multi(monkeypatch, results, reports):
 
     monkeypatch.setattr(search_mod, "multi_search", fake_multi)
     # Default the reranker path to 'unavailable' so mode=auto deterministically
-    # falls back to keyword BM25 (no real model load / network in tests). Tests
-    # that want neural/deep override these after calling _stub_multi.
+    # falls back to consensus + engine-position order (no real model load / network
+    # in tests). Tests that want neural override these after calling _stub_multi.
     monkeypatch.setattr(search_mod, "neural_rerank", lambda q, r: None)
     return captured
 
@@ -97,8 +97,8 @@ def test_smart_search_builds_relevance_score_and_tiers(monkeypatch):
     assert isinstance(resp, SearchResponseModel)
     assert resp.engines_used == ["duckduckgo", "bing"]
     assert resp.engine_blocked == []
-    assert resp.rerank_mode == "keyword"
-    # BM25 ranks the python/asyncio doc first; its score is normalized to 1.0.
+    assert resp.rerank_mode == "merge"  # neural unavailable in tests -> consensus+position order
+    # merge order: b.com is first in the stubbed results; position score 1.0.
     assert resp.results[0].url == "https://b.com"
     assert resp.results[0].relevance_score == 1.0
     assert resp.results[0].fetch_relevance == "high"
@@ -178,7 +178,7 @@ def test_cache_hit_returns_results_without_calling_multi(monkeypatch):
                                  source="duckduckgo", position=1,
                                  relevance_score=1.0, fetch_relevance="high").model_dump()],
         "engines_used": ["duckduckgo"], "engine_blocked": [],
-        "rerank_mode": "keyword",
+        "rerank_mode": "neural",
     }
     import json
 
@@ -269,5 +269,5 @@ def test_smart_search_summary_populated(monkeypatch):
     resp = asyncio.run(_ss(srv, "python asyncio", max_results=5, cache_ttl=0))
     assert resp.summary
     assert "results" in resp.summary
-    assert "keyword" in resp.summary          # rerank mode present
+    assert "merge" in resp.summary           # rerank mode present
     assert "duckduckgo" in resp.summary       # engines present
