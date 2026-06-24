@@ -587,11 +587,30 @@ Phases (each tested + live-verified, no push until all done + Dondai approves):
 ### v7 status: READY FOR DONDAI REVIEW (built + tested + verified, not shipped)
 
 All 5 phases done locally on master (commits 4c24c08, bb6c030, 77e18d8,
-3a4a922, + this phase). To ship after approval: rebase (Dondai edits README on
-GitHub), push, GitHub release v7.0.0, `python -m build && twine upload`, verify
-on PyPI + CI green. The Reddit post at C:/Users/Dondai/hound-reddit-post.md
-still says "Web search takes a free TinyFish key" + has TinyFish referral lines —
-UPDATE it before posting (search is now 100% local keyless).
+3a4a922, deep-cut + this SERL phase). To ship after approval: rebase (Dondai
+edits README on GitHub), push, GitHub release v7.0.0, `python -m build &&
+twine upload`, verify on PyPI + CI green. The Reddit post at
+C:/Users/Dondai/hound-reddit-post.md still says "Web search takes a free
+TinyFish key" + has TinyFish referral lines — UPDATE it before posting (search
+is now 100% local keyless + rate-limit resilient via SERL).
+
+#### Search Engine Resilience Layer (SERL) — added 2026-06-24
+Dondai challenged that local keyless scraping exposes the user IP to rate-limits
+/ blocks. Designed + built a stateful per-engine coordinator in
+`search_engines.py` (`_EngineCoordinator` + module singleton `_ENGINES_COORD`):
+(1) persistent warm session per engine (cookies+TLS reuse, also faster); (2)
+per-engine pacer w/ jitter (parallel within a search, paces same-engine bursts);
+(3) circuit breaker w/ exponential cooldown 15->120s (blocked engine skipped,
+others carry); (4) 202 soft-limit + 429/503/403 + Retry-After aware (DDG 202 was
+a real missed-case bug, now fixed); (5) fingerprint rotation via scrapling
+`impersonate` list; (6) adaptive Google reserve tier (fires via stealthy only
+when primaries <3 results + one blocked + server present); (7) `HOUND_SEARCH_PROXY`
+env escape hatch for power users w/ a rotating proxy. New `_engine_get` seam
+(replaces `_impersonated_get` for SERPs). `close_search_engines()` wired into
+`server._shutdown_close_sessions`. 14 new SERL tests; 604 pass. Live-verified:
+12-15 results from all 3 engines, warm sessions created+reused, no blocks on a
+clean IP, cooldown idle. Honest line: not bulletproof without a proxy, but
+dramatically more robust for single-user real agent work. tools/list ~2.6K tokens.
 
 ## Dev notes / API quirks
 

@@ -7,16 +7,38 @@ escalation to hound's warm stealthy Patchright browser when an engine blocks.
 
 Built for one job: feed smart_fetch.
 
-Honest posture (same as SearXNG/ddgs): engines may rate-limit or CAPTCHA. We
-mitigate with browser-impersonated TLS, a real user agent, backoff, multi-engine
-fallback, the warm stealthy browser as the anti-bot tier, and result caching
-(in search.py). No search-engine ToS compliance is claimed.
+Anti rate-limit / IP-block: the Search Engine Resilience Layer (SERL), a stateful
+per-engine coordinator (_EngineCoordinator) in front of every SERP request:
+  1. Persistent warm session per engine (cookies + TLS reuse across searches) so
+     the engine sees a returning human, not a fresh bot each call. Also faster
+     (no per-search TLS handshake).
+  2. Per-engine pacer with jitter: within one search all engines fire in parallel
+     (free); across searches, only same-engine bursts get a small jittered delay.
+  3. Per-engine circuit breaker + exponential cooldown: a blocked engine is
+     skipped for 15->30->60->120s (capped) while the other engines carry the load.
+  4. 202 soft-limit + 429/503/403 + Retry-After aware (DDG returns 202 as a soft
+     rate-limit; this was a missed case before).
+  5. Fingerprint rotation: scrapling impersonate list picks a real Chrome/Edge/
+     Firefox/Safari TLS fingerprint per request.
+  6. Adaptive reserve tier: Google (most CAPTCHA-prone) is held in reserve and
+     only fires via the stealthy browser when the primary engines fall short AND
+     one was blocked.
+  7. HOUND_SEARCH_PROXY env: route all engine requests through a user-supplied
+     proxy (residential/rotating) for near-unblockable heavy use. Not bundled.
+
+Honest posture (same as SearXNG/ddgs): no keyless local tool is bulletproof
+against sustained engine blocking without a proxy. For a single user on a clean
+residential IP doing real agent work, the seven mechanisms above keep it working;
+HOUND_SEARCH_PROXY is the bulletproof path for those who bring one. No
+search-engine ToS compliance is claimed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import random
 from dataclasses import dataclass, asdict
 from time import time
 from typing import Optional
@@ -32,6 +54,24 @@ DEFAULT_ENGINES = ("duckduckgo", "bing", "wikipedia")
 ENGINE_TIMEOUT = 12  # seconds per engine request
 CAPTCHA_MARKERS = ("captcha", "unusual traffic", "are you a robot", "sorry/image", "ddg-captcha", "blocked", "access denied")
 
+# Per-engine pacing: min seconds between successive requests to the SAME engine.
+# Within a single search all engines fire in parallel (each engine sees 1 req),
+# so this only spreads same-engine bursts across successive searches.
+_PACE = {"duckduckgo": 1.2, "bing": 1.5, "wikipedia": 0.3, "google": 2.0}
+_COOLDOWN_BASE = 15.0   # seconds; doubles each consecutive block
+_COOLDOWN_CAP = 120.0   # max cooldown
+_RECREATE_EVERY = 3     # recreate the persistent session every N consecutive blocks (burned session)
+
+# Power-user env knobs (all optional).
+_PROXY = os.environ.get("HOUND_SEARCH_PROXY") or None
+try:
+    _PACE_OVERRIDE = float(os.environ.get("HOUND_SEARCH_MIN_INTERVAL", "0") or 0)
+except ValueError:
+    _PACE_OVERRIDE = 0.0
+# Current, realistic TLS fingerprints scrapling can impersonate. Passing a LIST
+# makes scrapling pick one at random per request -> fingerprint rotation.
+_IMPERSONATE_POOL = ["chrome131", "chrome136", "chrome142", "edge", "safari184", "firefox147"]
+
 
 @dataclass
 class RawResult:
@@ -46,14 +86,16 @@ class RawResult:
 class EngineReport:
     name: str
     ok: bool = False        # parsed >=1 result
-    blocked: bool = False   # rate-limited / CAPTCHA'd / refused
+    blocked: bool = False   # rate-limited / CAPTCHA'd / refused / cooling down
     error: str = ""
 
 
 # ─── transport ──────────────────────────────────────────────────────────────
 
 def _is_blocked(status: int, body_text: str) -> bool:
-    if status in (429, 503, 403):
+    # 202 = DuckDuckGo soft rate-limit (it accepts the request but will not
+    # answer). 429/503/403 are hard rate-limit / refusal codes.
+    if status in (429, 503, 403, 202):
         return True
     low = (body_text or "").lower()
     if any(m in low for m in CAPTCHA_MARKERS):
@@ -63,39 +105,21 @@ def _is_blocked(status: int, body_text: str) -> bool:
     return False
 
 
-async def _impersonated_get(url: str, *, method: str = "GET", form: Optional[dict] = None,
-                            timeout: int = ENGINE_TIMEOUT) -> tuple[Optional[str], int, bool]:
-    """Browser-impersonated HTTP GET/POST via scrapling FetcherSession (core dep).
-
-    Returns (html_text, status, blocked). html_text is None on transport failure.
-    """
+def _retry_after(resp) -> float:
+    """Read a Retry-After header (seconds) from a scrapling Response, else 0."""
     try:
-        from scrapling.engines.static import FetcherSession
-    except ImportError:
-        # Fallback to urllib (no impersonation) so search still works on a
-        # minimal install where scrapling's static engine is unavailable.
-        return await _urllib_get(url, timeout=timeout)
-
-    try:
-        async with FetcherSession() as sess:
-            if method == "POST" and form is not None:
-                resp = await sess.post(url, data=form, timeout=timeout)
-            else:
-                resp = await sess.get(url, timeout=timeout)
-            status = getattr(resp, "status", 0) or 0
-            body = getattr(resp, "body", None)
-            if not body:
-                return None, status, status in (429, 503, 403)
-            text = body.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
-            blocked = _is_blocked(status, text)
-            return text, status, blocked
-    except Exception as e:
-        logger.debug(f"impersonated GET failed for {url[:80]}: {e}")
-        return None, 0, False
+        headers = getattr(resp, "headers", None) or {}
+        ra = headers.get("Retry-After") or headers.get("retry-after")
+        if ra:
+            return float(int(ra))
+    except Exception:
+        pass
+    return 0.0
 
 
 async def _urllib_get(url: str, *, timeout: int = ENGINE_TIMEOUT) -> tuple[Optional[str], int, bool]:
-    """Stdlib fallback transport (no TLS impersonation)."""
+    """Stdlib fallback transport (no TLS impersonation). Used only if scrapling's
+    static engine is unavailable on a minimal install."""
     from urllib.request import Request, urlopen
     UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -129,7 +153,7 @@ async def _stealthy_html(server, url: str, timeout: int = ENGINE_TIMEOUT) -> Opt
             use_trafilatura=False, google_search=False,
             disable_resources=True, timeout=int(timeout * 1000),
         )
-        # content is a list of text chunks; for html extraction it's the page HTML.
+        # content is a list of text chunks; for html extraction it is the page HTML.
         if res and res.content and not res.error:
             html = "".join(res.content)
             if html and len(html) > 200:
@@ -137,6 +161,182 @@ async def _stealthy_html(server, url: str, timeout: int = ENGINE_TIMEOUT) -> Opt
     except Exception as e:
         logger.debug(f"stealthy SERP escalation failed for {url[:80]}: {e}")
     return None
+
+
+# ─── Search Engine Resilience Layer (SERL) ───────────────────────────────────
+#
+# A stateful per-engine coordinator: persistent warm session + pacer + circuit
+# breaker. One module singleton (_ENGINES_COORD) lives for the server lifetime.
+
+class _EngineState:
+    __slots__ = ("name", "cm", "sess", "lock", "last_req",
+                 "cooldown_until", "consecutive_blocks", "created", "recreate")
+
+    def __init__(self, name: str):
+        self.name = name
+        self.cm = None            # FetcherSession async context manager (held open)
+        self.sess = None          # the live session object returned by __aenter__
+        self.lock = asyncio.Lock()  # serializes same-engine requests (pacing)
+        self.last_req = 0.0
+        self.cooldown_until = 0.0
+        self.consecutive_blocks = 0
+        self.created = False
+        self.recreate = False
+
+
+class _EngineCoordinator:
+    """Per-engine persistent warm session + pacer + circuit breaker."""
+
+    def __init__(self):
+        self.states: dict[str, _EngineState] = {}
+
+    def state(self, name: str) -> _EngineState:
+        st = self.states.get(name)
+        if st is None:
+            st = _EngineState(name)
+            self.states[name] = st
+        return st
+
+    def cooldown_left(self, name: str) -> float:
+        return max(0.0, self.state(name).cooldown_until - time())
+
+    def reset(self, name: str) -> None:
+        """Clear the circuit breaker for an engine (e.g. stealthy escalation
+        succeeded, so the engine is not actually blocked)."""
+        st = self.state(name)
+        st.cooldown_until = 0.0
+        st.consecutive_blocks = 0
+
+    def _make_session(self):
+        from scrapling.engines.static import FetcherSession
+        # impersonate list -> random fingerprint per request (rotation).
+        # retries=2 handles transient connection errors; scrapling does NOT retry
+        # on HTTP 429 (a 429 is a successful response), so the circuit breaker
+        # owns backoff for rate-limits.
+        return FetcherSession(
+            impersonate=_IMPERSONATE_POOL, proxy=_PROXY,
+            stealthy_headers=True, retries=2, retry_delay=1,
+            follow_redirects="safe", timeout=ENGINE_TIMEOUT,
+        )
+
+    async def _ensure_session(self, st: _EngineState):
+        """Lazily create (or recreate) the persistent warm session for an engine."""
+        if st.recreate and st.cm is not None:
+            try:
+                await st.cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            st.cm = None
+            st.sess = None
+            st.created = False
+            st.recreate = False
+        if not st.created or st.sess is None:
+            try:
+                st.cm = self._make_session()
+                st.sess = await st.cm.__aenter__()
+                st.created = True
+            except Exception as e:
+                logger.debug(f"persistent session for {st.name} failed: {e}; per-request fallback")
+                st.cm = None
+                st.sess = None
+                st.created = False
+
+    async def get(self, name: str, url: str, *,
+                  method: str = "GET", form: Optional[dict] = None,
+                  timeout: int = ENGINE_TIMEOUT) -> tuple[Optional[str], int, bool, bool]:
+        """Paced, circuit-broken, persistent-session request to an engine SERP.
+
+        Returns (text, status, blocked, cooling). When cooling is True the engine
+        is in cooldown and NO request was made (load-shedding); text is None,
+        blocked is True. Transport errors return blocked=False (not a rate-limit).
+        """
+        st = self.state(name)
+        async with st.lock:  # serialize same-engine requests so pacing is accurate
+            now = time()
+            # Circuit breaker: skip entirely while cooling down.
+            if now < st.cooldown_until:
+                return None, 0, True, True
+            # Pacer: enforce a min interval (with jitter) between successive
+            # same-engine hits so a burst of searches does not hammer one engine.
+            pace = _PACE_OVERRIDE if _PACE_OVERRIDE > 0 else _PACE.get(name, 1.0)
+            elapsed = now - st.last_req
+            if elapsed < pace:
+                await asyncio.sleep(pace - elapsed + random.uniform(0, 0.35))
+            await self._ensure_session(st)
+            st.last_req = time()
+
+            text: Optional[str] = None
+            status = 0
+            try:
+                if st.sess is not None:
+                    if method == "POST" and form is not None:
+                        resp = await st.sess.post(url, data=form, timeout=timeout)
+                    else:
+                        resp = await st.sess.get(url, timeout=timeout)
+                else:
+                    # Per-request fallback if the persistent session would not create.
+                    cm = self._make_session()
+                    s2 = await cm.__aenter__()
+                    try:
+                        if method == "POST" and form is not None:
+                            resp = await s2.post(url, data=form, timeout=timeout)
+                        else:
+                            resp = await s2.get(url, timeout=timeout)
+                    finally:
+                        await cm.__aexit__(None, None, None)
+                status = getattr(resp, "status", 0) or 0
+                body = getattr(resp, "body", None)
+                if body:
+                    text = body.decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
+                blocked = _is_blocked(status, text or "")
+                ra = _retry_after(resp)
+            except Exception as e:
+                logger.debug(f"engine {name} GET failed: {e}")
+                return None, 0, False, False  # transport error, not a rate-limit
+
+            # Update the circuit breaker.
+            if blocked:
+                st.consecutive_blocks += 1
+                cd = min(_COOLDOWN_BASE * (2 ** (st.consecutive_blocks - 1)), _COOLDOWN_CAP)
+                if ra > 0:
+                    cd = max(cd, ra)
+                st.cooldown_until = time() + cd
+                # If this session keeps getting blocked, it may be burned: force a
+                # fresh session (new cookies + TLS) on the next acquire.
+                if st.consecutive_blocks % _RECREATE_EVERY == 0:
+                    st.recreate = True
+            else:
+                st.consecutive_blocks = 0
+                st.cooldown_until = 0.0
+            return text, status, blocked, False
+
+    async def close_all(self) -> None:
+        """Close every persistent session (called at server shutdown)."""
+        for st in self.states.values():
+            if st.cm is not None:
+                try:
+                    await st.cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            st.cm = None
+            st.sess = None
+            st.created = False
+
+
+_ENGINES_COORD = _EngineCoordinator()
+
+
+async def _engine_get(name: str, url: str, *, method: str = "GET",
+                      form: Optional[dict] = None,
+                      timeout: int = ENGINE_TIMEOUT) -> tuple[Optional[str], int, bool, bool]:
+    """SERP transport via the resilience coordinator. Returns
+    (text, status, blocked, cooling). Patchable seam for tests."""
+    return await _ENGINES_COORD.get(name, url, method=method, form=form, timeout=timeout)
+
+
+async def close_search_engines() -> None:
+    """Shutdown hook: close all persistent warm engine sessions."""
+    await _ENGINES_COORD.close_all()
 
 
 # ─── DuckDuckGo (html endpoint) ─────────────────────────────────────────────
@@ -181,15 +381,17 @@ async def search_ddg(query: str, max_results: int, *, region: str = "us-en",
     if freshness in ("day", "week", "month", "year"):
         params += f"&df={freshness[0]}"
     url = f"https://html.duckduckgo.com/html/?{params}"
-    text, status, blocked = await _impersonated_get(url)
+    text, status, blocked, cooling = await _engine_get("duckduckgo", url)
     rep = EngineReport(name="duckduckgo")
-    if blocked and server is not None:
+    if blocked and not cooling and server is not None:
         escalated = await _stealthy_html(server, url)
         if escalated:
             text, blocked = escalated, False
+            _ENGINES_COORD.reset("duckduckgo")
     if not text:
-        rep.blocked = blocked or (status in (429, 503, 403))
-        rep.error = f"no response (status {status})"
+        rep.blocked = blocked
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('duckduckgo'))}s left)"
+                     if cooling else f"no response (status {status})")
         return [], rep
     results = _parse_ddg(text)[:max_results]
     rep.ok = bool(results)
@@ -213,7 +415,7 @@ def _parse_bing(html: str) -> list[RawResult]:
             continue
         # Bing wraps the main link in an opaque bing.com/ck/a redirect that has
         # NO recoverable real URL in the href. The real URL is shown in the <cite>
-        # display element (sometimes with '›' breadcrumb separators).
+        # display element (sometimes with '>>' breadcrumb separators).
         cite = li.select_one(".b_attribution cite, .t_tgk cite, cite")
         cite_text = cite.get_text(" ", strip=True) if cite else ""
         url = _bing_real_url(cite_text)
@@ -228,8 +430,8 @@ def _parse_bing(html: str) -> list[RawResult]:
 def _bing_real_url(cite_text: str) -> str:
     """Reconstruct a real URL from Bing's <cite> display text.
 
-    Bing shows the result URL as e.g. 'https://www.programiz.com › python-programming › online-compiler'.
-    Replace the '›' breadcrumb separators with '/' and ensure a scheme.
+    Bing shows the result URL as e.g. 'https://www.programiz.com >> python-programming >> online-compiler'.
+    Replace the '>' breadcrumb separators with '/' and ensure a scheme.
     """
     if not cite_text:
         return ""
@@ -251,15 +453,17 @@ async def search_bing(query: str, max_results: int, *, region: str = "us-en",
     elif freshness == "year":
         params += "&filters=ex1%3a%22ez5_y1%22"
     url = f"https://www.bing.com/search?{params}"
-    text, status, blocked = await _impersonated_get(url)
+    text, status, blocked, cooling = await _engine_get("bing", url)
     rep = EngineReport(name="bing")
-    if blocked and server is not None:
+    if blocked and not cooling and server is not None:
         escalated = await _stealthy_html(server, url)
         if escalated:
             text, blocked = escalated, False
+            _ENGINES_COORD.reset("bing")
     if not text:
-        rep.blocked = blocked or (status in (429, 503, 403))
-        rep.error = f"no response (status {status})"
+        rep.blocked = blocked
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('bing'))}s left)"
+                     if cooling else f"no response (status {status})")
         return [], rep
     results = _parse_bing(text)[:max_results]
     rep.ok = bool(results)
@@ -312,17 +516,19 @@ async def search_google(query: str, max_results: int, *, region: str = "us-en",
     if freshness in ("day", "week", "month", "year"):
         params += f"&tbs=qdr:{freshness[0]}"
     url = f"https://www.google.com/search?{params}"
-    text, status, blocked = await _impersonated_get(url)
+    text, status, blocked, cooling = await _engine_get("google", url)
     rep = EngineReport(name="google")
     # Google almost always CAPTCHAs plain impersonated HTTP under any load; if
     # blocked or empty, escalate to the warm stealthy browser (the flagship move).
-    if (blocked or not text) and server is not None:
+    if (blocked or not text) and not cooling and server is not None:
         escalated = await _stealthy_html(server, url)
         if escalated:
             text, blocked = escalated, False
+            _ENGINES_COORD.reset("google")
     if not text:
-        rep.blocked = blocked or (status in (429, 503, 403))
-        rep.error = f"no response (status {status})"
+        rep.blocked = blocked or (status in (429, 503, 403, 202))
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('google'))}s left)"
+                     if cooling else f"no response (status {status})")
         return [], rep
     results = _parse_google(text)[:max_results]
     rep.ok = bool(results)
@@ -347,11 +553,12 @@ async def search_wikipedia(query: str, max_results: int, *, region: str = "us-en
     url = (f"https://{lang}.wikipedia.org/w/api.php?action=query&list=search"
            f"&srsearch={quote(query)}&srlimit={max(min(max_results, 20), 1)}"
            f"&srprop=snippet&format=json&utf8=1")
-    text, status, blocked = await _impersonated_get(url)
+    text, status, blocked, cooling = await _engine_get("wikipedia", url)
     rep = EngineReport(name="wikipedia")
     if not text:
-        rep.blocked = blocked or (status in (429, 503, 403))
-        rep.error = f"no response (status {status})"
+        rep.blocked = blocked
+        rep.error = (f"cooling down (rate-limited, ~{int(_ENGINES_COORD.cooldown_left('wikipedia'))}s left)"
+                     if cooling else f"no response (status {status})")
         return [], rep
     out: list[RawResult] = []
     try:
@@ -461,7 +668,7 @@ def bm25_rerank(query: str, results: list[RawResult], *, k1: float = 1.5, b: flo
         scored.append((r, score))
     max_s = max((s for _, s in scored), default=0.0)
     # Tiebreak: engine position (lower = better) then original order, so zero-overlap
-    # queries don't get randomly reordered by the merge dict.
+    # queries do not get randomly reordered by the merge dict.
     order = {id(r): i for i, (r, _) in enumerate(scored)}
     scored.sort(key=lambda rs: (-rs[1], rs[0].position, order[id(rs[0])]))
     if max_s > 0:
@@ -471,14 +678,20 @@ def bm25_rerank(query: str, results: list[RawResult], *, k1: float = 1.5, b: flo
 
 async def fetch_source_for_similar(url: str, *, timeout: int = 10, max_chars: int = 4000
                                     ) -> tuple[str, str]:
-    """Fetch a URL for find_similar: returns (title, body_text). Uses impersonated
-    HTTP (no stealthy escalation; find_similar works on the page text, and a block
-    just means we cannot seed the similarity search for that URL)."""
+    """Fetch a URL for find_similar: returns (title, body_text). Uses a one-off
+    impersonated HTTP fetch (not the per-engine SERL coordinator: this is a single
+    arbitrary page, not a repeated engine hit, so pacing/cookies do not apply)."""
     try:
-        text, _status, blocked = await _impersonated_get(url, timeout=timeout)
+        from scrapling.engines.static import FetcherSession
+        async with FetcherSession(impersonate=_IMPERSONATE_POOL, proxy=_PROXY,
+                                  stealthy_headers=True, retries=1) as sess:
+            resp = await sess.get(url, timeout=timeout)
+            text = (getattr(resp, "body", None) or b"").decode(
+                getattr(resp, "encoding", None) or "utf-8", errors="replace")
+            status = getattr(resp, "status", 0) or 0
     except Exception:
         return "", ""
-    if not text or blocked:
+    if not text or _is_blocked(status, text):
         return "", ""
     title = ""
     try:
@@ -512,6 +725,11 @@ async def multi_search(
 
     Returns (ranked_results, engine_reports). engines defaults to
     (duckduckgo, bing, wikipedia). Unknown engine names are ignored.
+
+    Adaptive reserve tier: if the primary engines returned few results AND one was
+    blocked, fan out to Google via the stealthy browser (Google is CAPTCHA-prone,
+    so it is held in reserve, not hit by default). Skipped when google was already
+    requested or no server is available (the reserve uses the stealthy browser).
     """
     names = [e for e in (engines or list(DEFAULT_ENGINES)) if e in _ENGINES]
     if not names:
@@ -533,6 +751,20 @@ async def multi_search(
             reports.append(rep)
             cleaned.append((results, rep))
     merged = merge_dedupe(cleaned, max_results, site=site, exclude_sites=exclude_sites)
+
+    # Adaptive reserve tier (Google) when primaries fell short + one was blocked.
+    if (server is not None and "google" not in names
+            and len(merged) < 3 and any(r.blocked for _, r in cleaned)):
+        try:
+            g_res, g_rep = await search_google(query, max_results, region=region,
+                                               freshness=freshness, server=server)
+            if g_res:
+                cleaned.append((g_res, g_rep))
+                reports.append(g_rep)
+                merged = merge_dedupe(cleaned, max_results, site=site, exclude_sites=exclude_sites)
+        except Exception as e:
+            logger.debug(f"reserve google fan-out failed: {e}")
+
     ranked = bm25_rerank(query, merged)
     return [r for r, _ in ranked], reports
 

@@ -430,7 +430,7 @@ async def smart_search(
             blocked_any = bool([r for r in reports if r.blocked])
             error = (
                 "No results from any engine. " +
-                ("Engines were rate-limited/CAPTCHA'd; retry in a moment or rephrase. "
+                ("Engines were rate-limited/CAPTCHA'd; retry in a moment, rephrase, or set HOUND_SEARCH_PROXY for sustained heavy use. "
                  if blocked_any else "Try rephrasing the query.")
             )
 

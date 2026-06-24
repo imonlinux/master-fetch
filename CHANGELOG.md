@@ -58,11 +58,22 @@ someone else's cloud.
 - `compute_fetch_relevance` (old overlap heuristic) replaced by BM25 + `_tier`.
 
 #### Notes
-- Honest posture (same as SearXNG/ddgs): public engines may rate-limit or
-  CAPTCHA; mitigated by impersonated TLS, multi-engine fallback, the warm stealthy
-  browser, and caching. No search-engine ToS compliance claimed.
-- 599 tests pass (was 549 at 6.0.0). New: `tests/test_search_engines.py` (24),
-  `tests/test_reranker.py` (29). All TinyFish tests removed; replaced with the
+- **Search Engine Resilience Layer (SERL)**: a stateful per-engine coordinator
+  in front of every SERP request. (1) Persistent warm session per engine reused
+  across searches (cookies + TLS accumulate -> returning human, not fresh bot;
+  also faster, no per-search TLS handshake). (2) Per-engine pacing with jitter;
+  within one search all engines fire in parallel. (3) Per-engine circuit breaker
+  with exponential cooldown (15->120s); a blocked engine is skipped while the
+  others keep serving. (4) 202 soft-limit + 429/503/403 + Retry-After aware (DDG
+  202 was a missed case before). (5) Fingerprint rotation across a pool of real
+  Chrome/Edge/Firefox/Safari TLS profiles. (6) Adaptive Google reserve tier
+  (fires via the stealthy browser only when primaries fall short + one was
+  blocked). (7) `HOUND_SEARCH_PROXY` env to route all engine requests through a
+  user-supplied proxy (the bulletproof path for sustained heavy use). Honest
+  posture: not bulletproof without a proxy, but dramatically more robust for a
+  single user on a clean residential IP. No search-engine ToS compliance claimed.
+- 604 tests pass (was 549 at 6.0.0). New: `tests/test_search_engines.py` (38,
+  incl. 14 SERL tests), `tests/test_reranker.py` (29). All TinyFish tests removed; replaced with the
   local-search error contract. Live-verified against the real web: all engines
   return clean real URLs, neural reranks vs keyword,
   find_similar returns pages ranked vs a source URL, expand runs sub-queries.

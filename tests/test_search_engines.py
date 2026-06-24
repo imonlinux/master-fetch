@@ -137,10 +137,10 @@ def test_search_wikipedia_parses_api_json(monkeypatch):
         {"title": "Async/await", "snippet": "Async <i>await</i> syntax."},
     ]}}
 
-    async def fake_get(url, *, method="GET", form=None, timeout=12):
-        return (json.dumps(payload), 200, False)
+    async def fake_get(name, url, *, method="GET", form=None, timeout=12):
+        return (json.dumps(payload), 200, False, False)
 
-    monkeypatch.setattr(se, "_impersonated_get", fake_get)
+    monkeypatch.setattr(se, "_engine_get", fake_get)
     out, rep = asyncio.run(se.search_wikipedia("coroutine", 5, region="us-en"))
     assert rep.ok and not rep.blocked
     assert out[0].title == "Coroutine"
@@ -153,10 +153,10 @@ def test_search_wikipedia_parses_api_json(monkeypatch):
 def test_search_wikipedia_uses_language_suffix_of_region(monkeypatch):
     captured = {}
     payload = {"query": {"search": [{"title": "Python", "snippet": "lang"}]}}
-    async def fake_get(url, **kw):
+    async def fake_get(name, url, **kw):
         captured["url"] = url
-        return (json.dumps(payload), 200, False)
-    monkeypatch.setattr(se, "_impersonated_get", fake_get)
+        return (json.dumps(payload), 200, False, False)
+    monkeypatch.setattr(se, "_engine_get", fake_get)
     # region "fr-fr" -> Wikipedia host language = "fr" (last segment), NOT "fr-fr" or the country.
     asyncio.run(se.search_wikipedia("python", 3, region="fr-fr"))
     assert "fr.wikipedia.org" in captured["url"]
@@ -275,3 +275,234 @@ def test_multi_search_engine_exception_is_caught(monkeypatch):
     assert ranked == []
     # Every engine reported an error (not ok, not blocked) instead of crashing the call.
     assert all(not r.ok and not r.blocked and r.error for r in reports)
+
+# ─── Search Engine Resilience Layer (SERL) ───────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, status, body=b"", headers=None):
+        self.status = status
+        self.body = body.encode() if isinstance(body, str) else body
+        self.encoding = "utf-8"
+        self.headers = headers or {}
+
+
+class _FakeSess:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+        self.closed = False
+    async def get(self, url, timeout=None):
+        return self._next()
+    async def post(self, url, data=None, timeout=None):
+        return self._next()
+    def _next(self):
+        self.calls += 1
+        r = self.responses[self.calls - 1]
+        if isinstance(r, BaseException):
+            raise r
+        return r
+
+
+class _FakeCM:
+    def __init__(self, sess):
+        self.sess = sess
+    async def __aenter__(self):
+        return self.sess
+    async def __aexit__(self, *a):
+        self.sess.closed = True
+        return False
+
+
+@pytest.fixture
+def fresh_coord(monkeypatch):
+    """Reset the coordinator state and stub session creation for each test."""
+    se._ENGINES_COORD.states.clear()
+    holder = {}
+    def make_session():
+        return _FakeCM(holder["sess"])
+    monkeypatch.setattr(se._ENGINES_COORD, "_make_session", make_session)
+    return holder
+
+
+def _set_sess(holder, responses):
+    holder["sess"] = _FakeSess(responses)
+    return holder["sess"]
+
+
+def test_is_blocked_catches_ddg_202_soft_limit():
+    # DDG returns 202 as a soft rate-limit; this was a missed case before SERL.
+    assert se._is_blocked(202, "") is True
+    assert se._is_blocked(429, "") is True
+    assert se._is_blocked(503, "") is True
+    assert se._is_blocked(403, "") is True
+    assert se._is_blocked(200, "real serp body " * 50) is False
+
+
+def test_serl_circuit_breaker_skips_request_while_cooling(fresh_coord):
+    sess = _set_sess(fresh_coord, [_FakeResp(429, b"")])
+    text, status, blocked, cooling = asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert blocked is True and cooling is False
+    assert sess.calls == 1
+    # Immediate second call: engine in cooldown -> NO request, cooling=True.
+    text2, status2, blocked2, cooling2 = asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert cooling2 is True and blocked2 is True and text2 is None
+    assert sess.calls == 1  # no second network request was made
+
+
+def test_serl_cooldown_exponential_growth(fresh_coord):
+    sess = _set_sess(fresh_coord, [_FakeResp(429, b""), _FakeResp(429, b""), _FakeResp(429, b"")])
+    cds = []
+    for _ in range(3):
+        asyncio.run(se._engine_get("bing", "https://x"))
+        cds.append(round(se._ENGINES_COORD.cooldown_left("bing")))
+        # simulate cooldown expiring so the next call actually hits the network
+        se._ENGINES_COORD.state("bing").cooldown_until = 0.0
+    # 15 -> 30 -> 60 (base 15, doubling, capped later)
+    assert cds[0] >= 14 and cds[1] >= 29 and cds[2] >= 59
+    assert se._ENGINES_COORD.state("bing").consecutive_blocks == 3
+
+
+def test_serl_recreate_session_every_3_blocks(fresh_coord):
+    sess = _set_sess(fresh_coord, [_FakeResp(429, b""), _FakeResp(429, b""), _FakeResp(429, b"")])
+    for _ in range(3):
+        asyncio.run(se._engine_get("duckduckgo", "https://x"))
+        se._ENGINES_COORD.state("duckduckgo").cooldown_until = 0.0
+    st = se._ENGINES_COORD.state("duckduckgo")
+    assert st.recreate is True  # 3rd consecutive block -> session marked burned
+    # Next acquire closes the old session and makes a new one.
+    new_sess = _FakeSess([_FakeResp(200, b"ok")])
+    fresh_coord["sess"] = new_sess
+    st.cooldown_until = 0.0
+    asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert sess.closed is True
+    assert new_sess.calls == 1
+
+
+def test_serl_success_clears_circuit_breaker(fresh_coord):
+    _set_sess(fresh_coord, [_FakeResp(429, b""), _FakeResp(200, b"<html>ok</html>")])
+    asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert se._ENGINES_COORD.state("duckduckgo").consecutive_blocks == 1
+    se._ENGINES_COORD.state("duckduckgo").cooldown_until = 0.0
+    text, status, blocked, cooling = asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert blocked is False and cooling is False and status == 200
+    assert se._ENGINES_COORD.state("duckduckgo").consecutive_blocks == 0
+    assert se._ENGINES_COORD.cooldown_left("duckduckgo") == 0.0
+
+
+def test_serl_reset_clears_cooldown(fresh_coord):
+    _set_sess(fresh_coord, [_FakeResp(429, b"")])
+    asyncio.run(se._engine_get("bing", "https://x"))
+    assert se._ENGINES_COORD.cooldown_left("bing") > 0
+    se._ENGINES_COORD.reset("bing")
+    assert se._ENGINES_COORD.cooldown_left("bing") == 0.0
+    assert se._ENGINES_COORD.state("bing").consecutive_blocks == 0
+
+
+def test_serl_transport_error_is_not_a_block(fresh_coord):
+    _set_sess(fresh_coord, [ConnectionError("network reset")])
+    text, status, blocked, cooling = asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert text is None and blocked is False and cooling is False
+    # No cooldown for a transport error (transient, not a rate-limit).
+    assert se._ENGINES_COORD.cooldown_left("duckduckgo") == 0.0
+    assert se._ENGINES_COORD.state("duckduckgo").consecutive_blocks == 0
+
+
+def test_serl_retry_after_header_honored(fresh_coord):
+    _set_sess(fresh_coord, [_FakeResp(429, b"", headers={"Retry-After": "30"})])
+    asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    assert se._ENGINES_COORD.cooldown_left("duckduckgo") >= 29.0
+
+
+def test_serl_pacer_delays_same_engine_burst(monkeypatch, fresh_coord):
+    monkeypatch.setitem(se._PACE, "wikipedia", 0.08)
+    _set_sess(fresh_coord, [_FakeResp(200, b"{}"), _FakeResp(200, b"{}")])
+    import time as _t
+    t0 = _t.time()
+    asyncio.run(se._engine_get("wikipedia", "https://x"))
+    asyncio.run(se._engine_get("wikipedia", "https://x"))
+    gap = _t.time() - t0
+    assert gap >= 0.08  # second same-engine call is paced
+
+
+def test_serl_pacer_keeps_engines_parallel(monkeypatch, fresh_coord):
+    monkeypatch.setitem(se._PACE, "wikipedia", 0.08)
+    monkeypatch.setitem(se._PACE, "duckduckgo", 0.08)
+    _set_sess(fresh_coord, [_FakeResp(200, b"{}"), _FakeResp(200, b"{}")])
+    import time as _t
+    async def _both():
+        await asyncio.gather(
+            se._engine_get("wikipedia", "https://x"),
+            se._engine_get("duckduckgo", "https://x"),
+        )
+    t0 = _t.time()
+    asyncio.run(_both())
+    gap = _t.time() - t0
+    assert gap < 0.16  # different engines -> independent locks -> parallel
+
+
+def test_serl_close_all_closes_sessions(fresh_coord):
+    sess = _set_sess(fresh_coord, [_FakeResp(200, b"{}")])
+    asyncio.run(se._engine_get("duckduckgo", "https://x"))
+    asyncio.run(se.close_search_engines())
+    assert sess.closed is True
+    assert se._ENGINES_COORD.state("duckduckgo").sess is None
+
+
+# ─── multi_search adaptive reserve tier (Google) ─────────────────────────────
+
+def test_multi_search_reserve_google_fires_when_primaries_short(monkeypatch):
+    async def fake_ddg(q, n, *, region, freshness, server):
+        return ([], EngineReport("duckduckgo", blocked=True, error="captcha"))
+    async def fake_bing(q, n, *, region, freshness, server):
+        return ([], EngineReport("bing", blocked=True, error="captcha"))
+    async def fake_wiki(q, n, *, region, freshness, server):
+        return ([_rr("W1", "https://en.wikipedia.org/wiki/A", "wikipedia", 1),
+                 _rr("W2", "https://en.wikipedia.org/wiki/B", "wikipedia", 2)],
+                EngineReport("wikipedia", ok=True))
+    called = {"google": False}
+    async def fake_google(q, n, *, region, freshness, server):
+        called["google"] = True
+        return ([_rr("G", "https://g.com", "google", 1, "g")], EngineReport("google", ok=True))
+    monkeypatch.setitem(se._ENGINES, "duckduckgo", fake_ddg)
+    monkeypatch.setitem(se._ENGINES, "bing", fake_bing)
+    monkeypatch.setitem(se._ENGINES, "wikipedia", fake_wiki)
+    monkeypatch.setattr(se, "search_google", fake_google)
+    ranked, reports = asyncio.run(multi_search("x", 5, server=object()))  # truthy server
+    assert called["google"] is True
+    assert any(r.name == "google" and r.ok for r in reports)
+    assert any(r.url == "https://g.com" for r in ranked)
+
+
+def test_multi_search_reserve_google_skipped_when_server_none(monkeypatch):
+    async def fake_ddg(q, n, *, region, freshness, server):
+        return ([], EngineReport("duckduckgo", blocked=True, error="captcha"))
+    async def fake_wiki(q, n, *, region, freshness, server):
+        return ([_rr("W1", "https://en.wikipedia.org/wiki/A", "wikipedia", 1)],
+                EngineReport("wikipedia", ok=True))
+    called = {"google": False}
+    async def fake_google(q, n, *, region, freshness, server):
+        called["google"] = True
+        return ([_rr("G", "https://g.com", "google", 1)], EngineReport("google", ok=True))
+    monkeypatch.setattr(se, "_ENGINES", {"duckduckgo": fake_ddg, "wikipedia": fake_wiki})
+    monkeypatch.setattr(se, "search_google", fake_google)
+    asyncio.run(multi_search("x", 5, server=None))
+    assert called["google"] is False  # no server -> reserve tier stays off
+
+
+def test_multi_search_reserve_google_skipped_when_results_sufficient(monkeypatch):
+    async def fake_ddg(q, n, *, region, freshness, server):
+        return ([_rr(f"D{i}", f"https://d{i}.com", "duckduckgo", i) for i in range(5)],
+                EngineReport("duckduckgo", ok=True))
+    async def fake_bing(q, n, *, region, freshness, server):
+        return ([], EngineReport("bing", blocked=True, error="captcha"))
+    async def fake_wiki(q, n, *, region, freshness, server):
+        return ([_rr("W", "https://en.wikipedia.org/wiki/W", "wikipedia", 1)],
+                EngineReport("wikipedia", ok=True))
+    called = {"google": False}
+    async def fake_google(q, n, *, region, freshness, server):
+        called["google"] = True
+        return ([_rr("G", "https://g.com", "google", 1)], EngineReport("google", ok=True))
+    monkeypatch.setattr(se, "_ENGINES", {"duckduckgo": fake_ddg, "bing": fake_bing, "wikipedia": fake_wiki})
+    monkeypatch.setattr(se, "search_google", fake_google)
+    asyncio.run(multi_search("x", 5, server=object()))
+    assert called["google"] is False  # primaries returned enough -> reserve not needed

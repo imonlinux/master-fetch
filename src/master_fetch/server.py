@@ -84,6 +84,7 @@ from master_fetch.trafilatura_extractor import extract_with_trafilatura
 from master_fetch.robots import is_allowed, clear_robots_cache
 from master_fetch.search import SearchResponseModel
 from master_fetch.reddit import is_reddit_url, rewrite_to_old_reddit, parse_old_reddit_listing
+from master_fetch.search_engines import close_search_engines
 from master_fetch.security import (
     validate_url,
     validate_css_selector,
@@ -1048,6 +1049,11 @@ class MasterFetchServer:
             except Exception:
                 pass
             entry._alive = False
+        # Close the persistent warm search-engine sessions (SERL) too.
+        try:
+            await close_search_engines()
+        except Exception:
+            pass
 
     async def _finalize_result(
         self,
@@ -2494,7 +2500,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks by relevance. Each result has relevance_score + fetch_relevance (high/med/low). NEVER answer from snippets alone: either smart_fetch the 'high' results, OR set fetch_content=true (research mode) to auto-fetch the top-N results' full content in THIS one call (saves round-trips). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google' to use Google via the stealthy browser). Results cached 5min.",
+            "description": "Local keyless web search. No API key, no account. Scrapes DuckDuckGo + Bing + Wikipedia in parallel, merges + ranks by relevance. Each result has relevance_score + fetch_relevance (high/med/low). NEVER answer from snippets alone: either smart_fetch the 'high' results, OR set fetch_content=true (research mode) to auto-fetch the top-N results' full content in THIS one call (saves round-trips). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year), engines (list, default ['duckduckgo','bing','wikipedia']; add 'google' to use Google via the stealthy browser). Rate-limit resilient: per-engine warm sessions + pacing + auto-cooldown; engine_blocked lists any engine cooling down (results still come from the others, retry shortly). Results cached 5min.",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
