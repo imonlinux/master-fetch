@@ -114,7 +114,7 @@ IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 # the #1 workflow, the gotchas, and when to use each tool. Kept tight (~300
 # tokens) since it is paid once, not per-turn-per-tool.
 HOUND_INSTRUCTIONS = (
-    "Hound = web access for this agent. 4 tools cover 95% of web work.\n"
+    "Hound = web access for this agent. 4 main tools (+ cache_clear, version) cover 95% of web work.\n"
     "\n"
     "• smart_fetch(url) - get any page. Auto-handles anti-bot (HTTP → stealthy Patchright browser). Returns extracted text + metadata.\n"
     "  - One section only? pass css_selector (e.g. 'article', '.main').\n"
@@ -129,7 +129,7 @@ HOUND_INSTRUCTIONS = (
     "• smart_search(query) - find pages. Local + keyless (no API key, no account). Scrapes DuckDuckGo + Bing + Wikipedia in parallel and ranks by relevance. NEVER answer from snippets alone. Each result has fetch_relevance (high/med/low): smart_fetch the 'high' ones first (1-2), then 'med' if needed. Skip 'low'.\n"
     "  - Research mode: options={fetch_content:true} auto-fetches the top 3 results' full content in the same call (one call instead of 4). Good for quick factual answers.\n"
     "  - Rerank: options={mode:'neural'} uses a local neural cross-encoder (needs hound-mcp[all]; auto-detects). mode='find_similar' + url=<a page> finds pages similar to it (fetches the source, reranks candidates vs its content). expand=N runs N sub-query variants in parallel for niche recall. Default 'auto' picks neural if available else keyword BM25.\n"
-    "  - Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','wikipedia','google']}.\n"
+    "  - Response: summary (one-line status) + next_action (the obvious next call: fetch the high results / rephrase / retry / paginate) + engine_blocked (engines that timed out or cooled down; results still came from the others, retry shortly for more recall).  Filters: options={site:'docs.python.org', exclude_sites:['pinterest.com'], location:'US', language:'en', region:'us-en', page:0, freshness:'day|week|month|year', engines:['duckduckgo','bing','wikipedia','google']}.\n"
     "• smart_crawl(url) - read a whole site/section. Best-first same-domain crawl; returns each page as markdown with content_ok + page_type (article/list/js_shell). List pages (HN/aggregators) come back as a structured link list. options: max_pages (default 10), max_depth (default 2), path_include (scope to ['/docs']), discover_only=true (URL map only), focus query (crawl relevant pages first + focus-filter), crawl_urls list (fetch a chosen subset after discover_only). Check next_action if it stopped early.\n"
     "• screenshot(url) - image capture. Multimodal agents only (content rendered as images/canvas/visual layout). Text agents: use smart_fetch instead. Session is auto-managed.\n"
     "\n"
