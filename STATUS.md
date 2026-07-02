@@ -13,35 +13,34 @@ Testing", real_chrome=False) for smart_fetch/screenshot only, eager at startup.
 
 ---
 
-## Current shipped version: 8.2.0 (2026-06-28)
+## Current shipped version: 8.2.1 (2026-07-02)
 
-Fixes the recurring 'hound failed to load' (~50% startup failure) + isolates
-the browser prewarm so it can never crash the server.
+Faster first search + race-safe reranker prewarm.
 
-- **Root cause: heavy module-level imports blocked the handshake.** `import
-  master_fetch.server` took 5.45s cold (trafilatura 0.87s + search_metasearch
-  chain 0.86s + mcp.server.fastmcp 1.03s + mcp.types 1.03s, all eager). Cold
-  starts exceeded the MCP client's initialize timeout -> client killed hound ->
-  messy teardown (Event loop is closed / EPIPE) looked like a crash. The browser
-  prewarm was async + caught; the synchronous 5s import was the killer.
-- **Heavy imports deferred to first use**: trafilatura, search_metasearch chain,
-  mcp.server.fastmcp, mcp.types are lazy-imported at call sites, NOT module
-  load. `import master_fetch.server`: **5.45s -> 0.52s** (10x). Handshake
-  responds in ~0.5-1s. Heavy deps load on first search/screenshot/fetch that
-  needs them. (mcp.server.Server + mcp.types still imported in serve() before
-  first response — irreducible SDK cost ~2s, cached after first run.)
-- **Browser prewarm fully isolated**: `_prewarm_stealthy` catches BaseException
-  (not just Exception) + 30s `asyncio.wait_for` cap so a hung launch can't hold
-  the session-creation lock forever. On failure -> lazy-launch on first fetch.
-- **Bulletproof shutdown**: serve() finally cancels prewarm + closes sessions
-  swallowing BaseException at every step, so 'Event loop is closed' / EPIPE can
-  never crash the process. New `_safe_prewarm` helper isolates + times out the
-  search/reranker prewarm too.
-- 619 tests (613 + 6 new v8.2 startup tests). Live-proven: 11/11 stdio init
-  probes succeeded (steady-state ~2.5s, was 5.45s cold).
+- **Problem**: first `smart_search` on a fresh process was ~7s because the neural
+  reranker's ONNX model (~1.4s cold load) ran SEQUENTIALLY AFTER the engine fetch
+  (~2s diversity quorum), even with the startup prewarm loading it in the
+  background. Worse, prewarm + search RACED on sync get_reranker(): if prewarm
+  set _reranker_tried=True mid-load, the search saw tried=True,_reranker=None and
+  silently fell back to non-neural (merge/consensus) rerank — or double-loaded.
+- **Fix 1 — ensure_reranker() (async, race-safe)**: asyncio.Lock serializes
+  concurrent callers (prewarm + first search) so they share ONE load; the search
+  awaits the in-flight prewarm instead of racing it. get_reranker() is now
+  peek-only (returns cached singleton or None, never loads) — used by rerank()
+  + find_similar. _load_reranker() is the sync load body (sets _reranker +
+  _reranker_tried under the lock).
+- **Fix 2 — load overlaps engine fetch**: smart_search starts ensure_reranker()
+  as a background task at search start (parallel with multi_search), awaits it
+  before the rerank step. ~1.4s cold model load now runs concurrently with the
+  ~2s diversity quorum, so first search = max(engine_fetch, model_load) instead
+  of engine_fetch + model_load. First search ~7s -> ~2-4s (engine-fetch-bound);
+  warm searches unchanged (0ms peek). Real clients (gap before first call) get
+  warm prewarm -> ~2s first search.
+- 622 tests (619 + 3 new reranker tests).
 
 ---
 
+## Version history (summarized; full detail in CHANGELOG.md + git history)
 ## Version history (summarized; full detail in CHANGELOG.md + git history)
 ## Version history (summarized; full detail in CHANGELOG.md + git history)
 ## Version history (summarized; full detail in CHANGELOG.md + git history)
@@ -127,9 +126,13 @@ the browser prewarm so it can never crash the server.
   metasearch status robustness fix. 603 tests.
 - **8.1.0 (2026-06-28)** — real Qwant backend (10 keyless engines),
   circuit breaker for blocked backends, tracking-aware dedup. 613 tests.
-- **8.2.0 (2026-06-28)** — CURRENT. Fixes 'failed to load': heavy imports
+- **8.2.0 (2026-06-28)** — fixes 'failed to load': heavy imports
   deferred (cold start 5.45s->0.52s), browser prewarm fully isolated
   (BaseException + 30s timeout), bulletproof shutdown. 619 tests.
+- **8.2.1 (2026-07-02)** — CURRENT. Faster first search (reranker ONNX load
+  overlaps the engine fetch via a parallel ensure_reranker task) + race-safe
+  prewarm (asyncio.Lock: prewarm + first search share ONE load, no double-load
+  / no silent merge fallback). get_reranker() now peek-only. 622 tests.
 
 ### Key decisions / cut scope (still valid, do not re-propose)
 - Residential proxy rotation: cut (can't test without proxies, risky blind).
@@ -245,6 +248,32 @@ the code no longer exists.
 - **v8.1 primp impersonate values**: primp accepts string impersonate names
   ('random', 'safari', 'safari_18.5', 'chrome', etc.). _PrimpClient now takes an
   `impersonate` arg (default 'random'); Qwant pins 'safari'.
+
+- **v8.2.1 RACE-SAFE RERANKER PREWARM + PARALLEL LOAD (reranker.py, search.py)**:
+  The neural reranker's ONNX model is ~1.4s cold load. v8.2.0's prewarm_reranker
+  ran in the background but RACED the first search: sync get_reranker() set
+  _reranker_tried=True early, so a concurrent search saw tried=True,_reranker=None
+  -> returned None -> fell back to non-neural merge (or double-loaded). FIX:
+  - `ensure_reranker(*, download=True)` (async) serializes via an asyncio.Lock
+    (lazily created) so prewarm + first search share ONE load; the search awaits
+    the in-flight prewarm. Top-level fast path: `if _reranker is not None: return`
+    (NO _reranker_tried short-circuit at top — that bypassed the lock and was the
+    race). Under the lock: `if _reranker_tried: return None` (finished-failed,
+    no retry).
+  - `get_reranker()` is now PEEK-ONLY (returns _reranker or None, never loads).
+    `_load_reranker()` is the sync load body. `prewarm_reranker()` ->
+    `ensure_reranker(download=False)` (skips if model absent).
+  - search.py: `asyncio.create_task(ensure_reranker())` for neural/auto/find_similar
+    modes, started BEFORE `await multi_search` so the model load OVERLAPS the
+    engine fetch (diversity quorum ~2s), then `await _rerank_task` before _rank.
+    First search = max(engine_fetch, model_load) not engine_fetch + model_load.
+  - The asyncio.Lock is created lazily inside ensure_reranker (module-level
+    `_reranker_lock=None`) to avoid event-loop binding issues; modern asyncio
+    defers loop binding anyway but lazy is safest across anyio/run loops.
+  - TESTS (test_reranker.py): get_reranker peek-only (never loads), 3 concurrent
+    ensure_reranker = ONE load (fake_load MUST set _reranker+_reranker_tried to
+    mirror real _load_reranker, else the test sees None and re-loads), no retry
+    after finished failure. prewarm tests mock _load_reranker not get_reranker.
 
 - **v8.2 LAZY IMPORTS (the 'failed to load' fix)**: `import master_fetch.server`
   was 5.45s cold because trafilatura, search_metasearch (primp/httpx/lxml/h2/

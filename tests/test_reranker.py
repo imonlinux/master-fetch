@@ -252,25 +252,80 @@ def test_model_present_false_when_model_absent(tmp_path, monkeypatch):
 
 def test_prewarm_reranker_skips_when_model_absent(monkeypatch):
     import master_fetch.reranker as rer
-    # Force "model not cached" so prewarm must NOT call get_reranker (which would
-    # download). If it did call it, the bomb raises.
+    # Force "model not cached" so prewarm (download=False) must NOT load. If it
+    # did call the loader, the bomb raises.
+    monkeypatch.setattr(rer, "_reranker", None)
+    monkeypatch.setattr(rer, "_reranker_tried", False)
+    monkeypatch.setattr(rer, "_reranker_lock", None)
     monkeypatch.setattr(rer, "model_present", lambda: False)
     called = {"yes": False}
     def bomb():
         called["yes"] = True
         raise AssertionError("prewarm must not load the reranker when the model is absent")
-    monkeypatch.setattr(rer, "get_reranker", bomb)
+    monkeypatch.setattr(rer, "_load_reranker", bomb)
     asyncio.run(rer.prewarm_reranker())   # must not raise
     assert called["yes"] is False
 
 
 def test_prewarm_reranker_warms_when_model_present(monkeypatch):
     import master_fetch.reranker as rer
+    # prewarm -> ensure_reranker(download=False) -> _load_reranker when present.
+    monkeypatch.setattr(rer, "_reranker", None)
+    monkeypatch.setattr(rer, "_reranker_tried", False)
+    monkeypatch.setattr(rer, "_reranker_lock", None)
     monkeypatch.setattr(rer, "model_present", lambda: True)
     called = {"yes": False}
-    def fake_get():
+    def fake_load():
         called["yes"] = True
         return None
-    monkeypatch.setattr(rer, "get_reranker", fake_get)
+    monkeypatch.setattr(rer, "_load_reranker", fake_load)
     asyncio.run(rer.prewarm_reranker())
     assert called["yes"] is True
+
+
+def test_get_reranker_is_peek_only_and_never_loads(monkeypatch):
+    """get_reranker() must NOT trigger a load (that's ensure_reranker's job).
+    It just returns the cached singleton or None."""
+    import master_fetch.reranker as rer
+    monkeypatch.setattr(rer, "_reranker", None)
+    monkeypatch.setattr(rer, "_reranker_tried", False)
+    bomb = lambda *a, **k: (_ for _ in ()).throw(AssertionError("get_reranker must not load"))
+    monkeypatch.setattr(rer, "_load_reranker", bomb)
+    assert rer.get_reranker() is None  # peek returns None, no load triggered
+
+
+def test_ensure_reranker_concurrent_callers_share_one_load(monkeypatch):
+    """The race fix: concurrent ensure_reranker calls (prewarm + first search)
+    must share ONE load via the lock, not double-load or fall back to None."""
+    import master_fetch.reranker as rer
+    monkeypatch.setattr(rer, "_reranker", None)
+    monkeypatch.setattr(rer, "_reranker_tried", False)
+    monkeypatch.setattr(rer, "_reranker_lock", None)
+    monkeypatch.setattr(rer, "model_present", lambda: True)
+    loads = {"n": 0}
+    sentinel = object()
+    def fake_load():
+        loads["n"] += 1
+        rer._reranker = sentinel   # mirror real _load_reranker: set the singleton
+        rer._reranker_tried = True
+        return sentinel
+    monkeypatch.setattr(rer, "_load_reranker", fake_load)
+    import asyncio
+    async def main():
+        return await asyncio.gather(rer.ensure_reranker(), rer.ensure_reranker(), rer.ensure_reranker())
+    results = asyncio.run(main())
+    assert loads["n"] == 1, f"concurrent callers must share ONE load, got {loads['n']}"
+    assert all(r is sentinel for r in results), "all callers must get the same loaded instance"
+
+
+def test_ensure_reranker_does_not_retry_after_failure(monkeypatch):
+    """Once a load finished and failed (_reranker_tried=True, _reranker=None),
+    subsequent ensure_reranker calls return None without re-loading."""
+    import master_fetch.reranker as rer
+    monkeypatch.setattr(rer, "_reranker", None)
+    monkeypatch.setattr(rer, "_reranker_tried", True)
+    monkeypatch.setattr(rer, "_reranker_lock", None)
+    bomb = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not retry after a finished failure"))
+    monkeypatch.setattr(rer, "_load_reranker", bomb)
+    import asyncio
+    assert asyncio.run(rer.ensure_reranker()) is None

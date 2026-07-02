@@ -44,6 +44,7 @@ MIN_MODEL_BYTES = 50_000_000
 _reranker: Optional[object] = None
 _reranker_tried: bool = False
 _reranker_unavailable_reason: str = ""
+_reranker_lock: Optional["asyncio.Lock"] = None
 
 
 class _Reranker:
@@ -192,17 +193,11 @@ def _ensure_model() -> Optional[tuple[Path, Path]]:
     return onnx, tokjson
 
 
-def get_reranker() -> Optional[_Reranker]:
-    """Return a warm singleton reranker, or None if unavailable.
-
-    None means: fall back to BM25. Never raises. Caches the 'tried' state so a
-    one-time failure doesn't retry every call (retry again on next process).
-    """
+def _load_reranker() -> Optional[_Reranker]:
+    """Synchronous reranker load (ONNX session + tokenizer). Sets the module
+    singleton + 'tried' flag. Never raises. Called under the ensure_reranker
+    lock so concurrent callers (prewarm + first search) share ONE load."""
     global _reranker, _reranker_tried, _reranker_unavailable_reason
-    if _reranker is not None:
-        return _reranker
-    if _reranker_tried:
-        return None
     _reranker_tried = True
     try:
         import onnxruntime  # noqa: F401
@@ -233,6 +228,49 @@ def get_reranker() -> Optional[_Reranker]:
         _reranker_unavailable_reason = f"reranker init failed: {e}"
         logger.warning(f"reranker init failed: {e}")
         return None
+
+
+def get_reranker() -> Optional[_Reranker]:
+    """Peek the warm singleton reranker, or None if not yet loaded / unavailable.
+
+    PEEK ONLY — never triggers a load (that's ensure_reranker()'s job, called by
+    the prewarm + the search path). Callers (rerank(), search) use this to check
+    whether the neural cross-encoder is warm; if None they fall back to
+    cross-engine consensus + engine-position order. Never raises.
+    """
+    return _reranker  # type: ignore[return-value]
+
+
+async def ensure_reranker(*, download: bool = True) -> Optional[_Reranker]:
+    """Race-safe async reranker load. Concurrent callers (the startup prewarm +
+    the first search) share ONE load via a lock; the search awaits the in-flight
+    prewarm instead of racing it (the old sync get_reranker() would either
+    double-load or, if the prewarm had set _reranker_tried mid-load, silently
+    return None so the first search lost neural rerank). Returns the warm
+    reranker or None (unavailable / model absent and download=False).
+
+    Caches the 'tried' state so a one-time failure doesn't retry every call.
+    """
+    global _reranker_lock
+    if _reranker is not None:
+        return _reranker  # type: ignore[return-value]  # warm fast path (no lock)
+    if not download and not model_present():
+        return None
+    if _reranker_lock is None:
+        _reranker_lock = asyncio.Lock()
+    # Acquire the lock so a concurrent in-flight load (the startup prewarm, or a
+    # parallel search) is AWAITED rather than raced: the top-level fast path only
+    # short-circuits on a warm reranker, NOT on _reranker_tried (which is set
+    # early inside _load_reranker while still holding the lock — so a mid-load
+    # caller must wait on the lock, then see the finished result).
+    async with _reranker_lock:
+        if _reranker is not None:
+            return _reranker  # type: ignore[return-value]
+        if _reranker_tried:
+            return None  # a previous load FINISHED and failed; don't retry this process
+        if not download and not model_present():
+            return None
+        return await asyncio.to_thread(_load_reranker)
 
 
 def rerank(query: str, results: list) -> Optional[list[tuple]]:
@@ -283,12 +321,11 @@ def model_present() -> bool:
 
 async def prewarm_reranker() -> None:
     """Best-effort startup prewarm: if the reranker model is already cached, load
-    the ONNX session now (in a worker thread) so the first neural search skips
-    the ~1-2s init. Does NOT download (skips when the model is absent). Never raises."""
-    if not model_present():
-        return
+    the ONNX session now (in a worker thread, race-safe via ensure_reranker's
+    lock) so the first neural search skips the ~1-2s init and doesn't race this
+    load. Does NOT download (skips when the model is absent). Never raises."""
     try:
-        await asyncio.to_thread(get_reranker)
+        await ensure_reranker(download=False)
     except Exception:
         pass
 

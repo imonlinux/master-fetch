@@ -1,7 +1,7 @@
 [project]
 name = "hound-mcp"
-version = "8.2.0"
-description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v8.2: fixes 'failed to load' — heavy imports deferred (cold start 5.4s->0.5s), browser prewarm fully isolated, bulletproof shutdown."
+version = "8.2.1"
+description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v8.2.1: faster first search (reranker loads in parallel with engine fetch) + race-safe prewarm."
 readme = "README.md"
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
 requires-python = ">=3.11"

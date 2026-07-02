@@ -34,7 +34,7 @@ from master_fetch.search_engines import (
     fetch_source_for_similar, _INDEX_FAMILY,
 )
 from master_fetch.reranker import (
-    rerank as neural_rerank, unavailable_reason, get_reranker,
+    rerank as neural_rerank, unavailable_reason, get_reranker, ensure_reranker,
 )
 
 logger = logging.getLogger("master-fetch.search")
@@ -479,6 +479,14 @@ async def smart_search(
     rerank_used = "keyword"
     rerank_note = ""
 
+    # Start the reranker load in parallel with the engine fetch so the cold ONNX
+    # model load (~1-2s) overlaps the ~2s diversity quorum instead of stacking
+    # AFTER it (the old path paid engine_fetch + model_load sequentially = ~6-7s
+    # on the first search). Race-safe via ensure_reranker's lock — shares ONE
+    # load with the startup prewarm; awaited below before the rerank step so the
+    # result is warm by then (usually already done, loaded during the fetch).
+    _rerank_task = asyncio.create_task(ensure_reranker()) if mode in ("neural", "auto", "find_similar") else None
+
     if mode == "find_similar":
         src_title, src_text = await fetch_source_for_similar(find_sim_url, timeout=6)
         if not src_text:
@@ -498,6 +506,11 @@ async def smart_search(
             error = redact_api_key(str(e)[:200])
         # Rerank candidates against the SOURCE page content (Exa find-similar,
         # local: the cross-encoder scores (source_content, candidate)).
+        if _rerank_task:
+            try:
+                await _rerank_task
+            except Exception:
+                pass
         rer = get_reranker()
         if rer is not None and ranked:
             docs = [f"{r.title} {r.snippet}" for r in ranked]
@@ -546,6 +559,11 @@ async def smart_search(
                  if blocked_any else "Try rephrasing the query.")
             )
 
+        if _rerank_task:
+            try:
+                await _rerank_task
+            except Exception:
+                pass
         ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
         _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
         total_families = len(_efams) or 1

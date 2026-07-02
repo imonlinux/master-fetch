@@ -1,5 +1,38 @@
 # Changelog
 
+## [8.2.1] - 2026-07-02
+
+### fix: faster first search + race-safe reranker prewarm
+
+The first `smart_search` on a fresh process was ~7s because the neural reranker's
+ONNX model (~1.4s cold load) ran **sequentially after** the engine fetch
+(~2s diversity quorum), even though the startup prewarm was loading it in the
+background. Worse, the prewarm and the search **raced** on the sync
+`get_reranker()`: if the prewarm had set `_reranker_tried=True` mid-load, the
+search's `get_reranker()` saw `tried=True, _reranker=None` and silently returned
+None, so the first search fell back to non-neural (merge/consensus) rerank — or
+the search loaded the model itself while the prewarm redundantly loaded it too
+(double load).
+
+- **`ensure_reranker()` (async, race-safe)** replaces the sync load path. An
+  `asyncio.Lock` serializes concurrent callers (the startup prewarm + the first
+  search) so they share **ONE** load; the search awaits the in-flight prewarm
+  instead of racing it. `get_reranker()` is now a peek-only fast path (returns
+  the cached singleton or None, never loads) used by `rerank()` / find_similar.
+
+- **Reranker load now overlaps the engine fetch**: `smart_search` starts
+  `ensure_reranker()` as a background task at search start (in parallel with
+  `multi_search`), then awaits it before the rerank step. The ~1.4s cold model
+  load now runs concurrently with the ~2s diversity quorum, so the first search
+  = `max(engine_fetch, model_load)` instead of `engine_fetch + model_load`.
+  First search drops from ~7s to ~2-4s (engine-fetch-bound); warm searches are
+  unchanged (0ms peek). Real MCP clients (with a gap between handshake and first
+  call) get a warm prewarm and see ~2s on the first search.
+
+- 622 tests (619 + 3 new: get_reranker is peek-only, concurrent ensure_reranker
+  shares one load, no retry after a finished failure; prewarm tests updated to
+  the new _load_reranker path).
+
 ## [8.2.0] - 2026-06-28
 
 ### fix: 'hound failed to load' (50% startup failure) + browser prewarm isolation
