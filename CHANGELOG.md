@@ -1,5 +1,47 @@
 # Changelog
 
+## [8.2.0] - 2026-06-28
+
+### fix: 'hound failed to load' (50% startup failure) + browser prewarm isolation
+
+The recurring 'hound failed to load' ~50% of the time was caused by heavy
+MODULE-LEVEL imports blocking the process for ~5s BEFORE the MCP initialize
+handshake could respond. On a cold start `import master_fetch.server` took
+**5.45s** (trafilatura 0.87s + the metasearch engine chain 0.86s +
+mcp.server.fastmcp 1.03s + mcp.types 1.03s, all eager) — cold starts exceeded
+the MCP client's initialize timeout, the client killed hound, and the messy
+teardown (Event loop is closed / EPIPE) looked like a crash. The browser
+prewarm itself was async + caught, but the synchronous 5s import was the killer.
+
+- **Heavy imports deferred to first use**: trafilatura, the search_metasearch
+  engine chain (primp/httpx/lxml/h2/fake_useragent), mcp.server.fastmcp, and
+  mcp.types are now lazy-imported at their call sites, NOT at module load.
+  `import master_fetch.server` dropped from **5.45s to 0.52s** (10x). The MCP
+  handshake now responds in ~0.5-1s instead of 5s+. The heavy deps load on the
+  first search/screenshot/fetch that actually needs them, never blocking
+  startup. (mcp.server.Server + mcp.types are still imported in serve() before
+  the first response — they're irreducible SDK requirements, ~2s, but cached
+  after first run.)
+
+- **Browser prewarm fully isolated**: `_prewarm_stealthy` now catches
+  `BaseException` (not just `Exception`) so a CancelledError or any launch
+  failure can NEVER crash the server, and is capped at 30s (`asyncio.wait_for`)
+  so a hung browser launch can't hold the session-creation lock forever. On any
+  failure the browser simply lazy-launches on the first stealthy fetch.
+
+- **Bulletproof shutdown**: the serve() finally block now cancels prewarm tasks
+  and closes sessions swallowing `BaseException` at every step, so the Windows
+  ProactorEventLoop 'Event loop is closed' RuntimeError and the patchright node
+  driver EPIPE on teardown can never crash the process or look like a 'failed to
+  load' to the MCP client. New `_safe_prewarm` helper isolates + times out the
+  search/reranker prewarm tasks too.
+
+- 619 tests (613 + 6 new v8.2 startup tests in test_v8_2_startup.py: assert the
+  heavy deps are NOT in sys.modules after `import master_fetch.server`, assert
+  import < 2s, assert `_safe_prewarm` swallows Exception + BaseException +
+  caps hung launches). Live-proven: 11/11 stdio initialize probes succeeded
+  (steady-state ~2.5s, was 5.45s cold).
+
 ## [8.1.0] - 2026-06-28
 
 ### feat: search reliability + power upgrade (real Qwant backend, circuit breaker, tracking-aware dedup)

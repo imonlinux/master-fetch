@@ -13,35 +13,36 @@ Testing", real_chrome=False) for smart_fetch/screenshot only, eager at startup.
 
 ---
 
-## Current shipped version: 8.1.0 (2026-06-28)
+## Current shipped version: 8.2.0 (2026-06-28)
 
-Search reliability + power upgrade. Three functional changes (no re-labels).
+Fixes the recurring 'hound failed to load' (~50% startup failure) + isolates
+the browser prewarm so it can never crash the server.
 
-- **Real Qwant backend** (10th independent index): Qwant was aliased to
-  duckduckgo since v7.5 (vendored ddgs has no qwant backend). v8.1 adds a real
-  `Qwant` class hitting the keyless JSON API `api.qwant.com/v3/search/web` with
-  SearXNG's proven param set (count=10 exactly, locale en_US, tgp random 1-3,
-  device=desktop, shuffled param order). primp-pinned to a safari TLS
-  fingerprint (chrome/edge get 403-captcha). Own independent index -> 10th
-  `qwant` index family for consensus. Live-proven: 10 authoritative results.
-- **Circuit breaker**: a backend that CAPTCHAs/403s/rate-limits is skipped for
-  a 60s cooldown (`_record_block`/`_is_circuit_open`/`_record_success`), so we
-  stop hammering a host that is blocking our IP (avoids escalating to a longer
-  IP ban) and free quorum slots so healthy backends aren't held back. Empty/
-  timeout do NOT trip the breaker (only `MetaBlockedException` does, raised on
-  HTTP 403/503 or Qwant's captcha/rate-limit JSON signal). New statuses
-  `blocked` + `circuit_open` -> `engine_blocked`.
-- **Tracking-aware dedup**: `_normalize_url` now strips only tracking params
-  (utm_*, fbclid, gclid, ref, si, ...) and KEEPS real query, instead of dropping
-  the whole query string (which used to collapse distinct pages like ?page=2 vs
-  ?page=3).
-- Tool defs + HOUND_INSTRUCTIONS: 10 backends (added qwant), circuit-breaker
-  noted. search.py stale "duckduckgo+bing+qwant" docstring fixed.
-- 613 tests (603 + 10 new v8.1 search tests). Live-proven: full default search
-  1.1-1.4s, 3+ backends contribute, no false circuit-opens.
+- **Root cause: heavy module-level imports blocked the handshake.** `import
+  master_fetch.server` took 5.45s cold (trafilatura 0.87s + search_metasearch
+  chain 0.86s + mcp.server.fastmcp 1.03s + mcp.types 1.03s, all eager). Cold
+  starts exceeded the MCP client's initialize timeout -> client killed hound ->
+  messy teardown (Event loop is closed / EPIPE) looked like a crash. The browser
+  prewarm was async + caught; the synchronous 5s import was the killer.
+- **Heavy imports deferred to first use**: trafilatura, search_metasearch chain,
+  mcp.server.fastmcp, mcp.types are lazy-imported at call sites, NOT module
+  load. `import master_fetch.server`: **5.45s -> 0.52s** (10x). Handshake
+  responds in ~0.5-1s. Heavy deps load on first search/screenshot/fetch that
+  needs them. (mcp.server.Server + mcp.types still imported in serve() before
+  first response — irreducible SDK cost ~2s, cached after first run.)
+- **Browser prewarm fully isolated**: `_prewarm_stealthy` catches BaseException
+  (not just Exception) + 30s `asyncio.wait_for` cap so a hung launch can't hold
+  the session-creation lock forever. On failure -> lazy-launch on first fetch.
+- **Bulletproof shutdown**: serve() finally cancels prewarm + closes sessions
+  swallowing BaseException at every step, so 'Event loop is closed' / EPIPE can
+  never crash the process. New `_safe_prewarm` helper isolates + times out the
+  search/reranker prewarm too.
+- 619 tests (613 + 6 new v8.2 startup tests). Live-proven: 11/11 stdio init
+  probes succeeded (steady-state ~2.5s, was 5.45s cold).
 
 ---
 
+## Version history (summarized; full detail in CHANGELOG.md + git history)
 ## Version history (summarized; full detail in CHANGELOG.md + git history)
 ## Version history (summarized; full detail in CHANGELOG.md + git history)
 
@@ -124,8 +125,11 @@ Search reliability + power upgrade. Three functional changes (no re-labels).
 - **8.0.0 (2026-06-28)** — sitemap-mode crawl, outgoing-links field,
   related-queries mining, PDF section-map with page ranges, tool-def overhaul,
   metasearch status robustness fix. 603 tests.
-- **8.1.0 (2026-06-28)** — CURRENT. Real Qwant backend (10 keyless engines),
+- **8.1.0 (2026-06-28)** — real Qwant backend (10 keyless engines),
   circuit breaker for blocked backends, tracking-aware dedup. 613 tests.
+- **8.2.0 (2026-06-28)** — CURRENT. Fixes 'failed to load': heavy imports
+  deferred (cold start 5.45s->0.52s), browser prewarm fully isolated
+  (BaseException + 30s timeout), bulletproof shutdown. 619 tests.
 
 ### Key decisions / cut scope (still valid, do not re-propose)
 - Residential proxy rotation: cut (can't test without proxies, risky blind).
@@ -241,6 +245,33 @@ the code no longer exists.
 - **v8.1 primp impersonate values**: primp accepts string impersonate names
   ('random', 'safari', 'safari_18.5', 'chrome', etc.). _PrimpClient now takes an
   `impersonate` arg (default 'random'); Qwant pins 'safari'.
+
+- **v8.2 LAZY IMPORTS (the 'failed to load' fix)**: `import master_fetch.server`
+  was 5.45s cold because trafilatura, search_metasearch (primp/httpx/lxml/h2/
+  fake_useragent), mcp.server.fastmcp, and mcp.types were imported at MODULE
+  LEVEL. They are now lazy-imported at call sites: trafilatura_extractor in
+  _translate_response; search_engines (close/prewarm) + reranker in serve()/
+  _shutdown_close_sessions(); SearchResponseModel in the smart_search method;
+  mcp.server.fastmcp.Image + mcp.types.TextContent in the screenshot method.
+  Module-level mcp.types import removed (moved to TYPE_CHECKING + local imports).
+  Result: import 0.52s. mcp.server.Server + mcp.types are still imported IN
+  serve() before the first response (irreducible SDK cost, ~2s, cached after
+  first run). TEST: test_v8_2_startup asserts these heavy modules are NOT in
+  sys.modules after `import master_fetch.server` (checked in a fresh
+  subprocess, since the test process already loaded them) + import < 2s.
+  RULE: any new heavy dep added to server.py MUST be lazy-imported at its call
+  site, not at module top, or the handshake stalls again.
+
+- **v8.2 browser prewarm isolation**: `_prewarm_stealthy` wraps the warm work in
+  `asyncio.wait_for(_warm(), timeout=30.0)` and catches `BaseException` (not
+  just Exception) — a CancelledError or hung launch can't crash the server or
+  hold _auto_session_lock forever (cancel releases the `async with` lock).
+  `_safe_prewarm(coro_fn, timeout=20)` is the module-level helper for the
+  search/reranker prewarm: runs `coro_fn()`, swallows BaseException, caps at
+  timeout. serve()'s finally block cancels + awaits each prewarm task and calls
+  _shutdown_close_sessions, ALL wrapped per-step in `except BaseException: pass`,
+  so the Windows ProactorEventLoop 'Event loop is closed' RuntimeError and the
+  patchright node-driver EPIPE on teardown never crash the process (clean exit).
 
 - **v7.5 search transport quirks (search_metasearch.py — vendored ddgs, MIT):**
   - 9 text backends: duckduckgo (httpx transport, POST, html.duckduckgo.com/html,

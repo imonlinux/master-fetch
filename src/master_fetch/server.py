@@ -30,8 +30,7 @@ from typing import Annotated, Mapping, Sequence, Optional, Literal, Union, Dict,
 
 logger = logging.getLogger("master-fetch.server")
 
-from mcp.server.fastmcp import Image
-from mcp.types import ImageContent, TextContent
+
 
 from master_fetch import __version__
 from pydantic import BaseModel, Field
@@ -78,14 +77,13 @@ def _get_scrapling():
 if TYPE_CHECKING:
     from scrapling.engines.toolbelt.custom import Response as _ScraplingResponse
     from scrapling.fetchers import FetcherSession, AsyncDynamicSession, AsyncStealthySession
+    from master_fetch.search import SearchResponseModel
+    from mcp.server.fastmcp import Image
+    from mcp.types import ImageContent, TextContent
 
 from master_fetch.cache import get_cached, set_cached, clear_cache, clear_all_cache, DEFAULT_TTL
-from master_fetch.trafilatura_extractor import extract_with_trafilatura
 from master_fetch.robots import is_allowed, clear_robots_cache
-from master_fetch.search import SearchResponseModel
 from master_fetch.reddit import is_reddit_url, rewrite_to_old_reddit, parse_old_reddit_listing
-from master_fetch.search_engines import close_search_engines, prewarm_search_engines
-from master_fetch.reranker import prewarm_reranker
 from master_fetch.security import (
     validate_url,
     validate_css_selector,
@@ -739,6 +737,7 @@ def _translate_response(
                 )
             )
     elif use_trafilatura and extraction_type in ("markdown", "text", "article", "structured"):
+        from master_fetch.trafilatura_extractor import extract_with_trafilatura
         content = extract_with_trafilatura(page, extraction_type=extraction_type, css_selector=css_selector)
         if not content or content == [""] or content == ["\n"]:
             content = list(
@@ -811,6 +810,20 @@ async def _timed(coro):
     result = await coro
     elapsed = (now() - t0) * 1000
     return result, elapsed
+
+
+async def _safe_prewarm(coro_fn, timeout: float = 20.0) -> None:
+    """Run a prewarm callable in the background, fully isolated.
+
+    `coro_fn` is a zero-arg callable returning a coroutine (e.g.
+    prewarm_search_engines). Catches BaseException (a hung/crashing prewarm
+    NEVER takes down the server — not even CancelledError) and caps it at
+    `timeout` so a stuck launch can't linger. Prewarm is best-effort by design.
+    """
+    try:
+        await asyncio.wait_for(coro_fn(), timeout=timeout)
+    except BaseException:
+        pass
 
 
 def _normalize_credentials(credentials: Optional[Dict[str, str]]) -> Optional[tuple]:
@@ -958,16 +971,23 @@ class MasterFetchServer:
         Scheduled when the MCP server starts so the browser is warm by the time
         the agent first needs a stealthy fetch or screenshot — skipping the
         ~3-5s cold start. Stays alive for the whole process (idle timeout 0).
-        Idempotent: _ensure_auto_session reuses any existing session. Fails
-        silently (e.g. chromium not installed); in that case the browser launches
-        on first fetch instead. smart_search renders DDG/Bing SERPs in this same browser.
+        Idempotent: _ensure_auto_session reuses any existing session.
+
+        Robustness (v8.2): fully isolated — catches BaseException (so a
+        CancelledError or any launch failure can NEVER crash the server) and is
+        capped at 30s so a hung browser launch can't hold the session-creation
+        lock forever (a later real fetch can then take the lock and retry). On
+        any failure the browser simply lazy-launches on the first stealthy fetch.
+        smart_search renders DDG/Bing SERPs in this same browser.
         """
-        try:
+        async def _warm():
             _get_scrapling()  # Lazy-import scrapling (playwright) if not done yet
             await self._ensure_auto_session("stealthy")
+        try:
+            await asyncio.wait_for(_warm(), timeout=30.0)
             logger.debug("Stealthy browser warmed at startup")
-        except Exception as e:
-            logger.debug(f"Startup warm-up failed (will launch on first fetch): {e}")
+        except BaseException as e:
+            logger.debug(f"Startup warm-up failed/skipped (will launch on first fetch): {e!r}")
 
     async def _start_idle_monitor(self) -> None:
         """Background task: close auto browser sessions after AUTO_SESSION_IDLE_TIMEOUT
@@ -1054,13 +1074,14 @@ class MasterFetchServer:
         for sid, entry in entries:
             try:
                 await entry.session.close()
-            except Exception:
+            except BaseException:
                 pass
             entry._alive = False
         # Close the persistent warm search-engine sessions (SERL) too.
         try:
+            from master_fetch.search_engines import close_search_engines
             await close_search_engines()
-        except Exception:
+        except BaseException:
             pass
 
     async def _finalize_result(
@@ -1320,6 +1341,8 @@ class MasterFetchServer:
         if "bytes" not in captured:
             raise RuntimeError(f"Failed to capture screenshot for {url}")
 
+        from mcp.server.fastmcp import Image  # lazy: fastmcp is ~1s to import, only needed for screenshots
+        from mcp.types import TextContent  # lazy: mcp.types is ~1s; only needed for screenshot output
         image = Image(data=captured["bytes"], format=image_type).to_image_content()
         return [image, TextContent(type="text", text=captured["url"])]
 
@@ -2359,6 +2382,7 @@ class MasterFetchServer:
         location/language/region (geo), page (0-10), freshness
         (day|week|month|year). Results cached 5min.
         """
+        from master_fetch.search import SearchResponseModel  # lazy: search.py pulls the metasearch engine chain
         try:
             query = validate_search_query(query)
         except SecurityError as e:
@@ -2563,21 +2587,36 @@ class MasterFetchServer:
                 # runs in the background while the server handles the initialize
                 # handshake. smart_search renders DDG/Bing SERPs in this same browser.
                 warm = asyncio.create_task(self._prewarm_stealthy())
-                warm_search = asyncio.create_task(prewarm_search_engines())
-                warm_reranker = asyncio.create_task(prewarm_reranker())
+                try:
+                    from master_fetch.search_engines import prewarm_search_engines
+                    from master_fetch.reranker import prewarm_reranker
+                except Exception:
+                    prewarm_search_engines = prewarm_reranker = lambda *a, **k: None  # type: ignore[assignment]
+                warm_search = asyncio.create_task(_safe_prewarm(prewarm_search_engines))
+                warm_reranker = asyncio.create_task(_safe_prewarm(prewarm_reranker))
                 try:
                     async with stdio_server() as (read, write):
                         await server.run(read, write, server.create_initialization_options())
                 finally:
-                    warm.cancel()
-                    warm_search.cancel()
-                    warm_reranker.cancel()
+                    # Bulletproof teardown: cancel prewarm tasks + close sessions,
+                    # swallowing EVERYTHING (including 'Event loop is closed' and
+                    # BaseException) so the process always exits cleanly. A noisy
+                    # teardown traceback must never look like a server crash to the
+                    # MCP client (which reports it as 'failed to load').
+                    for _t in (warm, warm_search, warm_reranker):
+                        try:
+                            _t.cancel()
+                        except BaseException:
+                            pass
                     for _t in (warm, warm_search, warm_reranker):
                         try:
                             await _t
-                        except Exception:
+                        except BaseException:
                             pass
-                    await self._shutdown_close_sessions()
+                    try:
+                        await self._shutdown_close_sessions()
+                    except BaseException:
+                        pass
 
             anyio.run(_run)
         else:
@@ -2593,8 +2632,13 @@ class MasterFetchServer:
 
             async def _startup():
                 asyncio.create_task(self._prewarm_stealthy())
-                asyncio.create_task(prewarm_search_engines())
-                asyncio.create_task(prewarm_reranker())
+                try:
+                    from master_fetch.search_engines import prewarm_search_engines
+                    from master_fetch.reranker import prewarm_reranker
+                except Exception:
+                    prewarm_search_engines = prewarm_reranker = lambda *a, **k: None  # type: ignore[assignment]
+                asyncio.create_task(_safe_prewarm(prewarm_search_engines))
+                asyncio.create_task(_safe_prewarm(prewarm_reranker))
 
             app = Starlette(
                 routes=[Route("/sse", endpoint=handle_sse), Route("/messages/", endpoint=sse.handle_post_message)],
