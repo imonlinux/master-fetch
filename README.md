@@ -38,7 +38,6 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 <video src="https://github.com/user-attachments/assets/172212ac-0e50-4030-8d23-878ee1db30ed" controls muted width="860"></video>
 
-Prefer the full-resolution file? [Download the 60s demo (mp4)](https://github.com/dondai1234/master-fetch/releases/download/v9.0.0/Hound.demo.mp4).
 
 ---
 
