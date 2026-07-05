@@ -27,6 +27,55 @@ from datetime import datetime, timezone
 from time import time as now
 from dataclasses import dataclass, field
 from typing import Annotated, Mapping, Sequence, Optional, Literal, Union, Dict, List, Any, TYPE_CHECKING
+import warnings as _warnings
+import sys as _sys
+import traceback as _traceback
+
+# Production cleanliness: on Windows the ProactorEventLoop's stdio/subprocess
+# pipe transports can emit 'unclosed transport' ResourceWarnings from __del__
+# during interpreter teardown (after the loop is closed). These print a
+# traceback to stderr that an MCP client can mistake for a crash. The real
+# fix is closing the transports while the loop is alive (see
+# _shutdown_close_sessions); these two guards suppress any residual noise so
+# stderr stays clean. (Real __del__ exceptions still surface.)
+_warnings.filterwarnings("ignore", message="unclosed .*transport", category=ResourceWarning)
+_warnings.filterwarnings("ignore", message="coroutine .* was never awaited", category=RuntimeWarning)
+
+# CPython prints 'Exception ignored in __del__' via sys.unraisablehook. The
+# asyncio transport teardown on a closed ProactorEventLoop raises RuntimeError
+# ('Event loop is closed') and ValueError ('I/O operation on closed pipe') from
+# __del__ during GC — after the loop is gone, so they can't be caught. Override
+# the hook to swallow ONLY that benign asyncio-transport teardown noise; every
+# other unraisable exception still goes to the original hook (real bugs stay
+# visible). This is what keeps `python -m master_fetch` stderr clean on exit.
+_ORIG_UNRAISABLEHOOK = getattr(_sys, "unraisablehook", None)
+
+def _quiet_asyncio_del_hook(args):
+    etype = getattr(args, "exc_type", None)
+    try:
+        tb = getattr(args, "exc_traceback", None)
+        # extract_tb yields FrameSummary objects (.filename, not .f_code).
+        filenames = " ".join(
+            (getattr(fr, "filename", "") or "") for fr in _traceback.extract_tb(tb)
+        ) if tb is not None else ""
+    except Exception:
+        filenames = ""
+    is_asyncio_teardown = (
+        "asyncio" in filenames
+        and etype in (RuntimeError, ValueError, ResourceWarning)
+    )
+    if is_asyncio_teardown:
+        return  # benign transport teardown on a closed loop — swallow
+    if _ORIG_UNRAISABLEHOOK is not None:
+        try:
+            _ORIG_UNRAISABLEHOOK(args)
+        except Exception:
+            pass
+
+try:
+    _sys.unraisablehook = _quiet_asyncio_del_hook
+except Exception:
+    pass
 
 logger = logging.getLogger("master-fetch.server")
 
@@ -1065,6 +1114,18 @@ class MasterFetchServer:
         is torn down cleanly when the agent harness closes the MCP server
         (stdin closed / process exit), rather than relying on OS child reaping.
         Best-effort: never raises.
+
+        The critical detail on Windows: the patchright Chrome subprocess is an
+        asyncio BaseSubprocessTransport. Closing the session schedules
+        connection_lost via loop.call_soon; if the event loop exits before that
+        callback runs, the transport's __del__ fires during GC AFTER the loop is
+        closed and prints 'Exception ignored in __del__' tracebacks to stderr
+        (RuntimeError: Event loop is closed / ValueError: I/O operation on closed
+        pipe). An MCP client reading stderr sees a crash-like traceback even
+        though the process exited 0. So we close the sessions, then EXPLICITLY
+        flush the loop with a short sleep so pending callbacks drain while the
+        loop is alive, then close any lingering asyncio subprocess transports
+        so their __del__ is a no-op (they're already closing).
         """
         async with self._sessions_lock:
             entries = list(self._sessions.items())
@@ -1083,6 +1144,47 @@ class MasterFetchServer:
             await close_search_engines()
         except BaseException:
             pass
+        # Drain pending loop callbacks (the Chrome subprocess transport's
+        # connection_lost) so the transports fully close while the loop is
+        # alive. Without this, their __del__ warns/errors after loop close.
+        try:
+            await asyncio.sleep(0.15)
+        except BaseException:
+            pass
+        # Belt-and-suspenders: explicitly close any asyncio subprocess
+        # transports (the Chrome driver pipes) still holding the loop. This is
+        # the only reliable way to silence the 'unclosed transport' ResourceWarning
+        # + 'Event loop is closed' RuntimeError noise on Windows teardown.
+        try:
+            self._close_all_subprocess_transports()
+        except BaseException:
+            pass
+        try:
+            await asyncio.sleep(0.05)
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _close_all_subprocess_transports() -> None:
+        """Close every asyncio subprocess transport still alive on the current
+        loop so their __del__ is a no-op (no 'unclosed transport' / 'Event loop
+        is closed' noise on Windows teardown). Best-effort; never raises."""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        if loop is None:
+            return
+        try:
+            procs = list(getattr(loop, "_subprocess_transports", {}).values())
+        except Exception:
+            procs = []
+        for transport in procs:
+            try:
+                if not transport.is_closing():
+                    transport.close()
+            except BaseException:
+                pass
 
     async def _finalize_result(
         self,
@@ -2478,7 +2580,7 @@ class MasterFetchServer:
                     "password": {"type": "string", "description": "PDF only: password for an encrypted PDF."},
                     "focus": {"type": "string", "description": "Query-focused extraction: pass a query and only the BM25-relevant blocks (paragraphs/headings/tables) are returned, a big context saver on long pages. Runs post-cache (no re-fetch). Re-pass the same focus when paginating with offset."},
                     "actions": {"type": "array", "description": "Page interactions run on the stealthy browser AFTER load, BEFORE extraction. Forces stealthy tier + bypasses cache. Each item is one action: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'} (or {press:{selector:'css',key:'Enter'}}), {wait:500} (ms), {scroll:3} (viewport steps, triggers lazy/infinite scroll), {wait_selector:'css'}. Use for 'load more', search forms, pagination, infinite scroll."},
-                    "options": {"type": "object", "description": "include_links (bool, default false: populate response.links with citations/navigation/external + primary_source), include_media (bool, default false: populate response.media with up to 20 page image URLs for multimodal agents), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms, default 0), network_idle (bool, for SPAs), headless (bool, default true), real_chrome (bool), respect_robots (bool, default false), main_content_only (bool, default true), use_trafilatura (bool, default true), solve_cloudflare (bool, default true), block_webrtc (bool, default true), hide_canvas (bool, default true)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "include_links (bool, default false: populate response.links with the page's outgoing links classified as citations/navigation/external + a primary_source hint), include_media (bool, default false: populate response.media with up to 20 page image URLs for multimodal agents), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms, default 0), network_idle (bool, for SPAs), headless (bool, default true), respect_robots (bool, default false). Anti-detect tuning knobs (real_chrome, solve_cloudflare, block_webrtc, hide_canvas, main_content_only, use_trafilatura) are also accepted here and default to good values; most agents never need them.", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},

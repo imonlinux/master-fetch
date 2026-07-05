@@ -29,7 +29,7 @@ Thumbs.db
 *.key
 credentials.json
 
-# Project
+# Project caches (runtime)
 .master_fetch_cache/
 .hound_cache/
 *.log
@@ -40,8 +40,24 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Personal / local-only planning + temp helper scripts (never ship these)
-V7-SEARCH-PLAN.md
+# --- personal / agent scratch (never commit) ---
+# These are local-only planning, status, and AI-agent working files. They are
+# not for the public audience and stay out of the repo.
+STATUS.md
+PROJECT.md
+PLAN.md
+TODO.md
+ROADMAP-personal.md
+research/
+notes/
+scratch/
+.pi/
+.claude/
+.cursor/
+keys.md
+master-fetch-bug-report.md
+
+# Local-only temp helper scripts (one-off fixes, release-note drafts).
 /.fix_*.py
 /.v7*.py
 /.serl*.py
@@ -49,4 +65,4 @@ V7-SEARCH-PLAN.md
 /.drop_*.py
 /.soften_*.py
 /.release_notes*.md
-hound-mcp-bug-report.md
+V7-SEARCH-PLAN.md

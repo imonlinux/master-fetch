@@ -4,7 +4,7 @@
 
 # 🐕 Hound
 
-**Give your AI agent the web. $0. Two commands. ~2.5K tokens.**
+**Give your AI agent the web. $0. Two commands. ~3K tokens.**
 
 Fetch · crawl · bypass bot walls · read PDFs (even scanned) · interact with pages · search the web
 No accounts · no Docker · no API keys · runs on your machine
@@ -40,8 +40,9 @@ Hound is one [MCP](https://modelcontextprotocol.io) server that gives any agent 
 |---|---|
 | 🆓 **$0 forever, MIT** | No keys, no accounts, no per-request billing, no data sent to a third-party scraper. Search is keyless and local too. |
 | 🧠 **Mastered on connect** | A one-time `instructions` block gives the agent the mental model + the #1 workflow + the known limits. Effective on turn one, not turn ten. |
-| 📐 **~2.5K tokens, 6 tools** | Hand-crafted tool defs, no Pydantic schema bloat. More capability than tools shipping 5K+. |
+| 📐 **~3K tokens, 6 tools** | Hand-crafted tool defs, no Pydantic schema bloat. More capability than tools shipping 5K+. |
 | 🎯 **Every response is actionable** | `content_ok`, `next_action`, `summary`, `relevance_score`, `fetch_relevance`. Agents branch on structured fields, not error text. |
+| 🛡️ **Production-safe startup + shutdown** | Cold start < 1s (heavy imports deferred) so the MCP handshake never times out (the old 'failed to load'). On disconnect the process exits 0 with a clean stderr — no asyncio `__del__` tracebacks that a client can mistake for a crash. The reranker prewarm is race-safe. |
 
 > Hound is for the agent itself. You install it once; the agent calls it whenever it needs the web.
 
@@ -69,7 +70,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 |------|-----------|
 | `smart_fetch` | Fetch any URL. HTTP first, auto-escalates to the anti-detect browser if blocked. Bulk, PDFs (with OCR + quality score), `css_selector`, `focus`, `actions`, pagination. |
 | `smart_crawl` | Best-first same-domain crawl. Each page as markdown with `content_ok` + `page_type` (article / list / js_shell). `discover_only`, `crawl_urls`, `focus`, time + token caps. |
-| `smart_search` | Local keyless web search. Runs 9 backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google + opt-in wikipedia, grokipedia) via a vendored metasearch, merges + ranks with neural rerank + cross-backend consensus. `relevance_score` + `fetch_relevance` + `engines_consensus` per result. Neural / find_similar. Quality filter drops low-relevance results instead of padding. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows backends that rate-limited/CAPTCHA'd/timed out. |
+| `smart_search` | Local keyless web search. Runs 10 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia) via a vendored metasearch, merges + ranks with neural rerank + cross-backend consensus. `relevance_score` + `fetch_relevance` + `engines_consensus` per result. Neural / find_similar. Quality filter drops low-relevance results instead of padding. Returns URLs + ranking (the agent fetches the ones it wants). `engine_blocked` shows backends that rate-limited/CAPTCHA'd/timed out. |
 | `screenshot` | Capture a page as an image. For multimodal agents (canvas, image-of-text, visual layout). Session auto-managed. |
 | `cache_clear` | Clear the fetch cache. `all=true` wipes everything. |
 | `version` | Installed version + update status. |
@@ -81,7 +82,7 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 
 **`smart_crawl`** — Best-first walk of same-domain links. Content-adaptive: article/docs → main content; list/index pages → structured link list; JS shells → detected + reported. `discover_only=true` → URL map. `crawl_urls=[...]` → second-phase selective crawl. `focus` prioritizes + filters. Caps: `max_pages` (10), `max_depth` (2), `max_total_chars`, `deadline_ms` (120000). Per-page `content_ok` + `status` (network error = −1) + `fetched_at`. Reuses `smart_fetch` anti-bot + cache.
 
-**`smart_search`** — Runs 9 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google + opt-in wikipedia, grokipedia — INDEPENDENT indexes, not the same feed twice) via a vendored metasearch engine layer, merges, dedups by normalized URL, ranks, and boosts **cross-backend consensus** (a URL returned by several independent indexes is an authority signal). Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural rerank if `[all]`+model present, else consensus + engine-position order), `neural` (same, explicit), `find_similar` (pass `url=`). `engine_blocked` lists backends that rate-limited/CAPTCHA'd/timed out.
+**`smart_search`** — Runs 10 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia — INDEPENDENT indexes, not the same feed twice) via a vendored metasearch engine layer, merges, dedups by normalized URL, ranks, and boosts **cross-backend consensus** (a URL returned by several independent indexes is an authority signal). Returns URLs + ranking, not page content (the agent `smart_fetch`es the ones it wants). Filters: `site`/`exclude_sites`, `location`/`language`/`region`, `page`, `freshness`. Modes: `auto` (neural rerank if `[all]`+model present, else consensus + engine-position order), `neural` (same, explicit), `find_similar` (pass `url=`). `engine_blocked` lists backends that rate-limited/CAPTCHA'd/timed out.
 
 </details>
 
@@ -93,13 +94,13 @@ Then point any MCP client at the `hound` command. No arguments, no keys, no env 
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/hound-scene.png" alt="Hound fetches the web and brings it back to your agent" width="820">
 </div>
 
-No API key, no account, no third-party service. `smart_search` runs **9 keyless backends in parallel** (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google + opt-in wikipedia, grokipedia) via a vendored metasearch engine layer (derived from ddgs, MIT, attributed) — INDEPENDENT indexes, not the same feed twice — merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive). Every result carries `relevance_score` (0–1), `fetch_relevance` (**high** / **med** / **low**), and `engines_consensus` (how many independent indexes returned that URL — a free authority signal). A quality filter drops low-relevance results instead of padding to the max with garbage, so niche queries return fewer good results.
+No API key, no account, no third-party service. `smart_search` runs **10 keyless backends in parallel** (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia) via a vendored metasearch engine layer (derived from ddgs, MIT, attributed) — INDEPENDENT indexes, not the same feed twice — merges, dedups, and ranks on your machine. It returns URLs + ranking, **not page content** — the agent `smart_fetch`es whichever results match what it needs (the ranking is a hint, not a directive). Every result carries `relevance_score` (0–1), `fetch_relevance` (**high** / **med** / **low**), and `engines_consensus` (how many independent indexes returned that URL — a free authority signal). A quality filter drops low-relevance results instead of padding to the max with garbage, so niche queries return fewer good results.
 
 **Two rerank modes:**
 - **`neural`** (the only reranker) — a local ONNX cross-encoder (`ms-marco-MiniLM-L-6-v2`, Apache-2.0) running on the `onnxruntime` Hound already ships for OCR. Exa-style semantic ranking, $0, on your machine. The model downloads once (~80MB, cached, not bundled). Scores are min-max normalized per query so the `relevance_score` field carries meaningful spread (ms-marco sigmoid saturates ~1.0; normalization restores discrimination). BM25 was removed — neural matches its speed and ranks better. Lean installs (no model) fall back to cross-engine consensus + engine-position order.
 - **`find_similar`** — pass `url=`; Hound fetches a page you like, derives a query, and reranks candidates against that source page. Exa's find-similar, local.
 
-`smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 6 results. The 9 backends (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google + opt-in wikipedia, grokipedia) run in parallel; a diversity quorum waits for at least 3 to contribute before returning (~1.5–3s) so a single backend's bias or rate-limit can't dominate, and a backend that CAPTCHAs or rate-limits is simply carried by the others. Search is 100% HTTP — it never touches the browser (the single Patchright browser is smart_fetch's alone).
+`smart_search` returns URLs + ranking only — the agent `smart_fetch`es the results it wants (one extra call beats guessing which URL is worth fetching). Default 6 results. The 10 backends (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia) run in parallel; a diversity quorum waits for at least 3 to contribute before returning (~1.5–3s) so a single backend's bias or rate-limit can't dominate, and a backend that CAPTCHAs or rate-limits is simply carried by the others. Search is 100% HTTP — it never touches the browser (the single Patchright browser is smart_fetch's alone).
 
 ### 🛡️ Search Engine Resilience Layer
 
@@ -112,7 +113,7 @@ Scraping public engines from your IP can be rate-limited or CAPTCHA'd. No keyles
 | 3 | **Circuit breaker + cooldown** | A blocked engine auto-cools (15 → 120s) while the others keep serving. Results keep flowing. |
 | 4 | **202 / 429 / 503 / 403 + Retry-After** | DDG's HTTP 202 soft rate-limit is detected; `Retry-After` honored. |
 | 5 | **Fingerprint rotation** | A pool of real Chrome / Edge / Firefox / Safari TLS profiles, picked per request. |
-| 6 | **Diverse independent pool + cross-engine consensus** | Three independent indexes (DuckDuckGo, Bing, Qwant) run in parallel — no single engine is a bottleneck, and a URL returned by several of them gets a consensus boost (a free authority signal from merging independent indexes, no extra fetches). |
+| 6 | **Diverse independent pool + cross-engine consensus** | 10 backends across 6+ independent index families (Bing-index via DuckDuckGo + Yahoo, Google-index via Google + Startpage, plus Qwant, Brave, Mojeek, Yandex, Wikipedia, Grokipedia) run in parallel — no single engine is a bottleneck, and a URL returned by several independent indexes gets a consensus boost (a free authority signal from merging independent indexes, no extra fetches). |
 | 7 | **`HOUND_SEARCH_PROXY`** | Route all engine requests through your own rotating / residential proxy — the bulletproof path for heavy use. |
 
 `engine_blocked` in the response tells the agent which engines are cooling down (retry shortly). Same gray-area posture as SearXNG / ddgs; no search-engine ToS compliance is claimed.
@@ -126,7 +127,7 @@ Scraping public engines from your IP can be rate-limited or CAPTCHA'd. No keyles
 </div>
 
 - `smart_fetch` checks cache + robots, tries HTTP, escalates to the stealthy Patchright browser on a block / JS-shell / 403 / 503, then extracts + enriches. PDFs branch to pdfplumber (with CID-garbage + scanned auto-OCR via pypdfium2 + rapidocr, `quality_score`, ToC). `smart_crawl` reuses the same pipeline across a same-domain best-first walk.
-- `smart_search` runs 9 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google + opt-in wikipedia, grokipedia) via a vendored metasearch engine layer (derived from ddgs, MIT, attributed in NOTICE.ddgs.txt). A diversity quorum waits for at least 3 backends to contribute before returning (~1.5–3s) so no single backend's bias or rate-limit dominates; a backend that CAPTCHAs or rate-limits is carried by the others. Search is 100% HTTP (never touches the browser). Then it merges + dedups, reranks (neural / find_similar), and applies the cross-backend consensus boost.
+- `smart_search` runs 10 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia) via a vendored metasearch engine layer (derived from ddgs, MIT, attributed in NOTICE.ddgs.txt). A diversity quorum waits for at least 3 backends to contribute before returning (~1.5–3s) so no single backend's bias or rate-limit dominates; a backend that CAPTCHAs or rate-limits is carried by the others. Search is 100% HTTP (never touches the browser). Then it merges + dedups, reranks (neural / find_similar), and applies the cross-backend consensus boost.
 - One stealthy Chrome is pre-warmed at startup and reused, so escalation skips the 3–5s cold start.
 - Content over 40KB is chunked; the response gives `next_offset` so the agent pages through with one more call (served instantly from cache).
 
@@ -182,11 +183,11 @@ Hound is compared only to other **free** ways to give an agent web research. Onl
 | **Query-focused extraction** | yes (`focus`, BM25) | yes (BM25 filter) | no | no | build it |
 | **Web search** | yes (keyless local) | no | yes | no | no |
 | **Search rerank** | neural + find_similar | BM25 | none | none | n/a |
-| **Search anti-bot** | yes (9 keyless backends in parallel via vendored metasearch; primp browser-impersonated TLS + httpx HTTP/2 fingerprint; diversity quorum = 3 backends; a blocked one is carried by the others; 100% HTTP, no browser) | n/a | n/a | n/a | n/a |
+| **Search anti-bot** | yes (10 keyless backends in parallel via vendored metasearch; primp browser-impersonated TLS + httpx HTTP/2 fingerprint; diversity quorum = 3 backends; a blocked one is carried by the others; 100% HTTP, no browser) | n/a | n/a | n/a | n/a |
 | **Agent signals** | yes (`content_ok`/`next_action`/`summary`/`relevance_score`) | no | no | no | no |
 | **Connect-time `instructions`** | yes | no | no | no | no |
 | **MCP server** | yes (official) | community | yes (official) | yes (official) | build it |
-| **Token cost (tools/list)** | ~2.5K (6 tools) | varies | n/a | varies (12 tools) | n/a |
+| **Token cost (tools/list)** | ~2.7K (6 tools) | varies | n/a | varies (12 tools) | n/a |
 
 **Takeaway:** Crawl4AI is the closest free competitor (self-host Python, local, no key, has crawl + BM25), but no web search, no scanned-PDF OCR, no page interaction, no agent-optimized signals, and Apache-2.0 (attribution required) vs Hound's MIT. Jina Reader is the easiest (prefix a URL) and handles PDFs, but no anti-bot, no crawl, no interaction, no local search, routes through Jina's servers, rate-limited. Firecrawl's OSS has no anti-bot by default; the generous features live in the paid cloud. **Hound is the only free tool that combines crawl, built-in Cloudflare bypass, scanned-PDF OCR, page interaction, query-focused extraction, and keyless local search with neural + find-similar rerank — all local, MIT, $0, no accounts, no keys.**
 
@@ -205,7 +206,7 @@ Paid scrapers (Bright Data, ZenRows, Firecrawl paid, Spider.cloud) can beat free
 <img src="https://raw.githubusercontent.com/dondai1234/master-fetch/master/docs/tokens.svg" alt="MCP tool count comparison: Hound 6 tools vs Firecrawl 12, Jina 19, Bright Data 60+" width="760">
 </div>
 
-Most MCP servers cost 3–5K tokens just to exist. Hound's 6 tools cost **~2.5K tokens**, and the connect-time `instructions` are injected once at handshake, not repeated every turn. Your context window is expensive; Hound respects it.
+Most MCP servers cost 3–5K tokens just to exist. Hound's 6 tools cost **~2.7K tokens** at `tools/list` (measured with `cl100k_base`); the connect-time `instructions` (~0.8K, the orientation doc) are injected ONCE at handshake, not repeated every turn. Your context window is expensive; Hound respects it.
 
 ---
 
@@ -224,7 +225,7 @@ pip install hound-mcp               # fetch + crawl + keyless keyword search
 playwright install chromium
 ```
 
-The lean install is fully functional: multi-engine keyless search with keyword BM25, anti-bot, crawl, fetch, caching. `[all]` adds the ONNX neural reranker, PDF extraction, and OCR (scanned PDFs + CID-recovery + image pages) on the same `onnxruntime`.
+The lean install is fully functional: multi-engine keyless search (cross-backend consensus + engine-position ranking), anti-bot, crawl, fetch, caching. `[all]` adds the ONNX neural reranker, PDF extraction, and OCR (scanned PDFs + CID-recovery + image pages) on the same `onnxruntime`.
 
 </details>
 
@@ -290,8 +291,8 @@ No free tool can do everything. Hound is upfront about what it can't:
 | Limit | What happens instead |
 |-------|----------------------|
 | **DataDome / Akamai / Cloudflare Turnstile (interactive)** | Not bypassed. `next_action` tells the agent to switch sources instead of retrying. |
-| **Search rate-limits / CAPTCHAs** | Solved by diversity: 9 keyless backends (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, wikipedia, grokipedia) run in parallel via a vendored metasearch (primp browser-impersonated TLS); a backend that rate-limits/CAPTCHAs is carried by the others, and a diversity quorum waits for 3 to contribute so no single backend dominates. Search is never dead. `engine_blocked` reports backends that rate-limited/CAPTCHA'd/timed out; `HOUND_SEARCH_PROXY` (http/https/socks5) is a power-user rotating-proxy escape hatch for per-IP throttling (the one thing no scraper can escape from one IP). |
-| **Neural / find_similar search** | Need `hound-mcp[all]` (the ONNX reranker runs on the same `onnxruntime` as OCR; model downloads once). Lean installs get keyword BM25. |
+| **Search rate-limits / CAPTCHAs** | Solved by diversity: 10 keyless backends (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant, wikipedia, grokipedia) run in parallel via a vendored metasearch (primp browser-impersonated TLS); a backend that rate-limits/CAPTCHAs is carried by the others, and a diversity quorum waits for 3 to contribute so no single backend dominates. Search is never dead. `engine_blocked` reports backends that rate-limited/CAPTCHA'd/timed out; `HOUND_SEARCH_PROXY` (http/https/socks5) is a power-user rotating-proxy escape hatch for per-IP throttling (the one thing no scraper can escape from one IP). |
+| **Neural / find_similar search** | Need `hound-mcp[all]` (the ONNX reranker runs on the same `onnxruntime` as OCR; model downloads once). Lean installs get cross-backend consensus + engine-position ranking. |
 | **Sites requiring login** | Out of scope (Hound does page interaction, not authenticated sessions). |
 | **Deep shadow-DOM / hard SPAs** | `actions` (scroll, click, `wait_selector`) reach most of it; deep shadow-DOM piercing not yet wired. |
 | **YouTube** | Minimal text. |

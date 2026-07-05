@@ -40,11 +40,11 @@ class MCPClient:
         self.proc = subprocess.Popen(
             ["hound"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**__import__("os").environ, "TINYFISH_API_KEY": ""},
+            env={**__import__("os").environ},
         )
         self._id = 0
         self._send("initialize", {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {"name": "e2e-test", "version": "1.0"},
         })

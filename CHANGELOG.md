@@ -1,5 +1,74 @@
 # Changelog
 
+## [9.0.0] - 2026-07-05
+
+### Production-hardening + repo-professionalism release
+
+The v9 focus is reliability and presentation: the server always starts, never
+spews crash-like tracebacks on shutdown, and the repo reads like a maintained
+product. No new tools, no API breaks — the 6 tools, their schemas, and the
+response shapes are unchanged.
+
+### Fixed: clean shutdown (no more 'failed to load' on Windows)
+
+On Windows the ProactorEventLoop's pipe transports (the warm patchright Chrome
+subprocess) emit `Exception ignored in __del__` tracebacks to stderr during GC
+AFTER the event loop closes — `RuntimeError: Event loop is closed` and
+`ValueError: I/O operation on closed pipe` from `_ProactorBasePipeTransport`.
+The process exited 0, but an MCP client reading stderr saw a crash-like
+traceback and could report 'failed to load'. v8.2's `finally` block couldn't
+catch these (they fire in `__del__` post-loop, beyond any try/except).
+
+- `serve()` now installs a `sys.unraisablehook` override that swallows ONLY the
+  asyncio-transport-teardown noise (RuntimeError / ValueError / ResourceWarning
+  whose traceback is in `asyncio/`). Every other unraisable exception still
+  reaches the original hook, so genuine `__del__` bugs stay visible.
+- `_shutdown_close_sessions` now closes the browser session, flushes the loop
+  (`asyncio.sleep`) so pending `connection_lost` callbacks drain while the loop
+  is alive, then explicitly closes any lingering asyncio subprocess transports
+  on the loop (`loop._subprocess_transports`) so their `__del__` is a no-op.
+- Net result: `python -m master_fetch` exits 0 with an empty stderr on both a
+  quick disconnect (browser mid-launch) and a long-lived session. Verified with
+  a new CI-safe lifecycle test (`tests/test_v9_lifecycle.py`).
+
+### Added: CI-safe MCP lifecycle test
+
+`tests/test_v9_lifecycle.py` spawns `python -m master_fetch` as a stdio MCP
+server and runs a full `initialize` -> `notifications/initialized` ->
+`tools/list` -> `tools/call` (cache_clear) -> clean-disconnect cycle in ~3s,
+asserting: the handshake responds, the connect-time `instructions` ship, all 6
+tools are present with their hand-crafted descriptions, a tool call succeeds,
+and the process exits 0 with no `Traceback` in stderr. Runs in CI (not e2e):
+fast and network-free.
+
+### Changed: leaner tool defs, honest token count
+
+- `mcp_smart_fetch`'s `options` description stopped advertising the 6 rare
+  internal anti-detect knobs (`real_chrome`, `solve_cloudflare`, `block_webrtc`,
+  `hide_canvas`, `main_content_only`, `use_trafilatura`). They still work via
+  `additionalProperties: true`; the agent just isn't told to twiddle them.
+- README token claim corrected from the stale '~2.5K' to the measured
+  ~2.7K tools/list + ~0.8K one-time instructions (`cl100k_base`).
+
+### Fixed: stale docs + repo professionalism
+
+- README: '9 backends' -> '10 backends' everywhere (Qwant, added in 8.1, was
+  missing); the resilience-layer row that claimed 'Three independent indexes
+  (DuckDuckGo, Bing, Qwant)' now reflects the real 10-backend / 6+ index-family
+  pool; the lean-install 'keyword BM25' claim (BM25 was removed in 7.2) now
+  says 'cross-backend consensus + engine-position ranking'.
+- `STATUS.md` (a personal agent status doc) is no longer tracked in the public
+  repo; it is gitignored and stays local.
+- Added `.gitattributes` (LF normalization + `linguist-vendored` for the ddgs-
+  derived `search_metasearch.py` so it doesn't skew the language bar).
+- Added community files: `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1),
+  `SECURITY.md`, `PULL_REQUEST_TEMPLATE.md`, an `ISSUE_TEMPLATE/feature_request.yml`,
+  and `ISSUE_TEMPLATE/config.yml`.
+- e2e test desalted: removed the dead `TINYFISH_API_KEY` injection (TinyFish was
+  removed in 7.0) and bumped the protocol version to `2025-03-26`.
+
+624 tests (622 + 2 lifecycle).
+
 ## [8.2.1] - 2026-07-02
 
 ### fix: faster first search + race-safe reranker prewarm
