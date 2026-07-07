@@ -1,5 +1,22 @@
 # Changelog
 
+## [9.1.2] - 2026-07-07
+
+### Packaging hardening on top of 9.1.1 startup work
+
+9.1.1 shipped the startup/lazy-import reliability work, then fresh-install
+verification caught a packaging hygiene bug: Hound imports `mcp` and `pydantic`
+directly but relied on Scrapling's transitive dependency chain to install them.
+That is wrong for a console entrypoint package.
+
+- Declared `mcp>=1.27.0` as a direct runtime dependency.
+- Declared `pydantic>=2.0` as a direct runtime dependency.
+- Kept all 9.1.1 startup reliability changes: lazy metasearch import, lazy
+  reranker import, off-event-loop optional prewarm imports, removal of broad
+  unawaited-coroutine warning suppression, and `merge` search metadata cleanup.
+
+No new tools, no schema breaks, no response-shape breaks.
+
 ## [9.1.1] - 2026-07-07
 
 ### Startup reliability + lazy search/reranker imports

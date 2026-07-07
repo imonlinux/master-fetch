@@ -41,9 +41,9 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
-## ✨ New in 9.1.1
+## ✨ New in 9.1.2
 
-**Startup reliability + speed release.** Hound keeps the live-search backend and neural reranker off the MCP handshake path until they are actually needed. Cached searches, validation errors, and startup no longer import the metasearch stack, bs4, trafilatura, Scrapling static fetcher, or reranker wrapper. Optional prewarm imports resolve off the event loop, so slow ONNX/Scrapling imports cannot mute the initialize response. No new tools, no API breaks. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v9.1.1)
+**Startup reliability + packaging-hardening release.** Hound keeps the live-search backend and neural reranker off the MCP handshake path until they are actually needed. Cached searches, validation errors, and startup no longer import the metasearch stack, bs4, trafilatura, Scrapling static fetcher, or reranker wrapper. Optional prewarm imports resolve off the event loop, so slow ONNX/Scrapling imports cannot mute the initialize response. This release also declares MCP and Pydantic as direct runtime dependencies, so clean installs do not rely on transitive dependency luck. No new tools, no API breaks. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v9.1.2)
 
 ---
 

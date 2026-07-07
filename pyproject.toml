@@ -1,12 +1,14 @@
 [project]
 name = "hound-mcp"
-version = "9.1.1"
-description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v9.1.1: faster, safer startup with lazy search/reranker imports and no event-loop-blocking optional prewarms."
+version = "9.1.2"
+description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v9.1.2: faster startup with lazy imports plus direct MCP/Pydantic runtime dependency declarations."
 readme = "README.md"
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
 requires-python = ">=3.11"
 dependencies = [
     "scrapling[ai]>=0.4.7",
+    "mcp>=1.27.0",
+    "pydantic>=2.0",
     "trafilatura>=2.0.0",
     "aiosqlite>=0.20.0",
     # metasearch backends (vendored ddgs engine layer, MIT) - keyless search:
