@@ -2,7 +2,7 @@
 
 ## [9.2.0] - 2026-07-08
 
-### Idle browser close frees RAM (closes #1)
+### Idle browser close frees RAM (Issue #1)
 
 Hound keeps a single warm Patchright Chrome for `smart_fetch` and `screenshot`.
 Until now it stayed alive for the whole process, which was the right call for
@@ -12,10 +12,8 @@ and relaunches it on the next fetch.
 
 This is the mechanism that already existed in the codebase (`_start_idle_monitor`,
 race-safe, cross-platform, no new dependencies) but was disabled with
-`AUTO_SESSION_IDLE_TIMEOUT = 0`. v9.2 enables it by default and makes it tunable.
-No new code paths, no new dependencies, no platform-specific signals. The
-browser process actually exits, so the OS reclaims all its RAM, unlike a suspend
-(SIGSTOP / psutil.suspend) which on Windows does not free the working set.
+`AUTO_SESSION_IDLE_TIMEOUT = 0`. v9.2 enables it by default and makes it tunable. The
+browser process actually exits, so the OS reclaims all its RAM.
 
 - `HOUND_BROWSER_IDLE_TIMEOUT` env var (default 300s, i.e. 5 min). Set to `0` to
   keep Chrome alive forever (the old behavior, for when RAM is not a concern).
