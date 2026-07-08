@@ -132,7 +132,7 @@ Same gray-area posture as SearXNG / ddgs; no search-engine ToS compliance is cla
 
 `smart_fetch` tries plain HTTP first (~1s). If the site blocks HTTP or serves a JS shell, it auto-escalates to a **Patchright** anti-detect browser with Cloudflare challenge solving. Two tiers, nothing to configure.
 
-- 🛡️ **Built-in Cloudflare bypass**: a single stealthy Chrome warms at startup and stays alive for the whole session. Pages close after each fetch, idle memory stays near baseline. One browser total.
+- 🛡️ **Built-in Cloudflare bypass**: a single stealthy Chrome warms at startup. It closes after 5 min of idleness to free RAM (`HOUND_BROWSER_IDLE_TIMEOUT`, set `0` to keep it alive forever) and relaunches in ~2s on the next fetch. Pages close after each fetch, idle memory stays near baseline. One browser total.
 - 🎯 **Query-focused extraction**: `smart_fetch(url, focus="...")` returns only the BM25-relevant blocks. Cuts context 80%+ on long pages, no re-fetch (runs post-cache). Re-pass the same `focus` when paginating.
 - 🖱️ **Page interaction**: `actions=[{click:'button.load-more'},{fill:{selector:'#q',text:'x'}},{press:'Enter'},{wait:500},{scroll:3},{wait_selector:'.item'}]` for load-more, search forms, pagination, infinite scroll. Forces stealthy + bypasses cache.
 - 🏷️ **Metadata on every response**: title, description, site name, type, image, canonical URL, language, published time, author (OpenGraph + JSON-LD + canonical).
@@ -231,6 +231,7 @@ The lean install is fully functional: multi-engine keyless search with cross-bac
 |----------|---------|
 | `HOUND_SEARCH_PROXY` | Route all search-engine requests through your own proxy (`http://host:port`, `socks5://...`, or `user:pass@host:port`). For sustained heavy search use with a rotating / residential proxy. Not required for normal single-user use. |
 | `HOUND_SEARCH_MIN_INTERVAL` | Override the per-engine pacing floor (seconds, float). `0` = use the built-in defaults (DDG 1.2s, Bing 1.5s, Wikipedia 0.3s). Power-user tuning. |
+| `HOUND_BROWSER_IDLE_TIMEOUT` | Seconds of browser idleness before the warm Chrome is closed entirely to free RAM (default 300, i.e. 5 min). The next fetch relaunches it in ~2s. Set to `0` to keep Chrome alive forever (old behavior). |
 
 No API keys or accounts are needed for anything: search is keyless and local.
 </details>

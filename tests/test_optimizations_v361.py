@@ -193,15 +193,33 @@ class TestForceFetchHttpTimeout:
 # ─── Idle monitor no-op in keep-alive-forever mode ─────────────────────────
 
 class TestIdleMonitorNoOpWhenDisabled:
-    def test_ensure_idle_monitor_does_not_start_task(self):
-        assert AUTO_SESSION_IDLE_TIMEOUT == 0, (
-            "These tests assume the default keep-alive-forever mode."
-        )
+    def test_ensure_idle_monitor_does_not_start_task(self, monkeypatch):
+        # v9.2: the default is now 300s (idle close ON). These tests pin the
+        # opt-out behavior: when the timeout is explicitly 0, the monitor task
+        # is never started (keep-alive-forever mode, the old default).
+        monkeypatch.setattr("master_fetch.server.AUTO_SESSION_IDLE_TIMEOUT", 0)
         srv = MasterFetchServer()
         srv._ensure_idle_monitor()
         assert srv._idle_monitor_task is None, (
             "No monitor task should be created when AUTO_SESSION_IDLE_TIMEOUT == 0"
         )
+
+    @pytest.mark.asyncio
+    async def test_ensure_idle_monitor_starts_task_when_enabled(self, monkeypatch):
+        # v9.2: with a non-zero timeout the monitor task IS started.
+        monkeypatch.setattr("master_fetch.server.AUTO_SESSION_IDLE_TIMEOUT", 300)
+        srv = MasterFetchServer()
+        srv._ensure_idle_monitor()
+        assert srv._idle_monitor_task is not None, (
+            "Monitor task should be created when AUTO_SESSION_IDLE_TIMEOUT > 0"
+        )
+        # cleanup: cancel so it doesn't leak out of the test
+        if not srv._idle_monitor_task.done():
+            srv._idle_monitor_task.cancel()
+            try:
+                await srv._idle_monitor_task
+            except BaseException:
+                pass
 
 
 # ─── Dead-code removal: methods/module no longer exist ─────────────────────

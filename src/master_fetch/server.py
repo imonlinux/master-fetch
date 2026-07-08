@@ -152,7 +152,24 @@ MAX_CONTENT_CHARS = 40000
 MIN_CHUNK_CHARS = 500  # if remaining < this, merge into current chunk (avoids wasteful round-trips)
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024  # 50MB hard cap for response bodies
 MAX_BULK_URLS = 100  # hard cap to prevent DoS via unbounded parallel requests
-AUTO_SESSION_IDLE_TIMEOUT = 0  # 0 = keep browser alive forever. Pre-warmed at server startup (eager), shared by smart_fetch + screenshot.
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var, falling back to default on missing/invalid."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
+
+# Idle browser close: after this many seconds with no smart_fetch/screenshot in
+# flight, the warm Patchright Chrome is closed entirely (process exits, OS reclaims
+# all its RAM). The next fetch relaunches it (~2s cold start). Tuned via the
+# HOUND_BROWSER_IDLE_TIMEOUT env var. Default 300s (5 min) so an agent actively
+# working (30-90s think-pauses between fetches) keeps Chrome warm, while a hound
+# left running in the background actually frees its RAM. Set to 0 to keep the
+# browser alive forever (the old behavior, useful when RAM is not a concern).
+AUTO_SESSION_IDLE_TIMEOUT = _env_int("HOUND_BROWSER_IDLE_TIMEOUT", 300)
 IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 
 # MCP initialize `instructions` — injected into the agent's context ONCE on
@@ -1038,9 +1055,10 @@ class MasterFetchServer:
         """Warm the single stealthy browser at startup (background, best-effort).
 
         Scheduled when the MCP server starts so the browser is warm by the time
-        the agent first needs a stealthy fetch or screenshot — skipping the
-        ~3-5s cold start. Stays alive for the whole process (idle timeout 0).
-        Idempotent: _ensure_auto_session reuses any existing session.
+        the agent first needs a stealthy fetch or screenshot, skipping the
+        ~3-5s cold start. Closes after HOUND_BROWSER_IDLE_TIMEOUT of inactivity,
+        then relaunches on the next fetch. Idempotent: _ensure_auto_session
+        reuses any existing session.
 
         Robustness (v8.2): fully isolated — catches BaseException (so a
         CancelledError or any launch failure can NEVER crash the server) and is
@@ -2711,10 +2729,11 @@ class MasterFetchServer:
 
             async def _run():
                 # Warm the single stealthy browser at startup so it's ready before
-                # the agent's first stealthy fetch/screenshot. It stays alive for
-                # the whole process (AUTO_SESSION_IDLE_TIMEOUT=0). Best-effort,
-                # runs in the background while the server handles the initialize
-                # handshake.
+                # the agent's first stealthy fetch/screenshot. It stays alive until
+                # the idle monitor closes it after HOUND_BROWSER_IDLE_TIMEOUT of
+                # inactivity (default 300s), then relaunches on the next fetch.
+                # Best-effort, runs in the background while the server handles the
+                # initialize handshake.
                 warm = asyncio.create_task(self._prewarm_stealthy())
                 warm_reranker = asyncio.create_task(
                     _safe_imported_prewarm("master_fetch.reranker", "prewarm_reranker")

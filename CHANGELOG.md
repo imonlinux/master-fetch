@@ -1,5 +1,56 @@
 # Changelog
 
+## [9.2.0] - 2026-07-08
+
+### Idle browser close frees RAM (closes #1)
+
+Hound keeps a single warm Patchright Chrome for `smart_fetch` and `screenshot`.
+Until now it stayed alive for the whole process, which was the right call for
+fetch latency but meant a hound left running in the background held Chrome's
+RAM forever. v9.2 closes the warm browser entirely after a period of idleness
+and relaunches it on the next fetch.
+
+This is the mechanism that already existed in the codebase (`_start_idle_monitor`,
+race-safe, cross-platform, no new dependencies) but was disabled with
+`AUTO_SESSION_IDLE_TIMEOUT = 0`. v9.2 enables it by default and makes it tunable.
+No new code paths, no new dependencies, no platform-specific signals. The
+browser process actually exits, so the OS reclaims all its RAM, unlike a suspend
+(SIGSTOP / psutil.suspend) which on Windows does not free the working set.
+
+- `HOUND_BROWSER_IDLE_TIMEOUT` env var (default 300s, i.e. 5 min). Set to `0` to
+  keep Chrome alive forever (the old behavior, for when RAM is not a concern).
+- 300s was chosen so an agent actively working (30-90s think-pauses between
+  fetches) keeps Chrome warm, while a background-idle hound actually frees its
+  RAM. A fetch that pays the ~2s cold relaunch only happens after 5 min of true
+  idleness.
+- The idle monitor checks every 60s and only closes a session whose
+  `_auto_*_last_used` is older than the threshold, under `_sessions_lock`.
+- The next fetch's `_ensure_auto_session` cold-launches a fresh session, the
+  same path used for the startup prewarm.
+
+### Tests
+
+- `tests/test_v92_idle.py` (6 tests): idle monitor reaps the warm session after
+  the timeout, is a no-op at `0`, the next fetch relaunches a fresh session, a
+  freshly-used session is not reaped, and the env default is 300 (not 0).
+- `tests/test_optimizations_v361.py`: the old "monitor never starts" test pinned
+  the disabled default; rewritten to pin the opt-out (`0`) and assert the monitor
+  starts when enabled.
+- `scripts/live_idle_check.py`: a real-browser live check (not a pytest test).
+  Launches Chrome via a real fetch, counts Chrome procs, waits for the idle
+  reap, asserts the count drops to 0, fetches again, asserts Chrome relaunches.
+  Verified: 7 procs after first fetch, 0 after idle, 8 after relaunch,
+  `content_ok=True` both fetches.
+- 635 tests pass, no regressions.
+
+### Compatibility
+
+The default behavior changes: a hound left idle for more than 5 min now closes
+Chrome and pays a ~2s relaunch on the next fetch. Set `HOUND_BROWSER_IDLE_TIMEOUT=0`
+to restore the keep-alive-forever behavior. The 6 tools, their schemas, and
+response shapes are unchanged.
+
+
 ## [9.1.2] - 2026-07-07
 
 ### Packaging hardening on top of 9.1.1 startup work
