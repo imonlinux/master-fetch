@@ -1,7 +1,7 @@
 [project]
 name = "hound-mcp"
-version = "9.2.0"
-description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v9.2.0: idle browser closes after 5 min to free RAM, relaunches on next fetch."
+version = "10.0.0"
+description = "Web research for AI agents. Fetch any page with anti-bot bypass plus web search. $0 forever. v10.0.0: automatic Internet Archive recovery when a live site hard-blocks, plus a research-grade response envelope (page_type, freshness, source authority, smart next_action)."
 readme = "README.md"
 authors = [{name = "Bishesh Bhandari", email = "bishesh@master-fetch.dev"}]
 requires-python = ">=3.11"
@@ -63,6 +63,11 @@ packages = ["src/master_fetch"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Always import master_fetch from src/, never from a built wheel installed in
+# .venv. The dev venv ships a BUILT wheel (not editable); without this, pytest
+# silently runs the stale installed copy and src/ edits go untested. This has
+# bitten the project 4+ times. pythonpath (pytest 7+) wins over install.
+pythonpath = ["src"]
 addopts = ["-m", "not e2e"]
 markers = [
     "e2e: end-to-end tests that spawn a real hound.exe subprocess. Skip by default in CI; run manually with `pytest -m e2e`.",

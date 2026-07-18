@@ -41,9 +41,13 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
-## ✨ New in 9.1.2
+## ✨ New in 10.0.0
 
-**Startup reliability + packaging-hardening release.** Hound keeps the live-search backend and neural reranker off the MCP handshake path until they are actually needed. Cached searches, validation errors, and startup no longer import the metasearch stack, bs4, trafilatura, Scrapling static fetcher, or reranker wrapper. Optional prewarm imports resolve off the event loop, so slow ONNX/Scrapling imports cannot mute the initialize response. This release also declares MCP and Pydantic as direct runtime dependencies, so clean installs do not rely on transitive dependency luck. No new tools, no API breaks. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v9.1.2)
+**The web research tool that never gives up — and tells your agent what to do next.**
+
+- 🗄️ **Automatic Internet Archive recovery.** When a live site hard-blocks your agent (404 / 451 / 500 / bot wall / auth wall), Hound silently pulls the page from the Wayback Machine's closest snapshot and returns it — dated and honestly marked (`source=archive.org`, `archived_at`). Fetched via the Wayback `id_` marker so the content is clean (no toolbar, original links). The only **free, keyless, zero-setup** fetch tool that does this. Opt out with `archive_fallback=false`.
+- 🧠 **Research-grade response envelope.** Every `smart_fetch` now carries `page_type` (article / docs / list / forum / auth_wall / paywall / …), `content_age_days` + `is_stale` (from the page's own dates), and `source_type` + `is_official` (gov / edu / github / docs / …). And `next_action` got a brain: a list page points to its top links, a stale article suggests a dated search, an auth wall suggests the archive. ~26µs per response.
+- 🔧 **Professional internals.** Truncation can no longer silently drop fields; cache hits now return the full response (metadata / links / quality / envelope); the dev test trap that ran stale code is gone. 687 tests. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v10.0.0)
 
 ---
 
@@ -54,7 +58,8 @@ Hound is one [MCP](https://modelcontextprotocol.io) server that gives any agent 
 - 🆓 **$0 forever, MIT**: no keys, no accounts, no per-request billing, no data routed to a third-party scraper. Search is keyless and local.
 - 🧠 **Mastered on connect**: a one-time `instructions` block hands the agent the mental model, the #1 workflow, and the known limits. Effective on turn one.
 - 📐 **~2.7K tokens, 6 tools**: hand-crafted tool defs, no Pydantic schema bloat. More capability than tools shipping 5K+.
-- 🎯 **Every response is actionable**: `content_ok`, `next_action`, `summary`, `relevance_score`, `fetch_relevance`. Agents branch on structured fields, not error text.
+- 🎯 **Every response is actionable**: `content_ok`, `next_action`, `summary`, `page_type`, `content_age_days`/`is_stale`, `source_type`/`is_official`, `relevance_score`, `fetch_relevance`. Agents branch on structured fields, not error text. And when the live site blocks, `source=archive.org` tells them the content came from the Internet Archive.
+- 🗄️ **Never gives up.** A live hard-block (404, bot wall, paywall) is no longer a dead end — Hound auto-recovers the page from the Internet Archive, honestly marked with the snapshot date.
 - 🛡️ **Production-safe startup + shutdown**: cold start under 1s so the MCP handshake never times out; exits 0 with clean stderr, no crash-like teardown noise.
 
 > Hound is for the agent itself. You install it once; the agent calls it whenever it needs the web.

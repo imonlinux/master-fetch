@@ -66,4 +66,5 @@ master-fetch-bug-report.md
 /.soften_*.py
 /.release_notes*.md
 V7-SEARCH-PLAN.md
+V10_PLAN.md
 docs/hound-demo.mp4

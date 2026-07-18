@@ -25,9 +25,14 @@ _db_initialized: dict[Path, bool] = {}
 _db_init_lock = asyncio.Lock()
 
 
-def _cache_key(url: str, extraction_type: str, css_selector: str | None = None, pages: str | None = None) -> str:
-    """Deterministic cache key from fetch params."""
-    raw = f"{url}|{extraction_type}|{css_selector or ''}|{pages or ''}"
+def _cache_key(url: str, extraction_type: str, css_selector: str | None = None,
+               pages: str | None = None, source: str = "live") -> str:
+    """Deterministic cache key from fetch params.
+
+    ``source`` separates live vs archive.org entries so a page that gets unblocked
+    within TTL isn't served a stale archive snapshot (and vice versa).
+    """
+    raw = f"{url}|{extraction_type}|{css_selector or ''}|{pages or ''}|{source or 'live'}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -76,6 +81,9 @@ async def _ensure_db(cache_dir: Path | None = None) -> Path:
             for ddl in (
                 "ALTER TABLE cache ADD COLUMN content_type TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE cache ADD COLUMN total_size_bytes INTEGER NOT NULL DEFAULT 0",
+                # v10: envelope round-trips metadata/links/quality_score/toc/page_type/
+                # source/archived_at so cache hits restore them (previously lost on hit).
+                "ALTER TABLE cache ADD COLUMN envelope TEXT NOT NULL DEFAULT '{}'",
             ):
                 try:
                     await db.execute(ddl)
@@ -96,13 +104,14 @@ async def get_cached(
     ttl: int = DEFAULT_TTL,
     cache_dir: Path | None = None,
     pages: str | None = None,
+    source: str = "live",
 ) -> dict | None:
     """Return cached response if fresh, else None.
 
     Uses the *lesser* of the stored TTL and the caller-requested TTL.
     This prevents serving stale cache when caller wants a fresher window.
     """
-    key = _cache_key(url, extraction_type, css_selector, pages)
+    key = _cache_key(url, extraction_type, css_selector, pages, source)
     db_path = await _ensure_db(cache_dir)
 
     async with aiosqlite.connect(db_path) as db:
@@ -115,12 +124,14 @@ async def get_cached(
         row = await cursor.fetchone()
         if row is None:
             return None
+        env = row["envelope"] if "envelope" in row.keys() else "{}"
         return {
             "status": row["status"],
             "content": json.loads(row["content"]),
             "url": row["url"],
             "content_type": row["content_type"],
             "total_size_bytes": row["total_size_bytes"],
+            "envelope": json.loads(env) if env else {},
         }
 
 
@@ -135,23 +146,29 @@ async def set_cached(
     content_type: str = "",
     total_size_bytes: int = 0,
     pages: str | None = None,
+    source: str = "live",
+    envelope: dict | None = None,
 ) -> None:
     """Store a response in cache.
 
     v3.5.3+: content_type and total_size_bytes round-trip through cache so
     agents preserve MIME info on hits instead of always seeing empty/0.
+    v10: ``envelope`` round-trips metadata/links/quality_score/toc/page_type/
+    source/archived_at so cache hits restore the full research-grade response
+    (previously these fields were silently dropped on cache hits).
     """
-    key = _cache_key(url, extraction_type, css_selector, pages)
+    key = _cache_key(url, extraction_type, css_selector, pages, source)
     db_path = await _ensure_db(cache_dir)
+    env_json = json.dumps(envelope) if envelope else "{}"
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """INSERT OR REPLACE INTO cache
                (key, url, extraction_type, content, status, fetched_at, ttl,
-                content_type, total_size_bytes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                content_type, total_size_bytes, envelope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (key, url, extraction_type, json.dumps(content), status,
-             time.time(), ttl, content_type, total_size_bytes),
+             time.time(), ttl, content_type, total_size_bytes, env_json),
         )
         # Bound the cache: if over MAX_CACHE_ENTRIES, evict the oldest rows by
         # fetched_at down to 90% of the cap. Cheaper than per-insert single

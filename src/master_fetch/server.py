@@ -132,6 +132,9 @@ if TYPE_CHECKING:
 from master_fetch.cache import get_cached, set_cached, clear_cache, clear_all_cache, DEFAULT_TTL
 from master_fetch.robots import is_allowed, clear_robots_cache
 from master_fetch.reddit import is_reddit_url, rewrite_to_old_reddit, parse_old_reddit_listing
+from master_fetch.envelope import (
+    classify_source, compute_freshness, detect_page_type, page_type_from_error,
+)
 from master_fetch.security import (
     validate_url,
     validate_css_selector,
@@ -172,6 +175,12 @@ def _env_int(name: str, default: int) -> int:
 AUTO_SESSION_IDLE_TIMEOUT = _env_int("HOUND_BROWSER_IDLE_TIMEOUT", 300)
 IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 
+# v10 archive fallback: when a live fetch hard-fails (404/451/500/network/
+# bot-block/auth), recover the page from the Internet Archive's closest snapshot.
+# Default ON (the headline resilience feature). Set HOUND_ARCHIVE_FALLBACK=0 to
+# disable globally. Per-call opt-out via the smart_fetch `archive_fallback` option.
+_ARCHIVE_ENABLED = os.environ.get("HOUND_ARCHIVE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off", "")
+
 # MCP initialize `instructions` — injected into the agent's context ONCE on
 # connect by clients that support it. This is the connect-time mastery doc:
 # the #1 workflow, the gotchas, and when to use each tool. Kept tight (~300
@@ -179,7 +188,7 @@ IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 HOUND_INSTRUCTIONS = (
     "Hound = web access for this agent. 4 tools (+ cache_clear, version) cover 95% of web work.\n"
     "\n"
-    "• smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy Patchright browser). Returns extracted text + metadata + honest signals (content_ok, next_action, summary).\n"
+    "• smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy Patchright browser). Returns extracted text + metadata + honest signals (content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official). If the live site hard-blocks (404/bot-wall/auth), auto-recovers from the Internet Archive (source=archive.org + archived_at); archive_fallback=false to opt out.\n"
     "  - Narrow to one section: css_selector (e.g. 'article', '.main').\n"
     "  - Long page: is_truncated + next_offset -> call again with offset=next_offset. Or focus='query' to get only the BM25-relevant blocks (post-cache, no re-fetch; re-pass when paginating).\n"
     "  - Behind a click/form/load-more/infinite-scroll: actions=[{click:'button.load-more'},{scroll:3},{fill:{selector:'#q',text:'x'}},{press:'Enter'}] (forces stealthy; runs after load, before extraction; bypasses cache).\n"
@@ -224,6 +233,24 @@ class ResponseModel(BaseModel):
     links: Dict[str, Any] = Field(default_factory=dict, description="Outgoing links classified by context (only populated when include_links=true): {citations:[{url,text}], navigation:[{url,text}], external:[{url,text}], primary_source:url}. citations = links inside the main-content area (the page's referenced sources - the highest-value links to follow); navigation = site chrome; external = off-domain links; primary_source = best-effort hint at the actual primary source (canonical/JSON-LD or a citation on arxiv/doi/github/etc). Use to follow a page's source chain in one step.")
     quality_score: float = Field(default=0.0, description="PDF extraction quality 0.0-1.0 (readable-char ratio; 1.0 = clean, low = garbled/CID corruption). 0.0 for non-PDF. Trust PDF content more the closer this is to 1.0.")
     table_of_contents: list = Field(default_factory=list, description="PDF section-map: outline/bookmarks as [{level, title, page, end_page}] when the PDF has a ToC; for PDFs without bookmarks, a heading-based map is built from font-size detection. page+end_page give a range per section so you can pass pages='X-Y' to grab one section. Empty for non-PDF or PDFs with no detectable headings.")
+    # ─── v10 research-grade envelope (additive; all default-valued) ───
+    # page_type: structural class of the page, computed from raw HTML. Drives
+    # next_action (list pages point to their links, auth walls suggest archive).
+    page_type: str = Field(default="unknown", description="Structural class: article|docs|list|forum|qa|pdf|js_shell|auth_wall|paywall|redirect|image|json|unknown. Drives next_action. 'list' = a page whose main content is links to other pages (fetch those or smart_crawl). 'auth_wall'/'paywall' = content behind login/payment.")
+    # source_type + is_official: domain-based authority signal so the agent can
+    # weigh trust without a separate lookup. Conservative: is_official is True
+    # only on a strong signal (vendor's own docs domain, gov, edu, github).
+    source_type: str = Field(default="unknown", description="Domain authority class: vendor-docs|official-docs|news|blog|forum|qa|gov|edu|github|docs-site|ecommerce|unknown. Helps weigh source trust.")
+    is_official: bool = Field(default=False, description="True only on a strong signal that this is the canonical/official source for its subject (vendor docs, gov, edu, github, the org's own domain). Conservative default False.")
+    # Freshness: content_age_days from the page's own published/modified date
+    # (OpenGraph/JSON-LD/PDF). -1 = no date recoverable. is_stale = age > 365d.
+    content_age_days: int = Field(default=-1, description="Age in days from the page's published/modified date (OpenGraph/JSON-LD/PDF creation_date). -1 = no date recoverable. Pair with is_stale to judge currency.")
+    is_stale: bool = Field(default=False, description="True when content_age_days > 365 (info may be outdated). For news/current-state questions, seek a newer source.")
+    # source + archived_at: set ONLY when this content came from the Internet
+    # Archive (auto-fallback after a live hard-block). 'live' (default) = the
+    # real page. Honest marking so the agent knows it may be a dated snapshot.
+    source: str = Field(default="live", description="'live' (default) = fetched from the real URL. 'archive.org' = the live site hard-blocked and this content was recovered from the Internet Archive's closest snapshot (see archived_at for the snapshot date).")
+    archived_at: str = Field(default="", description="ISO date of the archive.org snapshot when source='archive.org'. Empty when source='live'. The content reflects the page as it was on this date.")
 
 
 class BulkResponseModel(BaseModel):
@@ -406,6 +433,33 @@ def _is_cacheable(result: ResponseModel) -> bool:
     return bool(result.content) and any(c.strip() for c in result.content)
 
 
+def _is_archive_worthy(result: ResponseModel) -> bool:
+    """True when a live fetch hard-failed in a way the Internet Archive can rescue.
+
+    Conservative: never on success, soft errors, or cases archive can't fix
+    (bad request, encrypted PDF). The caller also guards `result.source !=
+    'archive'` to prevent re-entry when finalizing an archive result.
+    """
+    if result.source != "live":  # only live results are archive-worthy; never recurse on a recovered source
+        return False
+    err = (result.error or "").lower()
+    if result.status == 404:      # page gone/deleted — archive goldmine
+        return True
+    if result.status == 451:      # legal block
+        return True
+    if result.status == 0:        # network/DNS/timeout — archive may have it
+        return True
+    if result.status >= 500:      # server error
+        return True
+    if result.status in (403, 503) and "bot_challenge" in err:
+        return True
+    if err.startswith("all_tiers_failed"):
+        return True
+    if err.startswith("auth_required"):
+        return True
+    return False
+
+
 def _format_size(n: int) -> str:
     """Human-readable byte size for the summary line."""
     if not n:
@@ -481,16 +535,101 @@ def _agent_hints(result: ResponseModel) -> tuple[str, str, bool]:
         next_action = "all fetchers failed; site may use unbypassable protection (DataDome/Akamai/Turnstile) - switch sources"
     elif result.status == 0 or result.status >= 400:
         next_action = "fetch failed - see error field"
+
+    # v10 envelope-driven next actions: fire ONLY when the fetch succeeded with
+    # real content and no error-driven next_action already fired. Turn the
+    # envelope (source/page_type/freshness) into a concrete next step so the
+    # agent doesn't have to re-derive it. Precedence: archive-source > page
+    # structure (list/auth/paywall/redirect) > freshness.
+    if not next_action and content_ok:
+        if result.source == "archive.org":
+            next_action = (
+                f"archive.org snapshot from {result.archived_at or 'unknown date'}; "
+                "the live site is blocking automated fetches — retry later or "
+                "use a different source for current data"
+            )
+        elif result.page_type == "list":
+            cits = (result.links or {}).get("citations") or []
+            top = [c.get("url", "") for c in cits[:3] if isinstance(c, dict) and c.get("url")]
+            if top:
+                next_action = (
+                    "this is a list page; the content you want is likely behind its "
+                    f"links. Top targets: {', '.join(top)}. Or call smart_crawl on this URL."
+                )
+            else:
+                next_action = (
+                    "this is a list page (links to other pages); call smart_crawl on "
+                    "this URL, or fetch the linked pages directly"
+                )
+        elif result.page_type == "auth_wall":
+            next_action = (
+                "content behind login/authentication; the Internet Archive may have a "
+                "snapshot, or switch sources"
+            )
+        elif result.page_type == "paywall":
+            next_action = "paywalled content; try the Internet Archive or a different source"
+        elif result.page_type == "redirect":
+            canon = (result.metadata or {}).get("canonical") or ""
+            next_action = (
+                f"page redirected; the real URL is {canon}" if canon
+                else "page redirected; check the final URL field"
+            )
+        elif result.is_stale and result.page_type in ("article", "docs", "unknown"):
+            next_action = (
+                f"content is {result.content_age_days} days old (may be outdated); for "
+                "current info, smart_search a recent query (e.g. add the current year)"
+            )
     return summary, next_action, content_ok
 
 
+def _apply_envelope(result: ResponseModel) -> None:
+    """Compute the v10 research-grade envelope fields on a result in place.
+
+    page_type: definitive error/content_type signals override the structural
+    value set in _translate_response (js_shell/auth_wall/redirect from error;
+    pdf/json/image from content_type). source_type/is_official from the URL
+    (cheap heuristic). content_age_days/is_stale from metadata dates + fetched_at.
+    Recomputed on every return (incl. cache hits) since it is near-free and the
+    inputs (url, metadata, fetched_at) are always present.
+    """
+    # page_type override: definitive signals win over the structural guess.
+    err_type = page_type_from_error(result.error)
+    if err_type:
+        result.page_type = err_type
+    else:
+        ct = (result.content_type or "").lower()
+        if ct.startswith("application/pdf"):
+            result.page_type = "pdf"
+        elif ct.startswith("application/json") or ct.startswith("text/json"):
+            result.page_type = "json"
+        elif ct.startswith("image/"):
+            result.page_type = "image"
+        # else: keep the structural page_type from _translate_response
+        # (forum/qa/list/docs/article/paywall/redirect/unknown).
+    # Source authority: cheap URL heuristic, recomputed always (not cached).
+    st, off = classify_source(result.url)
+    result.source_type = st
+    result.is_official = off
+    # Freshness: from metadata dates vs this response's fetched_at. Recomputed
+    # always (metadata may be cache-restored; age is relative to now).
+    age, stale = compute_freshness(result.metadata, result.fetched_at)
+    result.content_age_days = age
+    result.is_stale = stale
+
+
 def _with_agent_hints(result: ResponseModel) -> ResponseModel:
-    """Stamp agent-facing summary/content_ok/next_action/fetched_at on a result."""
+    """Stamp the v10 envelope + agent-facing hints on a result.
+
+    This is the universal final wrapper (called by _apply_chunking on every
+    return: live fetches, cache hits, robots blocks, archive fallback), so the
+    envelope appears on every response an agent ever sees.
+    """
+    result.fetched_at = datetime.now(timezone.utc).isoformat()
+    _apply_envelope(result)
     summary, next_action, content_ok = _agent_hints(result)
     result.summary = summary
     result.content_ok = content_ok
     result.next_action = next_action
-    result.fetched_at = datetime.now(timezone.utc).isoformat()
     return result
 
 
@@ -520,22 +659,16 @@ def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, o
     total_len = len(full_text)
 
     if offset >= total_len:
-        return _with_agent_hints(ResponseModel(
-            status=result.status, content=["[No more content.]"],
-            url=result.url, cached=result.cached, fetcher_used=result.fetcher_used,
-            extracted_type=result.extracted_type, session_id=result.session_id,
-            duration_ms=result.duration_ms, error=result.error,
-            content_type=result.content_type, total_size_bytes=result.total_size_bytes,
-            total_extracted_chars=total_len,
-            escalation_path=result.escalation_path, retry_count=result.retry_count,
-            metadata=result.metadata,
-            media=result.media,
-            links=result.links,
-            quality_score=result.quality_score,
-            table_of_contents=result.table_of_contents,
-            content_ok=result.content_ok,
-            next_offset=0,
-        ))
+        # model_copy(update=...) preserves EVERY field by construction
+        # (metadata/links/page_type/source_type/quality_score/toc/...). The
+        # old hand-written constructor dropped any field not listed, so every
+        # new envelope field silently vanished on the no-more-content branch.
+        return _with_agent_hints(result.model_copy(update={
+            "content": ["[No more content.]"],
+            "total_extracted_chars": total_len,
+            "is_truncated": False,
+            "next_offset": 0,
+        }))
 
     chunk = full_text[offset:offset + max_chars]
     chunk_len = len(chunk)
@@ -557,22 +690,15 @@ def _apply_chunking(result: ResponseModel, max_chars: int = MAX_CONTENT_CHARS, o
         # Remaining is small — include it all, no truncation flag
         chunk = full_text[offset:]
 
-    return _with_agent_hints(ResponseModel(
-        status=result.status, content=[chunk], url=result.url,
-        cached=result.cached, fetcher_used=result.fetcher_used,
-        extracted_type=result.extracted_type, session_id=result.session_id,
-        duration_ms=result.duration_ms, error=result.error,
-        content_type=result.content_type, total_size_bytes=result.total_size_bytes,
-        total_extracted_chars=total_len,
-        is_truncated=truncated, next_offset=next_off,
-        escalation_path=result.escalation_path, retry_count=result.retry_count,
-        metadata=result.metadata,
-        media=result.media,
-        links=result.links,
-        quality_score=result.quality_score,
-        table_of_contents=result.table_of_contents,
-        content_ok=result.content_ok,
-    ))
+    # model_copy(update=...) preserves every field by construction — no more
+    # hand-maintained field list that silently dropped envelope fields on
+    # truncation. Add a field to ResponseModel and it survives chunking free.
+    return _with_agent_hints(result.model_copy(update={
+        "content": [chunk],
+        "total_extracted_chars": total_len,
+        "is_truncated": truncated,
+        "next_offset": next_off,
+    }))
 
 
 # ─── Response translation helpers ──────────────────────────────────
@@ -589,6 +715,9 @@ _FOCUS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_focus",
 # Opt-in: populate ResponseModel.media with the page's image URLs (multimodal).
 _INCLUDE_MEDIA: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_media", default=False)
 _INCLUDE_LINKS: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_links", default=False)
+# v10 archive fallback opt-out (per-call). Default True. Set False to get the
+# raw live failure instead of an archive.org snapshot when the live site blocks.
+_ARCHIVE_FALLBACK: contextvars.ContextVar[bool] = contextvars.ContextVar("_archive_fallback", default=True)
 
 
 def _extract_pdf_response(body: bytes, raw_ct: str, total_size: int, url: str,
@@ -833,9 +962,11 @@ def _translate_response(
     page_metadata: Dict[str, Any] = {}
     page_media: List[str] = []
     page_links: Dict[str, Any] = {}
+    page_html: str = ""  # raw HTML for page_type detection (v10 envelope)
     if raw_body and isinstance(raw_body, (bytes, bytearray)):
         try:
             _html = raw_body.decode(getattr(page, 'encoding', None) or 'utf-8', errors='replace')
+            page_html = _html
             from master_fetch.metadata import extract_metadata, extract_image_urls
             page_metadata = extract_metadata(_html, page_url)
             if _INCLUDE_MEDIA.get():
@@ -852,11 +983,19 @@ def _translate_response(
         except Exception as e:
             logger.debug("metadata/media extraction failed for %s: %s", page_url, e)
 
+    # v10 page_type: structural class from raw HTML (forum/qa/list/docs/article/
+    # paywall/redirect). pdf/json/image/js_shell/auth_wall are filled later in
+    # _with_agent_hints from content_type/error (definitive signals override
+    # this structural guess).
+    _page_type = detect_page_type(
+        page_html, page_url, raw_ct, sum(len(c) for c in content),
+    )
+
     return ResponseModel(
         status=page.status, content=content, url=page.url,
         fetcher_used=fetcher_used, duration_ms=duration_ms,
         content_type=raw_ct, total_size_bytes=total_size, metadata=page_metadata,
-        media=page_media, links=page_links,
+        media=page_media, links=page_links, page_type=_page_type,
     )
 
 
@@ -1240,6 +1379,25 @@ class MasterFetchServer:
         that was duplicated 8+ times across smart_fetch.
         """
         result = _annotate_quality(result)
+        # v10: archive fallback for hard-fails. When the live tiers hard-blocked
+        # the page, recover it from the Internet Archive's closest snapshot
+        # (honestly marked source='archive.org'). Disabled by env or per-call
+        # opt-out. _is_archive_worthy guards re-entry (source='archive' -> False).
+        if (_ARCHIVE_ENABLED and _ARCHIVE_FALLBACK.get()
+                and result.source == "live" and _is_archive_worthy(result)):
+            from master_fetch.archive import try_archive_fallback
+            archived = await try_archive_fallback(
+                self, url, extraction_type, css_selector, cache_ttl,
+                pages=_PDF_PAGES.get(), max_chars=max_chars,
+            )
+            if archived is not None:
+                # Finalize the archive result: cache under the archive key +
+                # chunk + envelope. _is_archive_worthy(archived) is False
+                # (source='archive'), so this recursion terminates immediately.
+                return await self._finalize_result(
+                    archived, url, extraction_type, css_selector, cache_ttl,
+                    offset, max_chars,
+                )
         # Only cache CLEAN content. Caching JS shells / bot challenges / geo
         # redirects / error statuses would serve broken pages from cache for
         # the whole TTL (and the cache-hit path doesn't restore the error field,
@@ -1251,6 +1409,17 @@ class MasterFetchServer:
                 content_type=result.content_type,
                 total_size_bytes=result.total_size_bytes,
                 pages=_PDF_PAGES.get(),
+                source=result.source,
+                envelope={
+                    "metadata": result.metadata,
+                    "media": result.media,
+                    "links": result.links,
+                    "quality_score": result.quality_score,
+                    "table_of_contents": result.table_of_contents,
+                    "page_type": result.page_type,
+                    "source": result.source,
+                    "archived_at": result.archived_at,
+                },
             )
         return _apply_chunking(result, max_chars=max_chars, offset=offset)
 
@@ -2118,6 +2287,7 @@ class MasterFetchServer:
         actions: Annotated[Optional[List[Dict[str, Any]]], Field(description="Page interactions run on the stealthy browser AFTER load, BEFORE extraction: [{click:'button.load-more'}, {fill:{selector:'#q', text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'.item'}]. Forces the stealthy tier; bypasses cache. Reaches content behind a click/form/infinite scroll.")] = None,
         include_media: Annotated[bool, Field(description="If true, populate the response .media field with up to 20 image URLs found on the page (for multimodal agents). Default false (keeps responses lean).")] = False,
         include_links: Annotated[bool, Field(description="If true, populate the response .links field with the page's outgoing links classified as citations/navigation/external + a primary_source hint. Default false. Use when you want to follow a page's referenced sources in one step.")] = False,
+        archive_fallback: Annotated[bool, Field(description="If true (default), when the live site hard-blocks the fetch (404/451/500/bot-block/auth), recover the page from the Internet Archive's closest snapshot, honestly marked with source='archive.org' + archived_at. Set false to get the raw live failure instead.")] = True,
     ) -> ResponseModel:
         """Fetch a URL (or multiple URLs) with automatic anti-bot escalation.
 
@@ -2177,6 +2347,7 @@ class MasterFetchServer:
             _FOCUS.set(focus)
         _INCLUDE_MEDIA.set(bool(include_media))
         _INCLUDE_LINKS.set(bool(include_links))
+        _ARCHIVE_FALLBACK.set(bool(archive_fallback))
         # actions produce post-interaction content unique to the action sequence;
         # bypass the cache so a plain (pre-action) cached copy is never served.
         if actions:
@@ -2200,12 +2371,23 @@ class MasterFetchServer:
         if cache_ttl > 0:
             cached = await get_cached(url, extraction_type, css_selector, ttl=cache_ttl, pages=pages if isinstance(pages, str) else None)
             if cached is not None:
+                env = cached.get("envelope") or {}
                 return _apply_chunking(ResponseModel(
                     url=cached["url"], status=cached["status"], content=cached["content"],
                     cached=True, fetcher_used="cache", duration_ms=0,
                     extracted_type=extraction_type,
                     content_type=cached.get("content_type", ""),
                     total_size_bytes=cached.get("total_size_bytes", 0),
+                    # v10: restore the envelope so cache hits keep metadata/links/
+                    # quality_score/toc/page_type/source/archived_at (previously lost).
+                    metadata=env.get("metadata", {}) or {},
+                    media=env.get("media", []) or [],
+                    links=env.get("links", {}) or {},
+                    quality_score=env.get("quality_score", 0.0) or 0.0,
+                    table_of_contents=env.get("table_of_contents", []) or [],
+                    page_type=env.get("page_type", "unknown") or "unknown",
+                    source=env.get("source", "live") or "live",
+                    archived_at=env.get("archived_at", "") or "",
                 ), max_chars=mc, offset=offset)
 
         # 3. Reddit optimization: rewrite listings to old.reddit.com (7x smaller,

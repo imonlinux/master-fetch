@@ -1,5 +1,138 @@
 # Changelog
 
+## [10.0.0] - 2026-07-18
+
+### The web research tool that never gives up — and tells your agent what to do next
+
+v10 is a flagship release built around two ideas: (1) a fetch should stop
+returning dead-ends, and (2) every response should carry the trust, currency,
+and next-step signals an agent needs without a second call. No new tools (still
+6). One new feature, one major upgrade of the existing response envelope, and
+code-quality hardening that makes the internals professional-grade.
+
+### Internet Archive recovery (new) — the headline
+
+When `smart_fetch`'s live tiers hard-fail (404 / 451 / 500 / network error /
+bot-block-after-escalation / auth-required), hound now automatically recovers
+the page from the Internet Archive's closest snapshot and returns it —
+honestly marked `source='archive.org'` + `archived_at` (the snapshot date) so the
+agent always knows it got a dated snapshot, not the live page.
+
+Reliability-first (the agent must never get bloat or dumb info from the archive):
+
+- Triggers ONLY on a genuine hard-fail (see `_is_archive_worthy`). Never on
+  success, soft errors, or cases archive can't fix (bad request, encrypted PDF).
+- Requires the snapshot's own `status == 200` — rejects snapshots that archived
+  a 404/error page (archive would just re-serve the failure).
+- Fetches the snapshot via the Wayback `id_` identity marker, which serves the
+  RAW archived HTML with NO toolbar/wrapper and ORIGINAL links intact. The
+  agent gets clean content, not Wayback chrome or rewritten `/web/<ts>/` links.
+  No manual HTML stripping needed.
+- Validates the snapshot actually yields real content (status<400, no error,
+  non-empty, not a JS shell). If it doesn't, falls through to the original error
+  — never worse than today.
+- Retries the flaky availability API (transient ~1-in-10 errors, confirmed
+  2026) with backoff. Caps the whole fallback at ~12s.
+- Caches archive results under a separate key (`source='archive'`) so a repeat
+  fetch of a blocked URL is instant, and a page that later unblocks isn't
+  served a stale archive snapshot.
+- Opt-out: `archive_fallback=False` per-call, or `HOUND_ARCHIVE_FALLBACK=0` env.
+
+The only other tool doing Wayback fallback (TadMSTR/searxng-mcp) needs a
+Firecrawl API key + Crawl4AI + self-hosted SearXNG + Ollama. Hound = one
+`pip install`. That is the moat. Honest claim: the only free, keyless,
+zero-setup fetch tool with automatic Internet Archive recovery.
+
+### Research-grade response envelope (major upgrade)
+
+Every `smart_fetch` response now carries trust + currency + a concrete
+next step, computed from the page itself (dependency-free, ~26us/response):
+
+- `page_type`: structural class — `article|docs|list|forum|qa|pdf|js_shell|
+  auth_wall|paywall|redirect|image|json|unknown`. Detected from raw HTML
+  (forum/qa/docs framework markers, list-page link density, `<article>`,
+  paywall phrases, meta-refresh/JS redirects) with error/content-type signals
+  overriding the structural guess.
+- `content_age_days` + `is_stale`: from the page's own published/modified date
+  (OpenGraph/JSON-LD/PDF). Prefers modified over published (a page updated
+  last week is current even if first published in 2014). -1 = no date
+  recoverable; future-dated = untrustworthy. `is_stale` = age > 365d.
+- `source_type` + `is_official`: domain authority class
+  (gov/edu/github/docs-site/qa/forum/blog/news/ecommerce/unknown) with a
+  conservative `is_official` (True only on a strong canonical-owner signal).
+- `next_action` got a brain: it now consumes the envelope. A list page points
+  to its top 3 links (or suggests `smart_crawl`); a stale article suggests a
+  dated `smart_search`; an auth wall / paywall suggests the archive or another
+  source; a redirect points to the canonical URL; an archive result notes the
+  snapshot date. Precedence: archive-source > page structure > freshness.
+
+### Cache now round-trips the full envelope (fixes a silent field-loss bug)
+
+Pre-v10, cache hits rebuilt `ResponseModel` with only content/status/
+content_type/size — silently dropping `metadata`, `links`, `quality_score`,
+`table_of_contents`, `media`, and the new envelope fields. v10 adds an
+`envelope` column to the cache DB and round-trips all of them, so a repeat
+fetch returns the SAME rich response as the first (and `source` separates
+live vs archive cache entries).
+
+### Code-quality hardening ("professional, not a side project")
+
+- **Killed the vanish-on-truncation bug class.** `_apply_chunking` rebuilt
+  `ResponseModel` by hand at two sites, listing fields explicitly — any field
+  not listed (metadata, links, every envelope field) silently vanished on
+  truncated responses. Collapsed both sites to `result.model_copy(update=...)`
+  so fields survive by construction. Add a field to `ResponseModel` and it
+  survives chunking free.
+- **Killed the stale-wheel test trap.** The dev venv ships a BUILT wheel (not
+  editable); `pytest` silently ran the stale installed copy and `src/` edits
+  went untested (bit the project 4+ times). Added `pythonpath = ["src"]` to
+  `[tool.pytest.ini_options]` so pytest always imports from src. Pinned with a
+  test asserting `master_fetch.__file__` is under `src/`.
+- New modules `envelope.py` (page-type/freshness/authority) and `archive.py`
+  (Wayback fallback) are dependency-free (stdlib only) and fully type-annotated.
+- `archive.py` imports httpx lazily (only on a fallback) so it adds zero
+  startup cost.
+
+### Performance (profiled)
+
+`scripts/profile_hotpath.py` measures the new per-response cost: the full
+envelope (`_with_agent_hints`) is **~26us/response**; `detect_page_type` on a
+50KB page is ~0.7ms (once per fetch, <0.1% of fetch time); `classify_source`
+  and `compute_freshness` are ~3us each. Cache hits are ~5ms (pre-existing
+SQLite connection cost, still ~200x faster than a live fetch) and touch NO
+browser and run NO extraction. No v10-introduced waste to cut.
+
+### Tests
+
+- `tests/test_v10_archive.py` (20 tests): worthiness, the `id_` marker
+  transform, availability retry-then-success, rejection of archived error
+  pages / empty / JS-shell snapshots, honest marking, archive cache hit, and
+  the `_finalize_result` integration (fires on hard-fail, not on success,
+  per-call + env opt-out).
+- `tests/test_v10_envelope.py` (32 tests): source classification (gov/edu/
+  github/docs/qa/forum/blog/news), freshness (recent/stale/no-date/future/
+  modified-preferred/compact-timestamp), page-type detection (every class +
+  the article-with-many-links precision guard), and every smart-next_action
+  branch + precedence.
+- `tests/test_v10_construction.py` (3 tests): truncation + no-more-content +
+  short-content all preserve every field (the model_copy regression).
+- `tests/test_v10_devworkflow.py`: pins the pytest `pythonpath=["src"]` fix.
+- `tests/test_cache_qol.py`: the caching class gets an autouse fixture
+  disabling archive so it tests caching in isolation (archive is tested
+  separately).
+- `scripts/live_archive_check.py`: recovers a real page from the Internet
+  Archive (real network, not mocks) — proves both the module and the
+  `_finalize_result` integration end-to-end.
+- Full suite: 687 passed (was 635; +52 v10 tests), 0 failed.
+
+### Compatibility
+
+v10.0.0 is a MAJOR bump because archive fallback is default-on (a behavior
+change on the failure path: was error-only, now archive content). All new
+`ResponseModel` fields are additive with defaults (non-breaking). The 6 tools,
+their schemas, and all existing response fields are unchanged. Opt-out exists
+for the one behavior change.
+
 ## [9.2.0] - 2026-07-08
 
 ### Idle browser close frees RAM (Issue #1)
