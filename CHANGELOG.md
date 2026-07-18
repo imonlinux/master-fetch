@@ -2,7 +2,7 @@
 
 ## [10.0.0] - 2026-07-18
 
-### The web research tool that never gives up — and tells your agent what to do next
+### The web research tool that never gives up, and tells your agent what to do next
 
 v10 is a flagship release built around two ideas: (1) a fetch should stop
 returning dead-ends, and (2) every response should carry the trust, currency,
@@ -10,7 +10,7 @@ and next-step signals an agent needs without a second call. No new tools (still
 6). One new feature, one major upgrade of the existing response envelope, and
 code-quality hardening that makes the internals professional-grade.
 
-### Internet Archive recovery (new) — the headline
+### Internet Archive recovery (new) 
 
 When `smart_fetch`'s live tiers hard-fail (404 / 451 / 500 / network error /
 bot-block-after-escalation / auth-required), hound now automatically recovers
