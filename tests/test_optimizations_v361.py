@@ -25,16 +25,14 @@ from master_fetch.server import (
     MasterFetchServer,
     MAX_BULK_URLS,
     AUTO_SESSION_IDLE_TIMEOUT,
-    _hound_launcher_path,
-    _stage_running_launcher,
-    _cleanup_old_launcher,
-    _looks_like_file_lock_error,
-    _other_hound_pids,
-    _stop_hound_cmd,
-    _reinstall_cmd,
-    _do_update,
-    _run_pip_sync,
-    _spawn_console_updater,
+)
+from master_fetch.updater import (
+    check_version, pad_version, do_update, print_version, doctor, rollback,
+    cleanup_old_launcher, repair_script_path,
+    _hound_launcher_path, _stop_hound_cmd, _looks_like_file_lock_error,
+    _other_hound_pids, _build_helper_source, _spawn_helper,
+    _write_repair_script, _read_last_version, _write_last_version,
+    _pip_cmd, _heal_cmd, _run_pip, _diagnose,
 )
 
 
@@ -241,51 +239,48 @@ class TestDeadCodeRemoved:
 
 # ─── hound -u self-update: detached console updater (Windows lock fix) ──────
 
-class TestSelfUpdateHelpers:
+
+# ─── updater helpers ───────────────────────────────────────────────────────
+
+class TestUpdaterHelpers:
     """Platform helpers + process detection used by the updater."""
 
     def test_launcher_path_returns_str_or_none(self):
         p = _hound_launcher_path()
         assert p is None or isinstance(p, str)
 
-    def test_stage_returns_none_on_non_windows(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sys, "platform", "linux")
+    def test_cleanup_old_launcher_noop_when_no_old(self, tmp_path):
         exe = tmp_path / "hound.exe"
         exe.write_text("fake")
-        monkeypatch.setattr("master_fetch.server._hound_launcher_path", lambda: str(exe))
-        assert _stage_running_launcher() is None
-        assert exe.exists(), "POSIX staging must never touch the launcher"
-
-    def test_cleanup_noop_when_no_old(self, tmp_path):
-        exe = tmp_path / "hound.exe"
-        exe.write_text("fake")
-        with patch("master_fetch.server._hound_launcher_path", return_value=str(exe)):
-            _cleanup_old_launcher()
+        with patch("master_fetch.updater._hound_launcher_path", return_value=str(exe)):
+            cleanup_old_launcher()
         assert exe.exists()
         assert not (tmp_path / "hound.exe.old").exists()
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="launcher staging is Windows-only")
+    @pytest.mark.skipif(sys.platform != "win32", reason="launcher .old sweep is Windows-only")
     def test_cleanup_removes_stale_old(self, tmp_path):
         exe = tmp_path / "hound.exe"
         exe.write_text("fake")
         old = tmp_path / "hound.exe.old"
         old.write_text("stale")
-        with patch("master_fetch.server._hound_launcher_path", return_value=str(exe)):
-            _cleanup_old_launcher()
+        with patch("master_fetch.updater._hound_launcher_path", return_value=str(exe)):
+            cleanup_old_launcher()
         assert exe.exists()
         assert not old.exists(), "stale .old must be swept on launch"
 
-    def test_stop_hound_cmd_is_platform_aware(self, monkeypatch):
-        import master_fetch.server as srv_mod
-        monkeypatch.setattr(sys, "platform", "win32")
-        assert srv_mod._stop_hound_cmd() == "taskkill /IM hound.exe /F"
+    def test_cleanup_noop_on_posix(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
-        assert srv_mod._stop_hound_cmd() == "pkill -f hound"
-        monkeypatch.setattr(sys, "platform", "darwin")
-        assert srv_mod._stop_hound_cmd() == "pkill -f hound"
+        with patch("master_fetch.updater._hound_launcher_path", return_value="/x/hound"):
+            cleanup_old_launcher()  # must not touch anything on POSIX
 
-    def test_reinstall_cmd_format(self):
-        assert _reinstall_cmd("3.6.7") == "pip install --force-reinstall --no-deps hound-mcp==3.6.7"
+    def test_stop_hound_cmd_is_platform_aware(self, monkeypatch):
+        import master_fetch.updater as up
+        monkeypatch.setattr(sys, "platform", "win32")
+        assert up._stop_hound_cmd() == "taskkill /IM hound.exe /F"
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert up._stop_hound_cmd() == "pkill -x hound"
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert up._stop_hound_cmd() == "pkill -x hound"
 
     def test_file_lock_detector(self):
         assert _looks_like_file_lock_error(
@@ -313,197 +308,309 @@ class TestSelfUpdateHelpers:
         with patch.object(sp, "check_output", side_effect=FileNotFoundError("no tasklist")):
             assert _other_hound_pids() == []
 
+    def test_pip_cmd_is_no_deps_no_extras(self):
+        cmd = _pip_cmd("10.2.0")
+        assert "--no-deps" in cmd
+        assert "hound-mcp==10.2.0" in cmd
+        assert not any("[all]" in c for c in cmd), "must NOT pull the heavy [all] extra"
 
-class TestSpawnConsoleUpdater:
-    """Windows: a child python.exe (not hound.exe) inherits the console, waits
-    for the launcher to exit, then runs pip. Must be self-contained (no
-    master_fetch import) so it survives the package being replaced.
-    """
+    def test_heal_cmd_is_force_reinstall_no_deps(self):
+        cmd = _heal_cmd("10.2.0")
+        assert "--force-reinstall" in cmd and "--no-deps" in cmd
+        assert "hound-mcp==10.2.0" in cmd
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="console updater is Windows-only")
-    def test_spawns_python_dash_c_child(self):
+    def test_diagnose_categories(self):
+        assert "server" in _diagnose("[WinError 32] being used by another process: hound.exe")
+        assert "PyPI" in _diagnose("ERROR: No matching distribution found")
+        assert "timed out" in _diagnose("connection timed out")
+        assert "pip failed" in _diagnose("some other error")
+
+
+# ─── the detached Windows helper (standalone python -c) ────────────────────
+
+class TestHelperSource:
+    """The Windows helper is a standalone python -c (no master_fetch import)
+    that waits for the parent, stages the launcher via the rename trick, runs
+    pip --no-deps, self-heals, and points at repair.py on failure."""
+
+    def test_compiles_and_is_self_contained(self):
+        src = _build_helper_source("10.2.0", "/home/u/.hound/repair.py", 12345)
+        compile(src, "<helper>", "exec")
+        assert "import master_fetch" not in src, "helper must NOT depend on master_fetch"
+
+    def test_installs_target_no_deps(self):
+        src = _build_helper_source("10.2.0", "/r.py", 1)
+        assert "--no-deps" in src
+        assert ("hound-mcp==" + chr(34) + " + TARGET") in src, "installs the target version"
+        assert repr("10.2.0") in src, "target version injected"
+
+    def test_self_heals_with_force_reinstall(self):
+        src = _build_helper_source("10.2.0", "/r.py", 1)
+        assert "--force-reinstall" in src, "helper must self-heal"
+
+    def test_stages_via_rename(self):
+        src = _build_helper_source("10.2.0", "/r.py", 1)
+        assert "os.rename(EXE, old)" in src, "frees the launcher via the rename trick"
+
+    def test_waits_for_parent_exit(self):
+        src = _build_helper_source("10.2.0", "/r.py", 999)
+        assert "_wait_parent_exit" in src and repr(999) in src
+
+    def test_points_at_repair_on_failure(self):
+        src = _build_helper_source("10.2.0", "/home/u/.hound/repair.py", 1)
+        assert "repair" in src.lower()
+        assert repr("/home/u/.hound/repair.py") in src
+
+    def test_spawn_inherits_console_so_output_shows(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
         import subprocess as sp
         with patch.object(sp, "Popen") as m:
-            ok = _spawn_console_updater([sys.executable, "-m", "pip", "install", "x"], "3.6.7")
-        assert ok is True
-        assert m.called
-        args = m.call_args.args[0]
-        assert args[0] == sys.executable and args[1] == "-c"
-        # No detachment flags — must inherit the parent console so output shows.
-        assert m.call_args.kwargs.get("creationflags", 0) == 0
+            assert _spawn_helper("10.2.0", "/r.py", 1) is True
+        assert m.call_args.kwargs.get("creationflags", 0) == 0, "must inherit the console"
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="console updater is Windows-only")
-    def test_child_source_compiles_and_is_self_contained(self):
-        import subprocess as sp
-        captured = {}
-        def fake_popen(args, **kw):
-            captured["src"] = args[2]
-            return MagicMock()
-        with patch.object(sp, "Popen", side_effect=fake_popen):
-            _spawn_console_updater([sys.executable, "-m", "pip", "install", "x"], "3.6.7")
-        src = captured["src"]
-        compile(src, "<console_updater>", "exec")  # must be valid Python
-        assert "import master_fetch" not in src, "child must NOT depend on master_fetch"
-        assert "taskkill /IM hound.exe /F" in src, "must embed the platform stop cmd"
-        assert "pip install --force-reinstall --no-deps hound-mcp==3.6.7" in src, "must embed reinstall cmd"
-        assert "time.sleep(2)" in src, "must wait for the parent launcher to exit"
-        assert "tasklist" in src, "must re-check for a real server after parent exit"
-        assert "sys.stdout.write(chr(10))" in src, (
-            "must emit a leading newline after the sleep to move below the shell "
-            "prompt before printing (ghost-prompt overlap bug)"
-        )
-
-    def test_returns_false_on_popen_error(self):
+    def test_spawn_returns_false_on_popen_error(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
         import subprocess as sp
         with patch.object(sp, "Popen", side_effect=OSError("boom")):
-            assert _spawn_console_updater(["x"], "3.6.7") is False
+            assert _spawn_helper("10.2.0", "/r.py", 1) is False
 
 
-class TestRunPipSync:
-    """`_run_pip_sync` runs pip synchronously with bulletproof messaging."""
-
-    def _ok(self, rc=0):
-        return MagicMock(returncode=rc)
-
-    def test_success_prints_new_version(self, capsys):
-        import master_fetch.server as srv
-        with patch("subprocess.run", return_value=self._ok(0)), \
-             patch.object(srv, "_check_version", return_value=("3.6.7", "3.6.7", True)):
-            srv._run_pip_sync(["pip", "install", "x"], "3.6.7")
-        out = capsys.readouterr().out
-        assert "v3.6.7" in out and "updated" in out.lower()
-
-    def test_silent_no_op_detected(self, capsys):
-        import master_fetch.server as srv
-        with patch("subprocess.run", return_value=self._ok(0)), \
-             patch.object(srv, "_check_version", return_value=("3.6.5", "3.6.7", False)):
-            with pytest.raises(SystemExit):
-                srv._run_pip_sync(["pip", "install", "x"], "3.6.7")
-        out = capsys.readouterr().out
-        assert "did not complete" in out
-        assert "hound-mcp==3.6.7" in out
-
-    def test_pip_failure_prints_recovery(self, capsys):
-        import master_fetch.server as srv
-        with patch("subprocess.run", return_value=self._ok(1)):
-            with pytest.raises(SystemExit):
-                srv._run_pip_sync(["pip", "install", "x"], "3.6.7")
-        out = capsys.readouterr().out
-        assert "pip returned 1" in out
-        assert "taskkill /IM hound.exe /F" in out or "pkill -f hound" in out
-        assert "hound-mcp==3.6.7" in out
-
-    def test_timeout_prints_recovery(self, capsys):
-        import subprocess, master_fetch.server as srv
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["pip"], timeout=300)):
-            with pytest.raises(SystemExit):
-                srv._run_pip_sync(["pip", "install", "x"], "3.6.7")
-        out = capsys.readouterr().out
-        assert "timed out" in out.lower()
-        assert "hound-mcp==3.6.7" in out
-
-    def test_corrupted_result_prints_recovery(self, capsys):
-        import master_fetch.server as srv
-        with patch("subprocess.run", return_value=self._ok(0)), \
-             patch.object(srv, "_check_version", return_value=("unknown", "3.6.7", False)):
-            with pytest.raises(SystemExit):
-                srv._run_pip_sync(["pip", "install", "x"], "3.6.7")
-        out = capsys.readouterr().out
-        assert "metadata" in out.lower()
-        assert "hound-mcp==3.6.7" in out
-
+# ─── do_update: brick-proof self-update ─────────────────────────────────────
 
 class TestDoUpdate:
-    """`_do_update` dispatch: Windows spawns the console updater; POSIX runs sync."""
+    """POSIX runs pip inline + self-heals; Windows delegates to the helper.
+    No failure path ever prints a bare destructive `pip --force-reinstall`."""
+
+    @pytest.fixture(autouse=True)
+    def _no_state_writes(self, monkeypatch):
+        # don't touch the real ~/.hound during tests
+        monkeypatch.setattr("master_fetch.updater._write_repair_script", lambda: None)
+        monkeypatch.setattr("master_fetch.updater._write_last_version", lambda v: None)
 
     def test_already_latest(self, capsys):
-        import master_fetch.server as srv
-        with patch.object(srv, "_check_version", return_value=("3.6.7", "3.6.7", True)):
-            srv._do_update()
+        with patch("master_fetch.updater.check_version", return_value=("10.2.0", "10.2.0", True)):
+            do_update()
         out = capsys.readouterr().out
-        assert "v3.6.7" in out and "up to date" in out.lower()
+        assert "v10.2.0" in out and "up to date" in out.lower()
 
-    def test_pypi_unreachable_message(self, capsys):
-        import master_fetch.server as srv
-        with patch.object(srv, "_check_version", return_value=("3.6.7", None, None)):
-            srv._do_update()
+    def test_pypi_unreachable(self, capsys):
+        with patch("master_fetch.updater.check_version", return_value=("10.2.0", None, None)):
+            do_update()
         out = capsys.readouterr().out
         assert "couldn't reach PyPI" in out
         assert "hound -u" in out
 
-    @pytest.mark.skipif(sys.platform != "win32", reason="spawn path is Windows-only")
-    def test_win32_spawns_console_updater_and_returns(self, monkeypatch, capsys):
-        import master_fetch.server as srv
-        monkeypatch.setattr(sys, "platform", "win32")
-        with patch.object(srv, "_check_version", return_value=("3.6.5", "3.6.6", False)), \
-             patch.object(srv, "_spawn_console_updater", return_value=True) as mock_spawn, \
-             patch("subprocess.run") as mock_run:
-            srv._do_update()  # must NOT sys.exit
-        out = capsys.readouterr().out
-        assert mock_spawn.called, "must delegate to the console updater on Windows"
-        assert not mock_run.called, "parent must NOT run pip directly (the child does)"
-        assert "finishes in this window" in out
-
-    @pytest.mark.skipif(sys.platform != "win32", reason="spawn path is Windows-only")
-    def test_win32_falls_back_to_sync_when_spawn_fails(self, monkeypatch, capsys):
-        import master_fetch.server as srv
-        monkeypatch.setattr(sys, "platform", "win32")
-        with patch.object(srv, "_check_version", return_value=("3.6.5", "3.6.6", False)), \
-             patch.object(srv, "_spawn_console_updater", return_value=False), \
-             patch.object(srv, "_run_pip_sync") as mock_sync:
-            srv._do_update()
-        assert mock_sync.called, "must fall back to synchronous pip if spawn fails"
-
-    def test_posix_runs_pip_sync(self, monkeypatch, capsys):
-        import master_fetch.server as srv
+    def test_posix_inline_success(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "platform", "linux")
-        with patch.object(srv, "_check_version", return_value=("3.6.5", "3.6.6", False)), \
-             patch.object(srv, "_other_hound_pids", return_value=[]), \
-             patch.object(srv, "_run_pip_sync") as mock_sync:
-            srv._do_update()
+        checks = [("10.1.0", "10.2.0", False), ("10.2.0", "10.2.0", True),
+                  ("10.2.0", "10.2.0", True)]
+        with patch("master_fetch.updater.check_version", side_effect=lambda: checks.pop(0)), \
+             patch("master_fetch.updater._other_hound_pids", return_value=[]), \
+             patch("master_fetch.updater._run_pip", return_value=(0, "")) as m:
+            do_update()
         out = capsys.readouterr().out
-        assert mock_sync.called, "POSIX must run pip synchronously"
-        assert "v3.6.5" in out and "v3.6.6" in out and "updating" in out.lower()
+        assert m.called
+        assert "v10.2.0" in out and "updated" in out.lower()
 
-    def test_posix_warns_about_running_server_but_proceeds(self, monkeypatch, capsys):
-        import master_fetch.server as srv
+    def test_posix_self_heals_on_noop(self, monkeypatch, capsys):
+        # first pip "succeeds" but the version doesn't advance (a server held
+        # the file); the self-heal --force-reinstall pass must run + advance it.
         monkeypatch.setattr(sys, "platform", "linux")
-        with patch.object(srv, "_check_version", return_value=("3.6.5", "3.6.6", False)), \
-             patch.object(srv, "_other_hound_pids", return_value=[11111]), \
-             patch.object(srv, "_run_pip_sync") as mock_sync:
-            srv._do_update()
+        checks = [("10.1.0", "10.2.0", False), ("10.1.0", "10.2.0", False),
+                  ("10.2.0", "10.2.0", True), ("10.2.0", "10.2.0", True)]
+        with patch("master_fetch.updater.check_version", side_effect=lambda: checks.pop(0)), \
+             patch("master_fetch.updater._other_hound_pids", return_value=[]), \
+             patch("master_fetch.updater._run_pip", return_value=(0, "")) as m:
+            do_update()
         out = capsys.readouterr().out
-        assert "PID 11111" in out
-        assert "restart" in out.lower()
-        assert mock_sync.called, "POSIX must NOT refuse when a server is running (no file lock)"
+        assert m.call_count == 2, "must run pip then the self-heal pass"
+        assert "recovering" in out.lower()
+        assert "v10.2.0" in out and "updated" in out.lower()
 
+    def test_posix_failure_points_at_repair_not_bare_pip(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "linux")
+        checks = [("10.1.0", "10.2.0", False), ("unknown", "10.2.0", False),
+                  ("unknown", "10.2.0", False)]
+        with patch("master_fetch.updater.check_version", side_effect=lambda: checks.pop(0)), \
+             patch("master_fetch.updater._other_hound_pids", return_value=[]), \
+             patch("master_fetch.updater._run_pip", return_value=(1, "WinError 32 hound.exe")):
+            with pytest.raises(SystemExit):
+                do_update()
+        out = capsys.readouterr().out
+        assert "update failed" in out.lower()
+        assert "repair.py" in out, "must point at the safe repair script"
+        assert "force-reinstall" not in out, "must NOT print a bare destructive pip command"
+
+    def test_win32_spawns_helper(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "win32")
+        with patch("master_fetch.updater.check_version", return_value=("10.1.0", "10.2.0", False)), \
+             patch("master_fetch.updater._spawn_helper", return_value=True) as m:
+            do_update()
+        out = capsys.readouterr().out
+        assert m.called, "Windows must delegate to the detached helper"
+        assert "completes in this window" in out
+
+    def test_win32_spawn_fail_points_at_repair(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "platform", "win32")
+        with patch("master_fetch.updater.check_version", return_value=("10.1.0", "10.2.0", False)), \
+             patch("master_fetch.updater._spawn_helper", return_value=False):
+            do_update()
+        out = capsys.readouterr().out
+        assert "repair.py" in out
+        assert "force-reinstall" not in out
+
+    def test_corrupted_install_proceeds_to_install(self, monkeypatch, capsys):
+        # installed == "unknown" must NOT just print a message and stop - it
+        # must install the latest to recover.
+        monkeypatch.setattr(sys, "platform", "linux")
+        checks = [("unknown", "10.2.0", False), ("10.2.0", "10.2.0", True),
+                  ("10.2.0", "10.2.0", True)]
+        with patch("master_fetch.updater.check_version", side_effect=lambda: checks.pop(0)), \
+             patch("master_fetch.updater._other_hound_pids", return_value=[]), \
+             patch("master_fetch.updater._run_pip", return_value=(0, "")) as m:
+            do_update()
+        out = capsys.readouterr().out
+        assert m.called, "corrupted install must still attempt the install"
+        assert "v10.2.0" in out
+
+
+# ─── hound -v ───────────────────────────────────────────────────────────────
 
 class TestVersionCommand:
-    """`hound -v` bulletproof messages."""
+    """`hound -v` bulletproof, non-destructive messages."""
 
-    def test_corrupted_shows_reinstall_cmd(self, monkeypatch, capsys):
-        import master_fetch.server as srv
-        monkeypatch.setattr(srv, "_check_version", lambda: ("unknown", "3.6.7", False))
+    def test_corrupted_points_at_repair(self, monkeypatch, capsys):
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("unknown", "10.2.0", False))
         monkeypatch.setattr(sys, "argv", ["hound", "-v"])
+        import master_fetch.server as srv
         srv.main()
         out = capsys.readouterr().out
         assert "corrupted" in out.lower()
-        assert "hound-mcp==3.6.7" in out
+        assert "repair.py" in out, "must point at the safe repair script"
+        assert "force-reinstall" not in out, "no bare destructive pip command"
         assert "vunknown" not in out
 
     def test_pypi_unreachable(self, monkeypatch, capsys):
-        import master_fetch.server as srv
-        monkeypatch.setattr(srv, "_check_version", lambda: ("3.6.7", None, None))
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("10.2.0", None, None))
         monkeypatch.setattr(sys, "argv", ["hound", "-v"])
+        import master_fetch.server as srv
         srv.main()
         out = capsys.readouterr().out
         assert "couldn't reach PyPI" in out
 
     def test_update_available(self, monkeypatch, capsys):
-        import master_fetch.server as srv
-        monkeypatch.setattr(srv, "_check_version", lambda: ("3.6.5", "3.6.7", False))
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("10.1.0", "10.2.0", False))
         monkeypatch.setattr(sys, "argv", ["hound", "-v"])
+        import master_fetch.server as srv
         srv.main()
         out = capsys.readouterr().out
-        assert "v3.6.5" in out and "v3.6.7 available" in out
+        assert "v10.1.0" in out and "v10.2.0 available" in out
         assert "hound -u" in out
+
+
+# ─── hound doctor ───────────────────────────────────────────────────────────
+
+class TestDoctor:
+    """Proactive health check - catches a half-broken install before it bricks."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch, tmp_path):
+        # no network, no real ~/.hound writes
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("10.2.0", "10.2.0", True))
+        monkeypatch.setattr("master_fetch.updater._hound_home", lambda: str(tmp_path))
+        monkeypatch.setattr("master_fetch.updater.repair_script_path",
+                            lambda: str(tmp_path / "repair.py"))
+        monkeypatch.setattr("master_fetch.updater._state_path",
+                            lambda n: str(tmp_path / n))
+
+    def test_runs_and_reports_every_check(self, capsys):
+        doctor()
+        out = capsys.readouterr().out
+        assert "Hound" in out
+        for label in ["launcher resolves", "package imports", "metadata consistent",
+                      "launcher clean", "repair script ready", "core dependencies",
+                      "PyPI reachable"]:
+            assert label in out, f"missing check label: {label}"
+
+    def test_writes_repair_script(self, tmp_path):
+        doctor()
+        rp = tmp_path / "repair.py"
+        assert rp.exists(), "doctor must ensure the repair script exists"
+        src = rp.read_text(encoding="utf-8")
+        compile(src, "<repair>", "exec")
+        assert "import master_fetch" not in src, "repair must be standalone"
+        assert "force-reinstall" in src
+
+    def test_flags_missing_dep_and_offers_fix(self, monkeypatch, capsys):
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *a, **k):
+            if name == "httpx":
+                raise ImportError("no httpx")
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        doctor()
+        out = capsys.readouterr().out
+        assert "httpx" in out
+        assert "fix deps" in out.lower()
+
+
+# ─── hound --rollback ───────────────────────────────────────────────────────
+
+class TestRollback:
+    """Undo a bad update by reinstalling the previously-recorded version."""
+
+    def test_nothing_to_rollback(self, monkeypatch, capsys):
+        monkeypatch.setattr("master_fetch.updater._read_last_version", lambda: None)
+        rollback()
+        out = capsys.readouterr().out
+        assert "nothing to roll back" in out.lower()
+
+    def test_already_at_previous_version(self, monkeypatch, capsys):
+        monkeypatch.setattr("master_fetch.updater._read_last_version", lambda: "10.2.0")
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("10.2.0", "10.2.0", True))
+        rollback()
+        out = capsys.readouterr().out
+        assert "already at" in out.lower()
+
+    def test_rollback_reinstalls_previous_version(self, monkeypatch):
+        monkeypatch.setattr("master_fetch.updater._read_last_version", lambda: "10.1.0")
+        monkeypatch.setattr("master_fetch.updater.check_version",
+                            lambda: ("10.2.0", "10.2.0", True))
+        with patch("master_fetch.updater.do_update") as m:
+            rollback()
+        m.assert_called_once_with(target="10.1.0")
+
+
+# ─── ~/.hound/repair.py: the surviving brick-recovery script ────────────────
+
+class TestRepairScript:
+    """repair.py lives outside site-packages so a failed pip uninstall of
+    hound-mcp never removes it - it's the recovery when hound is bricked."""
+
+    def test_writes_compiling_standalone_script(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("master_fetch.updater._hound_home", lambda: str(tmp_path))
+        monkeypatch.setattr("master_fetch.updater.repair_script_path",
+                            lambda: str(tmp_path / "repair.py"))
+        _write_repair_script()
+        rp = tmp_path / "repair.py"
+        assert rp.exists()
+        src = rp.read_text(encoding="utf-8")
+        compile(src, "<repair>", "exec")
+        assert "import master_fetch" not in src, "repair must not depend on master_fetch"
+        assert "force-reinstall" in src
+        assert "taskkill" in src and "hound.exe" in src
+        # pkill must use -x (exact match) so the repair script (python) isn't killed
+        assert "pkill" in src and '"-x"' in src
+
+    def test_does_not_raise_when_home_not_writable(self, monkeypatch):
+        monkeypatch.setattr("master_fetch.updater.repair_script_path",
+                            lambda: "/nonexistent/dir/repair.py")
+        _write_repair_script()  # must swallow the OSError, not raise

@@ -1,17 +1,90 @@
 # Changelog
 
+## [10.2.0] - 2026-07-18
+
+### Reimagined, brick-proof self-update (+ `hound doctor`, `hound --rollback`)
+
+The old `hound -u` could **brick the install**, and once bricked `hound -u`
+itself was dead so the tool could not self-heal. Two root causes:
+
+1. `hound -u` ran `pip install --upgrade hound-mcp[all]`. The `[all]` extra pulls
+   `onnxruntime` (~100 MB), `tokenizers`, `rapidocr`, `pdfplumber` - slow and
+   fragile. When it failed mid-install, pip had already deleted `master_fetch`
+   but could not replace `hound.exe` (Windows locks a running .exe), so every
+   `hound` command crashed with `ModuleNotFoundError`, including `hound -u`.
+2. The recovery messages told users to run a bare `pip install --force-reinstall`
+   while a hound server held the launcher - the exact command that bricks it.
+
+This release rebuilds the whole update lifecycle in a new `updater.py` module.
+
+**`--no-deps`, no extras.** The self-update only touches `hound-mcp` itself.
+Dependencies already installed are left alone; a user's `[all]` extra is
+preserved. Fast, deterministic, cannot fail on a heavy dep.
+
+**Windows: a detached helper runs pip after the launcher exits.** The running
+`hound -u` command IS `hound.exe`, which Windows locks against overwrite. The
+helper is a standalone `python -c` (no `master_fetch` dependency, so it survives
+the package being replaced) that waits for the parent launcher to exit, frees
+the launcher via the **rename trick** (Windows permits renaming a running .exe,
+just not overwriting it), then runs pip with the launcher free. A still-running
+hound server keeps the old code in memory until restarted - no need to stop it
+first; a stale locked `.old` is cleared by stopping that server. It never
+refuses and never bricks.
+
+**Self-heal.** If pip's first pass leaves the version unchanged or broken, a
+`--force-reinstall --no-deps` pass runs (the launcher is free by then) and
+re-verifies. Catches a half-failed install automatically.
+
+**Surviving repair.** `~/.hound/repair.py` (pure stdlib, outside site-packages)
+is written on every update. If hound is ever bricked (e.g. a manual pip while a
+server held the launcher), `python ~/.hound/repair.py` stops hound and
+force-reinstalls. It survives because it is not part of the hound-mcp package,
+so a failed pip uninstall of `hound-mcp` never removes it.
+
+**Safe messages.** Every failure prints ONE clean error plus the safe recovery
+(`python ~/.hound/repair.py`), never a bare destructive pip command.
+
+**`hound doctor`** - proactive health check: launcher resolves, package imports,
+metadata version matches the module, no stale locked `.old`, core dependencies
+present, PyPI reachable, repair script ready. Catches a half-broken install
+before it bricks, and prints the right fix (update / repair / reinstall deps).
+
+**`hound --rollback`** - undo a bad update by reinstalling the version recorded
+before the last update (`~/.hound/last_version`).
+
+### Compatibility
+
+No new tools, no MCP schema changes, no response-shape changes, no new
+runtime dependencies. The CLI gained `--doctor` and `--rollback`; `hound -u`
+and `hound -v` keep their flags. The update command switched from `hound-mcp[all]`
+to `--no-deps hound-mcp` (faster, safer; your `[all]` extras are preserved).
+
+### Tests
+
+- `tests/test_optimizations_v361.py` rewritten for the new contract: helper
+  source (self-contained, --no-deps, self-heal, rename-trick, wait-parent,
+  repair.py fallback), `do_update` (already-latest, PyPI unreachable, POSIX
+  inline success, POSIX self-heal on no-op, failure points at repair not a bare
+  pip, Windows spawns helper, spawn-fail fallback, corrupted install proceeds),
+  `hound -v` (corrupted points at repair, PyPI unreachable, update available),
+  `hound doctor` (reports every check, writes repair script, flags missing dep),
+  `hound --rollback` (nothing to roll back, already-at-previous, reinstalls
+  previous), `~/.hound/repair.py` (compiles, standalone, has the stop +
+  force-reinstall, does not raise on unwritable home).
+- Full suite: 705 passed (was 693; +12 updater tests), 0 failed.
+
 ## [10.1.0] - 2026-07-18
 
 ### Polished, professional CLI (zero new dependencies)
 
-The `hound` CLI commands were plain `print()` text — a single line for `-v`, a
+The `hound` CLI commands were plain `print()` text  -  a single line for `-v`, a
 wall of pip output for `-u`, generic argparse `--help`. v10.1 gives every
 command a clean, GitHub-grade look that works on any machine (Linux / Windows /
 macOS) without adding a dependency.
 
-New module `cli_ui.py` (stdlib only — no rich) renders:
+New module `cli_ui.py` (stdlib only  -  no rich) renders:
 
-- `hound -v`: a compact bordered version panel — magenta wordmark, cyan
+- `hound -v`: a compact bordered version panel  -  magenta wordmark, cyan
   version, right-aligned status (green ✓ up to date / magenta "vX available"),
   plus an `→ update with hound -u` hint when an update exists. A clean error
   panel with the exact recovery command when the install is corrupted.
@@ -22,20 +95,20 @@ New module `cli_ui.py` (stdlib only — no rich) renders:
 - `hound --help`: a styled description (wordmark + tagline) + concise options +
   a command cheat-sheet + docs link.
 - `hound --http`: a one-line `Hound  serving HTTP  http://host:port/mcp`
-  banner (stdio mode stays silent — never corrupts the MCP protocol).
+  banner (stdio mode stays silent  -  never corrupts the MCP protocol).
 
 Cross-platform reliability (the renderer degrades gracefully, never breaks):
 
 - Color only when stdout is a TTY; respects `NO_COLOR` (any value) and
   `FORCE_COLOR`. Enables Windows VT processing (Win10+). When piped, output is
-  clean plain text — `hound -v | grep` never sees ANSI escapes.
+  clean plain text  -  `hound -v | grep` never sees ANSI escapes.
 - Unicode box borders (╭─│╰) with an **automatic ASCII fallback** (+-|) when
   stdout isn't UTF-8 (legacy consoles), and status glyphs (✓ → ✗) fall back to
   ASCII too. No mojibake on any machine.
 - Visible-length math excludes ANSI codes, so the right border always aligns.
 
 Palette: magenta + cyan-teal accents, dim gray secondary, red errors (no
-amber/gold, no forest green). Minimal — one panel for `-v`, one-liners
+amber/gold, no forest green). Minimal  -  one panel for `-v`, one-liners
 elsewhere.
 
 ### Code hygiene
@@ -76,7 +149,7 @@ code-quality hardening that makes the internals professional-grade.
 
 When `smart_fetch`'s live tiers hard-fail (404 / 451 / 500 / network error /
 bot-block-after-escalation / auth-required), hound now automatically recovers
-the page from the Internet Archive's closest snapshot and returns it —
+the page from the Internet Archive's closest snapshot and returns it  - 
 honestly marked `source='archive.org'` + `archived_at` (the snapshot date) so the
 agent always knows it got a dated snapshot, not the live page.
 
@@ -84,7 +157,7 @@ Reliability-first (the agent must never get bloat or dumb info from the archive)
 
 - Triggers ONLY on a genuine hard-fail (see `_is_archive_worthy`). Never on
   success, soft errors, or cases archive can't fix (bad request, encrypted PDF).
-- Requires the snapshot's own `status == 200` — rejects snapshots that archived
+- Requires the snapshot's own `status == 200`  -  rejects snapshots that archived
   a 404/error page (archive would just re-serve the failure).
 - Fetches the snapshot via the Wayback `id_` identity marker, which serves the
   RAW archived HTML with NO toolbar/wrapper and ORIGINAL links intact. The
@@ -92,7 +165,7 @@ Reliability-first (the agent must never get bloat or dumb info from the archive)
   No manual HTML stripping needed.
 - Validates the snapshot actually yields real content (status<400, no error,
   non-empty, not a JS shell). If it doesn't, falls through to the original error
-  — never worse than today.
+   -  never worse than today.
 - Retries the flaky availability API (transient ~1-in-10 errors, confirmed
   2026) with backoff. Caps the whole fallback at ~12s.
 - Caches archive results under a separate key (`source='archive'`) so a repeat
@@ -110,7 +183,7 @@ zero-setup fetch tool with automatic Internet Archive recovery.
 Every `smart_fetch` response now carries trust + currency + a concrete
 next step, computed from the page itself (dependency-free, ~26us/response):
 
-- `page_type`: structural class — `article|docs|list|forum|qa|pdf|js_shell|
+- `page_type`: structural class  -  `article|docs|list|forum|qa|pdf|js_shell|
   auth_wall|paywall|redirect|image|json|unknown`. Detected from raw HTML
   (forum/qa/docs framework markers, list-page link density, `<article>`,
   paywall phrases, meta-refresh/JS redirects) with error/content-type signals
@@ -131,7 +204,7 @@ next step, computed from the page itself (dependency-free, ~26us/response):
 ### Cache now round-trips the full envelope (fixes a silent field-loss bug)
 
 Pre-v10, cache hits rebuilt `ResponseModel` with only content/status/
-content_type/size — silently dropping `metadata`, `links`, `quality_score`,
+content_type/size  -  silently dropping `metadata`, `links`, `quality_score`,
 `table_of_contents`, `media`, and the new envelope fields. v10 adds an
 `envelope` column to the cache DB and round-trips all of them, so a repeat
 fetch returns the SAME rich response as the first (and `source` separates
@@ -140,7 +213,7 @@ live vs archive cache entries).
 ### Code-quality hardening ("professional, not a side project")
 
 - **Killed the vanish-on-truncation bug class.** `_apply_chunking` rebuilt
-  `ResponseModel` by hand at two sites, listing fields explicitly — any field
+  `ResponseModel` by hand at two sites, listing fields explicitly  -  any field
   not listed (metadata, links, every envelope field) silently vanished on
   truncated responses. Collapsed both sites to `result.model_copy(update=...)`
   so fields survive by construction. Add a field to `ResponseModel` and it
@@ -183,7 +256,7 @@ browser and run NO extraction. No v10-introduced waste to cut.
   disabling archive so it tests caching in isolation (archive is tested
   separately).
 - `scripts/live_archive_check.py`: recovers a real page from the Internet
-  Archive (real network, not mocks) — proves both the module and the
+  Archive (real network, not mocks)  -  proves both the module and the
   `_finalize_result` integration end-to-end.
 - Full suite: 687 passed (was 635; +52 v10 tests), 0 failed.
 
@@ -338,14 +411,14 @@ endpoint moved from `/sse` + `/messages/` to `/mcp`.
 
 The v9 focus is reliability and presentation: the server always starts, never
 spews crash-like tracebacks on shutdown, and the repo reads like a maintained
-product. No new tools, no API breaks — the 6 tools, their schemas, and the
+product. No new tools, no API breaks  -  the 6 tools, their schemas, and the
 response shapes are unchanged.
 
 ### Fixed: clean shutdown (no more 'failed to load' on Windows)
 
 On Windows the ProactorEventLoop's pipe transports (the warm patchright Chrome
 subprocess) emit `Exception ignored in __del__` tracebacks to stderr during GC
-AFTER the event loop closes — `RuntimeError: Event loop is closed` and
+AFTER the event loop closes  -  `RuntimeError: Event loop is closed` and
 `ValueError: I/O operation on closed pipe` from `_ProactorBasePipeTransport`.
 The process exited 0, but an MCP client reading stderr saw a crash-like
 traceback and could report 'failed to load'. v8.2's `finally` block couldn't
@@ -411,7 +484,7 @@ ONNX model (~1.4s cold load) ran **sequentially after** the engine fetch
 background. Worse, the prewarm and the search **raced** on the sync
 `get_reranker()`: if the prewarm had set `_reranker_tried=True` mid-load, the
 search's `get_reranker()` saw `tried=True, _reranker=None` and silently returned
-None, so the first search fell back to non-neural (merge/consensus) rerank — or
+None, so the first search fell back to non-neural (merge/consensus) rerank  -  or
 the search loaded the model itself while the prewarm redundantly loaded it too
 (double load).
 
@@ -442,7 +515,7 @@ The recurring 'hound failed to load' ~50% of the time was caused by heavy
 MODULE-LEVEL imports blocking the process for ~5s BEFORE the MCP initialize
 handshake could respond. On a cold start `import master_fetch.server` took
 **5.45s** (trafilatura 0.87s + the metasearch engine chain 0.86s +
-mcp.server.fastmcp 1.03s + mcp.types 1.03s, all eager) — cold starts exceeded
+mcp.server.fastmcp 1.03s + mcp.types 1.03s, all eager)  -  cold starts exceeded
 the MCP client's initialize timeout, the client killed hound, and the messy
 teardown (Event loop is closed / EPIPE) looked like a crash. The browser
 prewarm itself was async + caught, but the synchronous 5s import was the killer.
@@ -454,7 +527,7 @@ prewarm itself was async + caught, but the synchronous 5s import was the killer.
   handshake now responds in ~0.5-1s instead of 5s+. The heavy deps load on the
   first search/screenshot/fetch that actually needs them, never blocking
   startup. (mcp.server.Server + mcp.types are still imported in serve() before
-  the first response — they're irreducible SDK requirements, ~2s, but cached
+  the first response  -  they're irreducible SDK requirements, ~2s, but cached
   after first run.)
 
 - **Browser prewarm fully isolated**: `_prewarm_stealthy` now catches
@@ -600,12 +673,12 @@ ddgs metasearch** (ddgs is MIT by deedy5; attributed in NOTICE.ddgs.txt).
 - **9 keyless backends in parallel**: duckduckgo, brave, mojeek, yahoo, yandex,
   startpage, google + opt-in wikipedia, grokipedia. INDEPENDENT indexes (not the
   same feed twice). A backend that CAPTCHAs / rate-limits / has no topic-match
-  simply yields nothing and the others carry — the diversity IS the robustness
+  simply yields nothing and the others carry  -  the diversity IS the robustness
   my 3-engine hand-rolled never had.
 - **Vendored + stripped**, not a dependency: ddgs's base engine class + the 9 text
   backends + the aggregation logic live in `search_metasearch.py`. Removed the
   CLI / API server / MCP server / images / videos / news / books / extract /
-  cache / async-loop-in-thread — text search only.
+  cache / async-loop-in-thread  -  text search only.
 - **Async-native parallel aggregator**: backends run concurrently (asyncio +
   to_thread for the sync primp/httpx fetches); a **diversity quorum** waits for
   at least 3 backends to contribute before returning (so no single backend's
@@ -616,7 +689,7 @@ ddgs metasearch** (ddgs is MIT by deedy5; attributed in NOTICE.ddgs.txt).
   impersonation) for most backends; httpx (HTTP/2 + randomized cipher/SETTINGS
   frame) for DuckDuckGo. `primp`/`httpx[http2]`/`fake-useragent`/`lxml` added as
   core deps.
-- **No browser for search** — kills the 2nd-Chrome bug dead. Search is 100%
+- **No browser for search**  -  kills the 2nd-Chrome bug dead. Search is 100%
   HTTP; the single Patchright browser stays for smart_fetch only (eager +
   persistent at startup, as perfected).
 - **Neural rerank kept** (the part that was already great); `find_similar` kept.
@@ -624,7 +697,7 @@ ddgs metasearch** (ddgs is MIT by deedy5; attributed in NOTICE.ddgs.txt).
   CAPTCHA / timeout); empty (no results) + preempted (cancelled because enough
   backends delivered) backends are not falsely flagged.
 - `HOUND_SEARCH_PROXY` (http/https/socks5) is the power-user rotating-proxy
-  escape hatch for per-IP throttling — the one thing no scraper can escape from
+  escape hatch for per-IP throttling  -  the one thing no scraper can escape from
   a single IP.
 
 Verified live: 10 rapid searches -> 0 dead-ends, avg 3.7s, 3 backends
@@ -634,11 +707,11 @@ throughout (smart_fetch only, no 2nd Chrome). 585 tests pass.
 
 ## [7.4.0] - 2026-06-24
 
-### fix: the real rate-limit fix — shared-browser search backbone + parallel race
+### fix: the real rate-limit fix  -  shared-browser search backbone + parallel race
 
 Rate-limiting was terrible: 2 searches and all 3 engines could be dead for a
 while. Root cause: the previous patch (7.3.1) made the stealthy browser lazy
-AND the search→browser path had been removed, so search was bare HTTP — when the
+AND the search→browser path had been removed, so search was bare HTTP  -  when the
 engines 429'd, the circuit breaker put them all in cooldown with no recovery
 path, returning 0 results.
 
@@ -651,12 +724,12 @@ shared by smart_fetch AND search**. No escalation (one transport per engine):
   heavy for the browser; Qwant's JSON API is tolerant).
 - **Parallel race:** all three engines start concurrently and the search returns
   the moment enough results have merged (cancelling laggards). ~1s when the HTTP
-  engines are healthy (the DDG browser render is cancelled early — it ran in
+  engines are healthy (the DDG browser render is cancelled early  -  it ran in
   parallel, not as a fallback), and the DDG browser still delivers (~3-5s) when
-  every HTTP engine 429s — so search is **never dead**.
+  every HTTP engine 429s  -  so search is **never dead**.
 - **Reverted the 7.3.1 lazy-browser mistake:** the stealthy browser is eager at
   startup again + persistent for the whole session (as before). One browser
-  total, shared by smart_fetch, screenshot, and search — no extra Chrome.
+  total, shared by smart_fetch, screenshot, and search  -  no extra Chrome.
 - Speed opts (no quality loss): parallel race with early return, wait_selector
   on the SERP result container (return at domcontentloaded, not full load),
   disable_resources on SERP renders, eager warm browser, result caching.
@@ -675,7 +748,7 @@ With both HTTP engines force-blocked, the DDG browser backbone still delivered
 
 The stealthy Patchright browser was eagerly prewarmed at server startup (for
 smart_fetch's anti-bot escalation), so a Chrome instance sat idle eating ~150MB
-RAM the moment the agent started — even though search is all-HTTP and never
+RAM the moment the agent started  -  even though search is all-HTTP and never
 needs a browser. The browser is now LAZY: it launches only on the first
 smart_fetch / screenshot / search-all-blocked-last-resort that actually needs
 it. Startup now warms only the cheap search-engine HTTP sessions + the neural
@@ -707,10 +780,10 @@ faster search, less garbage, and a smart (not brute-force) rate-limit bypass.
 #### Smart rate-limit bypass (not brute force)
 - **Per-engine stealthy escalation REMOVED.** Previously when DDG/Bing got a
   403/202, hound escalated THAT engine to the warm stealthy browser (a 2-5s
-  render) — the latency cut Dondai saw. Now a rate-limited engine just returns
+  render)  -  the latency cut Dondai saw. Now a rate-limited engine just returns
   its 403 in <1s and the other engines carry; no slow stealthy path in the
   common case. The stealthy browser is now a **search-wide last resort only**
-  (one stealthy DDG fetch, fired solely when ALL engines blocked and 0 results —
+  (one stealthy DDG fetch, fired solely when ALL engines blocked and 0 results  - 
   rare), preserving the anti-bot flagship move without taxing the common case.
 - **Hard per-engine deadline 8s -> 5s** (engines normally return 1-2s; the
   deadline is just a cap for the rare hang).
@@ -734,25 +807,25 @@ faster search, less garbage, and a smart (not brute-force) rate-limit bypass.
 
 Solves the rate-limiting problem once and for all WITHOUT trading away speed
 (no just-add-delays cheating). The unique new feature, built from scratch at zero
-fetch cost: **cross-engine consensus ranking** — a URL returned by several
+fetch cost: **cross-engine consensus ranking**  -  a URL returned by several
 independent engines is an authority signal no single-engine tool can produce.
 
 #### Engines
 - **Google REMOVED entirely.** It CAPTCHAs even via the stealthy browser, so it
   was removed rather than silently contributing nothing. `engines=['google']` is
   now rejected.
-- **Brave (web) ADDED as a default engine** — an independent 30B-page index that
+- **Brave (web) ADDED as a default engine**  -  an independent 30B-page index that
   breaks the DuckDuckGo~Bing 99%-overlap problem. The Brave Search API free tier
   was killed Feb 2026 (metered billing), so Hound scrapes the keyless web UI.
   curl_cffi/scrapling throws curl error 23 on search.brave.com (every
   fingerprint), but stdlib urllib returns 200 + 20 clean results, so Brave rides a
   urllib transport inside the resilience coordinator (still gets the pacer +
   circuit breaker; stdlib = lean installs get it too).
-- **Mojeek DROPPED** — 403s every HTTP client AND the stealthy Patchright browser
+- **Mojeek DROPPED**  -  403s every HTTP client AND the stealthy Patchright browser
   (IP-blocked). Unreliable + per-search browser render = a speed cost.
-- **Yahoo ADDED opt-in** — serves Bing's index from a different server, a
+- **Yahoo ADDED opt-in**  -  serves Bing's index from a different server, a
   redundancy source for Bing's index when bing.com rate-limits.
-- **DEFAULT_ENGINES = (duckduckgo, bing, brave)** — three independent index
+- **DEFAULT_ENGINES = (duckduckgo, bing, brave)**  -  three independent index
   families, all HTTP (no browser needed for the default pool, so search stays
   fast).
 - **Default max_results 9 -> 6.**
@@ -770,7 +843,7 @@ independent engines is an authority signal no single-engine tool can produce.
 
 #### Rate-limit resilience proven live
 - Three independent engines run in PARALLEL (wall-clock = max(slowest, 8s
-  deadline), same as two engines — no slowdown). When one rate-limits, the
+  deadline), same as two engines  -  no slowdown). When one rate-limits, the
   circuit breaker rests it (15-120s) and the other independent engines carry
   genuinely different results. Live test: 15 successive searches, Brave blocked
   on #11 -> DDG+Bing carried, 6 results every time, agent never saw a failure;
@@ -786,7 +859,7 @@ entirely (simpler). Neural is always the top reranker.
   the merge order (consensus + engine-position). `mode='keyword'` is now
   rejected. Lean installs (no model) fall back to cross-engine consensus +
   engine-position order (rerank_mode "merge"), no lexical rerank.
-- **Neural optimized — min-max normalize per query** (`reranker.rerank`): ms-marco
+- **Neural optimized  -  min-max normalize per query** (`reranker.rerank`): ms-marco
   sigmoid saturates (~1.0 for any clearly-relevant snippet) so raw scores cluster
   and can't discriminate; normalizing to 0..1 across the result set restores
   meaningful `relevance_score` spread. Ranking order unchanged (monotonic).
@@ -942,7 +1015,7 @@ someone else's cloud.
 Per a thorough external agent bug report (12 crawl issues, 14 PDF issues), both
 features were rebuilt to be best-in-class among free/OSS alternatives.
 
-#### smart_crawl — best-first + content-adaptive + normalized
+#### smart_crawl  -  best-first + content-adaptive + normalized
 - **Best-first priority queue** (was BFS). Discovered URLs are scored by focus
   relevance + content-likelihood (docs/guide/api boosted; login/submit/cart/
   admin penalized) + shallow-depth, so content pages are crawled before junk
@@ -962,7 +1035,7 @@ features were rebuilt to be best-in-class among free/OSS alternatives.
 - Overall **`deadline_ms`** (default 120000) so one slow page can't hang the
   crawl; partial results returned with `truncated_by_time`.
 
-#### PDF — CID auto-OCR + honest quality + ToC + metadata
+#### PDF  -  CID auto-OCR + honest quality + ToC + metadata
 - **CID-corruption auto-OCR (the flagship trick).** Fonts without a ToUnicode
   CMap make pdfplumber emit `(cid:71)(cid:302)...` garbage (figures/diagrams/
   math in academic papers), but the glyphs render correctly. Hound detects
@@ -1008,26 +1081,26 @@ features were rebuilt to be best-in-class among free/OSS alternatives.
 
 The flagship release. Hound goes from a fetch+search tool to a complete $0 local web-research server for AI agents: **crawl, fetch, anti-bot, PDF/OCR, page interaction, query-focused extraction, search+research, and agent-optimized responses** in one lean MCP install (6 tools, ~2K tokens). Free alternatives stop being comparable; only paid services (Bright Data, ZenRows, Firecrawl paid) can compete, and only on hard anti-bot at scale.
 
-### Added — `smart_crawl` (new tool)
+### Added  -  `smart_crawl` (new tool)
 - **Deep same-domain crawl.** BFS from a start URL up to a depth/page/token budget, returns each page as clean markdown with `content_ok`/`summary`. `discover_only=true` returns the URL map. `path_include`/`path_exclude` scope it. `focus` makes it a query-prioritized crawl (most relevant pages first within the budget, each page focus-filtered). Concurrency via a semaphore; one fetch per page reusing `smart_fetch`'s anti-bot + cache.
 
-### Added — OCR (scanned PDFs + image pages)
+### Added  -  OCR (scanned PDFs + image pages)
 - Scanned/image-only PDFs are auto-OCR'd with `rapidocr` v3 + `pypdfium2` (pure-pip, no system binary, Python 3.13-supported). Image-only web pages (`content-type: image/*`) are OCR'd to text. Auto-caps at the first 10 pages when no `pages` spec to avoid hangs on huge scanned PDFs. `[all]` extra += `pypdfium2>=4.30`, `rapidocr>=3.0`.
 
-### Added — query-focused extraction (`smart_fetch` `focus`)
+### Added  -  query-focused extraction (`smart_fetch` `focus`)
 - `smart_fetch(url, focus="...")` returns only the BM25-relevant blocks. Runs post-cache (one cached page serves any focus query), so it never triggers a re-fetch. 80%+ context cut on long pages. Re-pass the same `focus` when paginating.
 
-### Added — `smart_search` filters + research mode
+### Added  -  `smart_search` filters + research mode
 - Filters: `site`/`exclude_sites` (domain include/exclude via native TinyFish `site:`/`-site:` operators), `location`/`language` (geo), `page` (0-10). Cache key includes every filter.
 - **Research mode** (`fetch_content=true`): searches AND bulk-fetches the top-N high-relevance results' full content in one call (each via `smart_fetch`, so anti-bot/PDF/OCR/cache apply), returning a `ResearchResponseModel` with per-result `content_ok` + relevance. Replaces the 3-5 call search→fetch loop.
 
-### Added — page interaction (`smart_fetch` `actions`)
+### Added  -  page interaction (`smart_fetch` `actions`)
 - `actions=[{click},{fill},{press},{wait},{scroll},{wait_selector}]` run on the stealthy browser after load, before extraction. Reaches content behind a click, search form, "load more", or infinite scroll. Forces the stealthy tier, bypasses cache. Max 20 actions, per-action error isolation.
 
-### Added — metadata on every response
+### Added  -  metadata on every response
 - Every HTML fetch carries structured `metadata`: title, description, site_name, type, image, canonical, lang, published_time, author (OpenGraph + JSON-LD + canonical + `<title>`).
 
-### Added — opt-in media
+### Added  -  opt-in media
 - `include_media=true` populates `response.media` with up to 20 page image URLs (for multimodal agents). Empty by default to keep responses lean.
 
 ### Changed
@@ -1069,30 +1142,30 @@ The flagship release. Hound goes from a fetch+search tool to a complete $0 local
 
 The agent-effectiveness release. Hound now masters itself the moment it connects, reads PDFs, and tells the agent exactly what to do next. **Breaking:** the manual `open_session` / `close_session` / `list_sessions` MCP tools are removed (8 tools → 5); a single warm browser is managed automatically.
 
-### Added — flagship: PDF extraction
+### Added  -  flagship: PDF extraction
 - **`smart_fetch` now extracts PDFs to structured, agent-optimized markdown.** PDFs are detected by content-type or `%PDF` magic bytes and routed to a new `pdf_extractor` built on `pdfplumber` (MIT, no AGPL): multi-column reading order, real tables as markdown tables, font-size heading detection, de-hyphenated paragraphs, a metadata header (title/author/date/subject), and `--- Page N ---` markers for citation.
 - **`pages` param** (`"1-5"`, `"1,3,5-7"`) extracts a PDF subset to save tokens/time on big PDFs. **`password`** for encrypted PDFs. Both flow to the extractor via contextvars (task-local, bulk-safe); the cache key includes `pages` so subsets don't collide with full-PDF entries.
 - Honest PDF signals: scanned/image-only PDFs return `content_ok=false` + a "needs OCR" `next_action`; encrypted PDFs report and accept a password; not-a-PDF/empty/corrupt are reported honestly.
 - `pdfplumber` added to `[all]` (lean install unaffected).
 
-### Added — connect-time mastery + actionable responses
+### Added  -  connect-time mastery + actionable responses
 - **MCP `instructions` at `initialize`.** A concise orientation (~365 tokens, paid once at handshake) gives the agent the 3-tool mental model, the #1 search→fetch workflow, and the known limits.
 - **Agent-facing response fields on every fetch:** `summary` (one-line status), `content_ok` (trust content only if true), `next_action` (the obvious next call: paginate / bypass robots / switch sources), `fetched_at` (ISO-8601 UTC).
 - **`smart_search` `fetch_relevance`** (high/med/low) per result + a `fetch_hint` so the agent fetches 1-2 results instead of all 10.
 - **Promoted `css_selector`, `max_content_chars`, `timeout`** to first-class `smart_fetch` params (were buried in the `options` bag). `max_content_chars` is a token-spend control. Units + defaults on every param description.
 
-### Changed — single warm browser instance
+### Changed  -  single warm browser instance
 - **Removed `open_session` / `close_session` / `list_sessions` MCP tools** (and the `list_sessions` method). `open_session`/`close_session` stay as internal helpers. Tool count 8 → 5.
 - **Eager warm-up at server startup** (was: pre-warm on first `smart_search`). The single stealthy Chrome launches when the harness starts the server, in parallel with the handshake.
 - **No second browser ever spawns**: a new `_auto_session_lock` serializes auto-session creation. Keep-alive-forever; graceful shutdown closes the browser when the harness closes.
 - `screenshot` now auto-manages a stealthy session (`session_id` optional); description clarifies it's for multimodal agents.
 
-### Changed — Reddit optimization hardened
+### Changed  -  Reddit optimization hardened
 - Reddit URLs now **skip HTTP and go straight to stealthy** (www.reddit.com walls HTTP; saves ~1s). The old.reddit.com rewrite runs before `force_fetcher` so a pinned `http` also benefits.
 - **Listing parser rewritten** to read per-post `data-*` attributes (was: span-scraping that misaligned scores/comment counts on real HTML, e.g. reported score 27 for a post whose real `data-score` was 28). Thing-block detection fixed for real HTML (`class=" thing"` has a leading space). HTML entities unescaped; promoted ads skipped; sticky/NSFW tagged; `1 comment` singular grammar; per-block span fallback for user-profile pages.
 - `rewrite_to_old_reddit` now rejects lookalikes (`notreddit.com`) standalone.
 
-### Fixed — caching + JS-shell detection
+### Fixed  -  caching + JS-shell detection
 - **Bad content is no longer cached.** `_finalize_result` previously cached JS shells / bot challenges / error statuses for the whole TTL, and the cache-hit path didn't restore `error`, so `content_ok` came back `true` and the agent trusted broken cached pages. New `_is_cacheable`: cache only clean, non-blank, <400 content.
 - **Cache size cap + oldest eviction** (`MAX_CACHE_ENTRIES = 10000`) so a long-lived agent's DB can't grow unbounded.
 - **Search cache key includes `max_results`** (was: a 5-result and 10-result search collided on one cached entry).
@@ -1106,13 +1179,13 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ## [3.6.7] - 2026-06-18
 
 ### Fixed
-- **`hound -u` finally just works on Windows.** The root cause of every prior failed attempt: the running `hound -u` command IS `hound.exe` (a console-scripts launcher that spawns python.exe as a grandchild), so pip can't overwrite the launcher while it runs — and every attempt to "detect the running process and refuse" flagged the command's OWN launcher (its PID is a grandparent of the python process, unreachable via `os.getppid()`), making `hound -u` refuse to run on itself forever.
+- **`hound -u` finally just works on Windows.** The root cause of every prior failed attempt: the running `hound -u` command IS `hound.exe` (a console-scripts launcher that spawns python.exe as a grandchild), so pip can't overwrite the launcher while it runs  -  and every attempt to "detect the running process and refuse" flagged the command's OWN launcher (its PID is a grandparent of the python process, unreachable via `os.getppid()`), making `hound -u` refuse to run on itself forever.
 
-  The fix: `hound -u` now spawns a **detached console updater** — a child `python.exe` (NOT hound.exe) that inherits the same console window, waits ~2s for the `hound.exe` launcher to exit, then runs pip. With the launcher gone, `hound.exe` is free and pip replaces it cleanly. The child prints pip progress and the result to the same window, so the user sees everything. The child re-checks for a REAL hound MCP server only AFTER the launcher exits (so the current command's own launcher is never mistaken for a server — the false-positive that made `hound -u` refuse on itself).
+  The fix: `hound -u` now spawns a **detached console updater**  -  a child `python.exe` (NOT hound.exe) that inherits the same console window, waits ~2s for the `hound.exe` launcher to exit, then runs pip. With the launcher gone, `hound.exe` is free and pip replaces it cleanly. The child prints pip progress and the result to the same window, so the user sees everything. The child re-checks for a REAL hound MCP server only AFTER the launcher exits (so the current command's own launcher is never mistaken for a server  -  the false-positive that made `hound -u` refuse on itself).
 
   Verified end-to-end on Windows: `hound -u` (3.6.7 -> 3.6.8) replaced `hound.exe` with no manual kill, no lock error, full pip output visible, `hound -v` confirmed the new version.
 
-- **macOS/Linux:** no file lock, so pip runs synchronously. If a hound MCP server is running, `hound -u` warns that it will keep old code until restarted (but still proceeds — pip works on POSIX). No false refusal.
+- **macOS/Linux:** no file lock, so pip runs synchronously. If a hound MCP server is running, `hound -u` warns that it will keep old code until restarted (but still proceeds  -  pip works on POSIX). No false refusal.
 
 - Removed the broken upfront running-server refusal (it false-positived on the command's own launcher) and the harmful detached-fallback from 3.6.3 (which created metadata/binary mismatches). The new console updater is the primary mechanism on Windows.
 
@@ -1129,7 +1202,7 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 
 ### Fixed
 - **Bulletproof, platform-aware error messages on every `hound -u` / `hound -v` failure path.** No more silent no-ops or dead-ends. Every path now tells the user exactly what to do, with the correct command for their OS.
-- **Silent no-op detection (the bug that stranded users).** Previously, when pip returned 0 but `hound.exe` couldn't be replaced (a running hound MCP server holds it), `hound -u` just printed `Hound v<old>` after `Updating to v<new>...` — looking like success while nothing changed. Now `_do_update` re-reads the version after pip and, if it didn't advance, prints: "The upgrade to vX did not complete. hound.exe could not be replaced (a running hound MCP server likely holds it). Stop it: <platform stop cmd>, then re-run `hound -u`, or recover manually: pip install --force-reinstall --no-deps hound-mcp==X".
+- **Silent no-op detection (the bug that stranded users).** Previously, when pip returned 0 but `hound.exe` couldn't be replaced (a running hound MCP server holds it), `hound -u` just printed `Hound v<old>` after `Updating to v<new>...`  -  looking like success while nothing changed. Now `_do_update` re-reads the version after pip and, if it didn't advance, prints: "The upgrade to vX did not complete. hound.exe could not be replaced (a running hound MCP server likely holds it). Stop it: <platform stop cmd>, then re-run `hound -u`, or recover manually: pip install --force-reinstall --no-deps hound-mcp==X".
 - **Platform-aware recovery commands** via two helpers: `_stop_hound_cmd()` (`taskkill /IM hound.exe /F` on Windows, `pkill -f hound` on macOS/Linux) and `_reinstall_cmd(ver)` (`pip install --force-reinstall --no-deps hound-mcp==ver`, same everywhere). Every failure path (running server, file lock, pip error, timeout, silent no-op, corrupted metadata) prints both the stop command and the reinstall command.
 - **New failure paths covered with messages:**
   - PyPI unreachable (`hound -v` and `hound -u`): "couldn't reach PyPI to check for updates" + manual upgrade command.
@@ -1150,7 +1223,7 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 
 ### Fixed
 - **`hound -u` no longer creates a metadata/binary mismatch when a hound MCP server is running.** The 3.6.3 detached-background-updater fallback was actively harmful in the common case where hound runs as a long-lived MCP server: that server process holds `hound.exe` against replacement, so the detached updater's pip run installed the new package *metadata* but could NOT replace `hound.exe` (WinError 32 on `hound.exe -> hound.exe.deleteme`), leaving the install in a broken state where `hound -v` reported the new version but the binary was still the old one. Removed the detached fallback entirely.
-- **`hound -u` now refuses to update while another hound process is running.** `_other_hound_pids()` (cross-platform: `tasklist` on Windows, `ps` on macOS/Linux) detects other running hound launchers BEFORE pip is invoked. If any are found, `hound -u` prints their PIDs and the exact stop command (`taskkill /IM hound.exe /F` / `pkill -f hound`), then exits without touching pip — so a half-update is now impossible. This is the only reliable fix: a running hound MCP server holds the launcher, and no self-update trick can replace a file another process has locked.
+- **`hound -u` now refuses to update while another hound process is running.** `_other_hound_pids()` (cross-platform: `tasklist` on Windows, `ps` on macOS/Linux) detects other running hound launchers BEFORE pip is invoked. If any are found, `hound -u` prints their PIDs and the exact stop command (`taskkill /IM hound.exe /F` / `pkill -f hound`), then exits without touching pip  -  so a half-update is now impossible. This is the only reliable fix: a running hound MCP server holds the launcher, and no self-update trick can replace a file another process has locked.
 - **Honest pip-failure message.** If the running-process check misses something and pip still hits the file lock, `hound -u` now prints "hound.exe is locked by another process. Stop any running hound MCP server, then re-run: hound -u" instead of promising a background updater that would silently fail.
 
 ### Notes
@@ -1182,21 +1255,21 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 
 ### Fixed
 - **`hound -u` self-update hardened cross-platform with a bulletproof fallback.** The 3.6.2 fix (rename the running `hound.exe` aside so pip can replace it) is now wrapped in a two-layer updater that guarantees no user ever hits `WinError 32`:
-  - **Layer 1 — launcher staging (Windows):** `_stage_running_launcher()` renames `hound.exe` → `hound.exe.old` before pip runs (Windows allows renaming a running .exe even though it forbids overwriting it). pip then writes a fresh `hound.exe`. The `.old` is swept on the next launch by `_cleanup_old_launcher()`.
-  - **Layer 2 — detached fallback (Windows):** if staging fails (read-only install, unusual layout) AND pip still hits the file lock, `_spawn_detached_updater()` spawns a background child that waits for the current process to exit (releasing the lock) and then runs pip, logging the outcome to `~/.master_fetch_cache/hound_updater.log`.
+  - **Layer 1  -  launcher staging (Windows):** `_stage_running_launcher()` renames `hound.exe` → `hound.exe.old` before pip runs (Windows allows renaming a running .exe even though it forbids overwriting it). pip then writes a fresh `hound.exe`. The `.old` is swept on the next launch by `_cleanup_old_launcher()`.
+  - **Layer 2  -  detached fallback (Windows):** if staging fails (read-only install, unusual layout) AND pip still hits the file lock, `_spawn_detached_updater()` spawns a background child that waits for the current process to exit (releasing the lock) and then runs pip, logging the outcome to `~/.master_fetch_cache/hound_updater.log`.
   - **macOS/Linux:** no file lock exists, so staging is skipped entirely and pip runs synchronously. None of the Windows `.exe` logic is touched on POSIX.
 - **Every pip failure now prints the manual recovery command** (`python -m pip install --upgrade hound-mcp[all]`), so a user is never left without a path forward.
 - **Detached-updater generated script bug:** the child one-liner double-braced the `{r.returncode}` placeholder, which would have emitted a literal string instead of the pip result. Fixed and covered by a compile-check test so it can't regress silently.
 
 ### Notes
-- No new features. No public API changes. The codebase was audited end-to-end for platform-specific code: the only platform-conditional logic in the entire package is this updater section, all guarded by `sys.platform == "win32"`. Everything else (`cache`, `robots`, `security`, `server`, `trafilatura_extractor`, `reddit`, `search`) uses `Path.home()`, stdlib, and cross-platform deps (scrapling, aiosqlite, trafilatura, mcp, pydantic) — fully native on macOS/Linux/Windows.
+- No new features. No public API changes. The codebase was audited end-to-end for platform-specific code: the only platform-conditional logic in the entire package is this updater section, all guarded by `sys.platform == "win32"`. Everything else (`cache`, `robots`, `security`, `server`, `trafilatura_extractor`, `reddit`, `search`) uses `Path.home()`, stdlib, and cross-platform deps (scrapling, aiosqlite, trafilatura, mcp, pydantic)  -  fully native on macOS/Linux/Windows.
 - Verified end-to-end on Windows: staging moves the real `hound.exe` aside and real `pip` writes a fresh one (sha changed, returncode 0).
 - To get onto 3.6.3 from <=3.6.1 (broken updater), run pip directly once: `python -m pip install --upgrade hound-mcp[all]`. From 3.6.2+, `hound -u` works normally.
 
 ## [3.6.2] - 2026-06-17
 
 ### Fixed
-- **`hound -u` self-update failed on Windows with WinError 32**: `_do_update` ran `pip install --upgrade` *inside* the running `hound.exe` process, so Windows locked `hound.exe` against the very overwrite pip was attempting (`The process cannot access the file because it is being used by another process`). The fix stages the running launcher aside first: `hound.exe` is renamed to `hound.exe.old` before pip runs (Windows permits renaming a running .exe even though it forbids overwriting it), so pip can write a fresh `hound.exe`. The `.old` is swept on the next `hound` launch by `_cleanup_old_launcher()`. Non-Windows is unaffected (no file lock). If staging fails for any reason, the code falls through to the old behavior — no worse than before.
+- **`hound -u` self-update failed on Windows with WinError 32**: `_do_update` ran `pip install --upgrade` *inside* the running `hound.exe` process, so Windows locked `hound.exe` against the very overwrite pip was attempting (`The process cannot access the file because it is being used by another process`). The fix stages the running launcher aside first: `hound.exe` is renamed to `hound.exe.old` before pip runs (Windows permits renaming a running .exe even though it forbids overwriting it), so pip can write a fresh `hound.exe`. The `.old` is swept on the next `hound` launch by `_cleanup_old_launcher()`. Non-Windows is unaffected (no file lock). If staging fails for any reason, the code falls through to the old behavior  -  no worse than before.
 
 ### Notes
 - This is a Windows-only fix to the updater. **To get onto 3.6.2 from a version with the broken updater (<=3.6.1), run pip directly once** (not via `hound -u`), since `python.exe` running pip does not lock `hound.exe`:
@@ -1208,12 +1281,12 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ## [3.6.1] - 2026-06-17
 
 ### Fixed
-- **robots.txt scrapling fetch path was silently broken**: `_fetch_robots_txt` wrapped an async `sess.get()` coroutine in `asyncio.to_thread` and unpacked the result as a `(response, elapsed)` tuple. The coroutine was never awaited and the unpack always raised, so every robots.txt lookup fell through to the plain-urllib fallback — defeating the browser-impersonated fetch path entirely. Now awaits `sess.get()` directly and reads `response.body`. Impersonated requests reach sites that block stdlib urllib.
-- **`smart_fetch` bulk mode silently truncated URLs past `MAX_BULK_URLS`**: `_smart_fetch_bulk` dropped overflow URLs with `urls[:MAX_BULK_URLS]` and no warning — silent data loss. Now raises `ValueError` matching the single-URL and `bulk_get`/`bulk_fetch`/`bulk_stealthy_fetch` behavior.
+- **robots.txt scrapling fetch path was silently broken**: `_fetch_robots_txt` wrapped an async `sess.get()` coroutine in `asyncio.to_thread` and unpacked the result as a `(response, elapsed)` tuple. The coroutine was never awaited and the unpack always raised, so every robots.txt lookup fell through to the plain-urllib fallback  -  defeating the browser-impersonated fetch path entirely. Now awaits `sess.get()` directly and reads `response.body`. Impersonated requests reach sites that block stdlib urllib.
+- **`smart_fetch` bulk mode silently truncated URLs past `MAX_BULK_URLS`**: `_smart_fetch_bulk` dropped overflow URLs with `urls[:MAX_BULK_URLS]` and no warning  -  silent data loss. Now raises `ValueError` matching the single-URL and `bulk_get`/`bulk_fetch`/`bulk_stealthy_fetch` behavior.
 - **`force_fetcher="http"` ignored the caller's `timeout`**: the HTTP branch hardcoded `timeout=30` seconds. A caller asking for a 5s budget got 30s. Now passes `timeout=max(1, min(int(timeout/1000), 30))`. The auto-escalation HTTP tier now also honors the caller timeout instead of always using the 30s default.
 - **`validate_proxy` rejected `socks5`/`socks5h` dict proxies**: the dict path validated the `server` URL with `validate_url`, which only permits `http`/`https`, so `proxy={"server": "socks5://host:1080"}` was rejected even though the string form `socks5://host:1080` was accepted. Now uses the same `http/https/socks5/socks5h` scheme set as the string path (and still allows internal/local proxy hosts).
 - **`_safe_cookie_dict` leaked cookie values into logs**: the "missing name" warning logged the whole cookie dict, which may contain a sensitive `value`. Now logs a fixed message without the dict.
-- **`_http_with_retry` retried deterministic validation errors**: `SecurityError`/`ValueError` (bad URL, oversized response body, blocked scheme) were retried 3x with exponential backoff — re-running the same deterministic failure (and, for oversized bodies, re-downloading them). Now surfaces validation errors immediately and retries only transport/network failures.
+- **`_http_with_retry` retried deterministic validation errors**: `SecurityError`/`ValueError` (bad URL, oversized response body, blocked scheme) were retried 3x with exponential backoff  -  re-running the same deterministic failure (and, for oversized bodies, re-downloading them). Now surfaces validation errors immediately and retries only transport/network failures.
 
 ### Removed (dead code)
 - **`domain_intel.py`** (207 lines): per-domain protection-level tracking was orphaned when v3.5.1 removed domain-intel routing from `smart_fetch`. No production code imported it; the `server.py` comment claiming it was "imported on demand for list_sessions stats only" was false. Removed the module, `tests/test_domain_intel.py`, and the domain-intel test classes/methods in `test_reliability_v3.py`.
@@ -1239,8 +1312,8 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 - **smart_fetch**: Reddit subreddit URLs (www.reddit.com, m.reddit.com, np.reddit.com) transparently rewritten to old.reddit.com before fetching. Individual post pages (/comments/...) are NOT rewritten to preserve full comment threads.
 
 ### Performance
-- Reddit subreddit fetch: 5-10s (was 12-15s) — 2x faster
-- Reddit page size: 134KB (was 1MB) — 7x smaller
+- Reddit subreddit fetch: 5-10s (was 12-15s)  -  2x faster
+- Reddit page size: 134KB (was 1MB)  -  7x smaller
 - Reddit extraction: 5,000+ chars structured (was 1,500 chars unstructured)
 - Reddit post pages: unchanged (preserves full comments)
 - Cached Reddit fetches: 21ms (unchanged)
@@ -1249,7 +1322,7 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ## [3.5.3] - 2026-06-13
 
 ### Fixed
-- **Cache schema upgrade**: `content_type` and `total_size_bytes` now persist through the SQLite cache (previously returned as empty string / 0 on cache hits, even though the live fetch populated them). `_ensure_db()` runs an idempotent `ALTER TABLE ADD COLUMN` migration on first access so users upgrading from 3.5.2 do not lose any cached entries — old rows get the new columns defaulted to `''` and `0`. Migration is safe to re-run; a `try/except` on `duplicate column name` makes it idempotent.
+- **Cache schema upgrade**: `content_type` and `total_size_bytes` now persist through the SQLite cache (previously returned as empty string / 0 on cache hits, even though the live fetch populated them). `_ensure_db()` runs an idempotent `ALTER TABLE ADD COLUMN` migration on first access so users upgrading from 3.5.2 do not lose any cached entries  -  old rows get the new columns defaulted to `''` and `0`. Migration is safe to re-run; a `try/except` on `duplicate column name` makes it idempotent.
 
 ### Notes
 - No behavior change for the live fetch path (HTTP/stealthy already populated these fields correctly). Cache hits and `cache_clear` descriptions are unchanged from a user-experience standpoint. New columns carry the existing `ResponseModel.content_type` / `ResponseModel.total_size_bytes` fields exactly.
@@ -1267,40 +1340,40 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ## [3.5.1] - 2026-06-08
 
 ### Added
-- **Pre-warm on smart_search**: Browser launches in background when the agent calls smart_search (always the first call). By the time smart_fetch runs, the browser is warm. No race condition — search is API-only, doesn't touch the browser.
+- **Pre-warm on smart_search**: Browser launches in background when the agent calls smart_search (always the first call). By the time smart_fetch runs, the browser is warm. No race condition  -  search is API-only, doesn't touch the browser.
 - **Browser stays alive**: Idle timeout set to 0 (keep forever). Browser sits at idle consuming minimal RAM, wakes instantly when stealthy fetch needs it, returns to idle after. No cold starts after the first search.
 
 ## [3.5.0] - 2026-06-08
 
 ### Changed
 - **Ripped out Phase A/B/C domain intel routing**: No more "high", "low", "none" domain levels deciding which fetcher to use. The algorithm is now dead simple: try HTTP first. If it fails, use stealthy. That's it. Every URL gets the same treatment. HTTP is fast (~1s), stealthy handles everything else. No more stale domain intel forcing sites through slow browser paths when HTTP would work fine.
-- **Removed dynamic (Playwright) tier entirely**: One browser engine (Patchright/stealthy). No second Chrome instance possible. `force_fetcher="dynamic"` now routes to stealthy — Patchright handles everything Playwright does.
+- **Removed dynamic (Playwright) tier entirely**: One browser engine (Patchright/stealthy). No second Chrome instance possible. `force_fetcher="dynamic"` now routes to stealthy  -  Patchright handles everything Playwright does.
 
 ### Added
-- **Post-HTTP pre-warming**: After a successful HTTP fetch, the stealthy browser starts in the background. No race condition — the current call is already done. The next call that needs a browser finds it warm and ready. Zero cold-start on second fetch.
+- **Post-HTTP pre-warming**: After a successful HTTP fetch, the stealthy browser starts in the background. No race condition  -  the current call is already done. The next call that needs a browser finds it warm and ready. Zero cold-start on second fetch.
 
 ## [3.4.1] - 2026-06-08
 
 ### Fixed
-- **Removed browser pre-warming (caused two-Chrome bug + slowness)**: Pre-warming created a stealthy session in the background on first smart_fetch call. This raced with Phase B: if Phase B started before pre-warming completed, it created a dynamic session, then pre-warming created a stealthy session — both lived indefinitely. Pre-warming also made stealthy always-alive, causing Phase B to always take the stealthy shortcut (slower than dynamic for simple JS rendering). Removed entirely.
-- **Dynamic session close is now non-blocking**: `_close_auto_dynamic_session()` was `await`-ed in the fetch path, blocking the actual fetch while Chrome shut down. Now fires as `asyncio.create_task()` — the close happens in background, the fetch proceeds immediately.
+- **Removed browser pre-warming (caused two-Chrome bug + slowness)**: Pre-warming created a stealthy session in the background on first smart_fetch call. This raced with Phase B: if Phase B started before pre-warming completed, it created a dynamic session, then pre-warming created a stealthy session  -  both lived indefinitely. Pre-warming also made stealthy always-alive, causing Phase B to always take the stealthy shortcut (slower than dynamic for simple JS rendering). Removed entirely.
+- **Dynamic session close is now non-blocking**: `_close_auto_dynamic_session()` was `await`-ed in the fetch path, blocking the actual fetch while Chrome shut down. Now fires as `asyncio.create_task()`  -  the close happens in background, the fetch proceeds immediately.
 
 ## [3.4.0] - 2026-06-08
 
 ### Fixed
-- **Double Chrome instance after auto-escalation**: When Phase B or C escalated from dynamic to stealthy, the dynamic auto session was never closed. Result: two Chrome processes (Playwright + Patchright) consuming ~300MB RAM combined. Added `_close_auto_dynamic_session()` to atomically close the dynamic session whenever a stealthy auto session is created. Patchright handles everything Playwright does — no reason to keep both.
+- **Double Chrome instance after auto-escalation**: When Phase B or C escalated from dynamic to stealthy, the dynamic auto session was never closed. Result: two Chrome processes (Playwright + Patchright) consuming ~300MB RAM combined. Added `_close_auto_dynamic_session()` to atomically close the dynamic session whenever a stealthy auto session is created. Patchright handles everything Playwright does  -  no reason to keep both.
 
 ### Changed
 - **Phase C (unknown domain) skips dynamic tier**: HTTP → Stealthy directly instead of HTTP → Dynamic → Stealthy. For unknown domains, trying dynamic first wastes 3-5s launching a browser that will likely need escalation anyway, and leaves an orphan Chrome process. Cuts worst-case first-fetch latency from ~12s to ~7s.
 
 ### Added
-- **Browser pre-warming**: Stealthy Chrome launches in the background on the first `smart_fetch`, `open_session`, or `screenshot` call. By the time a follow-up fetch or escalation needs it, the browser is already warm — eliminating the 3-5s cold-start penalty on subsequent calls. Fire-and-forget, fails silently.
+- **Browser pre-warming**: Stealthy Chrome launches in the background on the first `smart_fetch`, `open_session`, or `screenshot` call. By the time a follow-up fetch or escalation needs it, the browser is already warm  -  eliminating the 3-5s cold-start penalty on subsequent calls. Fire-and-forget, fails silently.
 
 ## [3.3.1] - 2026-06-07
 
 ### Changed
-- **smart_fetch description**: Added "USE THIS whenever you need information from the web — this is your web access" to make agents recognize it as their primary web tool, not an optional utility.
-- **smart_search description**: Added "Search finds links — descriptions are NOT enough to answer questions. ALWAYS fetch the result URL with smart_fetch for full content" to prevent agents from answering based on search snippets alone.
+- **smart_fetch description**: Added "USE THIS whenever you need information from the web  -  this is your web access" to make agents recognize it as their primary web tool, not an optional utility.
+- **smart_search description**: Added "Search finds links  -  descriptions are NOT enough to answer questions. ALWAYS fetch the result URL with smart_fetch for full content" to prevent agents from answering based on search snippets alone.
 
 ## [3.3.0] - 2026-06-07
 
@@ -1319,8 +1392,8 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ## [3.2.0] - 2026-06-07
 
 ### Fixed
-- **Double-chunking regression**: `bulk_get`, `bulk_fetch`, `bulk_stealthy_fetch` were applying `_apply_chunking` internally, then `_finalize_result` chunked again. Result: 148KB JSON appeared as 40KB because chunking ran twice. Removed chunking from bulk methods — only `_finalize_result` (single-URL path) and `_smart_fetch_bulk` (bulk path) apply chunking once.
-- **Cache now stores unchunked content**: Since bulk methods no longer chunk, cache stores full extracted content. Offset-based pagination now works correctly — the second call with `offset=40000` gets the correct remaining content instead of the first chunk again.
+- **Double-chunking regression**: `bulk_get`, `bulk_fetch`, `bulk_stealthy_fetch` were applying `_apply_chunking` internally, then `_finalize_result` chunked again. Result: 148KB JSON appeared as 40KB because chunking ran twice. Removed chunking from bulk methods  -  only `_finalize_result` (single-URL path) and `_smart_fetch_bulk` (bulk path) apply chunking once.
+- **Cache now stores unchunked content**: Since bulk methods no longer chunk, cache stores full extracted content. Offset-based pagination now works correctly  -  the second call with `offset=40000` gets the correct remaining content instead of the first chunk again.
 
 ## [3.1.0] - 2026-06-07
 
@@ -1415,7 +1488,7 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 ### Fixed
 - **MCP server now starts in <3s instead of 5-10s.** Scrapling/playwright imports deferred to first tool call. Before: OpenCode and other clients timed out waiting for `initialize` response (default 5s timeout). Now: server responds instantly, heavy deps load on first `smart_fetch`/`smart_search` call.
 - `serverInfo.version` in MCP handshake now shows Hound version (e.g. `2.9.0`) instead of MCP SDK version (`1.27.0`)
-- `NameError: name 'sys' is not defined` in `smart_fetch` and `open_session` — missing import in lazy loader
+- `NameError: name 'sys' is not defined` in `smart_fetch` and `open_session`  -  missing import in lazy loader
 
 ### Changed
 - Install flow: `pip install hound-mcp[all]` then `hound install` (Chromium setup). No more chicken-and-egg where `hound install` can't run before pip.
@@ -1440,7 +1513,7 @@ The agent-effectiveness release. Hound now masters itself the moment it connects
 
 ### Added
 - `ResponseModel` metadata: `content_type` (e.g. "text/html", "application/json"), `total_size_bytes`, `is_truncated`, `escalation_path` (e.g. "http→dynamic→stealthy"), `retry_count`
-- JSON responses detected and returned raw — no more trafilatura mangling
+- JSON responses detected and returned raw  -  no more trafilatura mangling
 - Agent-focused tool descriptions: "when to use", output shape, recovery hints
 - Actionable error messages with recovery tips ("Try: use smart_fetch for auto-escalation")
 

@@ -41,14 +41,15 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
-## ✨ New in 10.1.0
+## ✨ New in 10.2.0
 
-**A polished, professional CLI. And the tool that never gives up.**
+**A self-update that never bricks. Plus a polished CLI and a tool that never gives up.**
 
-- 🎨 **Beautiful cross-platform CLI.** `hound -v` shows a clean bordered version panel, `hound -u` runs a quiet one-line self-update (no pip wall), and `hound --help` is styled with a command cheat-sheet. Zero new dependencies: a stdlib-only renderer with color detection, Windows VT, `NO_COLOR` support, and Unicode/ASCII border fallback so it looks right on Linux, Windows, and macOS. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v10.1.0)
-- 🗄️ **Automatic Internet Archive recovery** (v10.0.0). When a live site hard-blocks your agent (404 / 451 / 500 / bot wall / auth wall), Hound silently pulls the page from the Wayback Machine's closest snapshot and returns it, dated and honestly marked (`source=archive.org`, `archived_at`). Fetched via the Wayback `id_` marker so the content is clean (no toolbar, original links). The only **free, keyless, zero-setup** fetch tool that does this. Opt out with `archive_fallback=false`.
-- 🧠 **Research-grade response envelope** (v10.0.0). Every `smart_fetch` carries `page_type` (article / docs / list / forum / auth_wall / paywall / ...), `content_age_days` + `is_stale` (from the page's own dates), and `source_type` + `is_official` (gov / edu / github / docs / ...). And `next_action` got a brain: a list page points to its top links, a stale article suggests a dated search, an auth wall suggests the archive. ~26µs per response.
-- 🔧 **Professional internals.** Truncation can no longer silently drop fields; cache hits return the full response; the dev test trap that ran stale code is gone. 693 tests.
+- 🛡️ **Brick-proof self-update + `hound doctor` + `hound --rollback`.** `hound -u` can no longer leave hound unusable. It updates with `--no-deps` (no heavy extras that fail mid-install), runs pip in a detached helper after the launcher exits (Windows can't overwrite a running .exe), frees the launcher via the rename trick, and **self-heals** a half-failed install. A surviving `~/.hound/repair.py` (outside site-packages) recovers from any brick with `python ~/.hound/repair.py`. `hound doctor` catches a half-broken install before it bricks; `hound --rollback` undoes a bad update. [Release notes →](https://github.com/dondai1234/master-fetch/releases/tag/v10.2.0)
+- 🎨 **Beautiful cross-platform CLI** (v10.1.0). `hound -v` shows a bordered version panel, `hound -u` runs a quiet one-line self-update, `hound --help` is styled. Zero deps: color detection, Windows VT, `NO_COLOR`, Unicode/ASCII border fallback.
+- 🗄️ **Automatic Internet Archive recovery** (v10.0.0). When a live site hard-blocks your agent (404, bot wall, paywall), Hound pulls the page from the Wayback Machine, dated and honestly marked (`source=archive.org`).
+- 🧠 **Research-grade response envelope** (v10.0.0). Every `smart_fetch` carries `page_type`, `content_age_days`/`is_stale`, `source_type`/`is_official`, and a smart `next_action`.
+- 🔧 **Professional internals.** 705 tests.
 
 ---
 
@@ -77,9 +78,13 @@ playwright install chromium         # the anti-detect browser engine
 Then point any MCP client at the `hound` command. No arguments, no keys, no env vars. See **[Install](#-install)** for the lean option and **[Tell your agent to install it](#-tell-your-agent-to-install-it)** for a copy-paste prompt.
 
 ```bash
-hound -v        # version + update status
-hound -u        # update to latest
+hound -v          # version + update status
+hound -u          # update to latest (brick-proof, self-healing)
+hound --doctor    # health check + fix advice
+hound --rollback  # undo the last update
 ```
+
+If `hound` ever breaks (a failed update, a locked launcher), recover with `python ~/.hound/repair.py`, or run `hound --doctor` to diagnose.
 
 ---
 
@@ -240,6 +245,26 @@ The lean install is fully functional: multi-engine keyless search with cross-bac
 | `HOUND_BROWSER_IDLE_TIMEOUT` | Seconds of browser idleness before the warm Chrome is closed entirely to free RAM (default 300, i.e. 5 min). The next fetch relaunches it in ~2s. Set to `0` to keep Chrome alive forever (old behavior). |
 
 No API keys or accounts are needed for anything: search is keyless and local.
+</details>
+
+<details>
+<summary><b>Updating, rolling back, and repairing</b></summary>
+
+```bash
+hound -u          # update to latest (brick-proof: --no-deps, detached helper, self-heal)
+hound --doctor    # health check: launcher, imports, metadata, deps, PyPI, repair script
+hound --rollback  # reinstall the version from before the last update
+```
+
+`hound -u` is designed to never brick the install. It updates with `--no-deps` (no heavy extras that fail mid-install); on Windows it runs pip in a detached helper after the launcher exits (Windows can't overwrite a running .exe), freeing the launcher via the rename trick. If a pip pass leaves the version unchanged, it self-heals with a `--force-reinstall --no-deps` pass.
+
+If `hound` is ever broken (a failed manual pip while a server held the launcher, a half-finished update), the safety net is a standalone script written outside site-packages on every update:
+
+```bash
+python ~/.hound/repair.py   # stops hound, force-reinstalls hound-mcp from PyPI, verifies
+```
+
+It survives because it is not part of the `hound-mcp` package, so a failed `pip uninstall` never removes it. `hound --doctor` diagnoses the install and tells you the right fix.
 </details>
 
 ---

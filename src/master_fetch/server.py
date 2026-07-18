@@ -2657,12 +2657,13 @@ class MasterFetchServer:
         Returns installed version, latest PyPI version, and whether Hound is up to date.
         Call this to check if you should tell the user to run: hound -u
         """
-        installed, latest, is_current = await asyncio_to_thread(_check_version)
+        from master_fetch import updater
+        installed, latest, is_current = await asyncio_to_thread(updater.check_version)
         # up_to_date: True if at or ahead of PyPI (no update needed)
         up_to_date = is_current if is_current is not None else True
         if not up_to_date and latest:
             try:
-                if _pad_version(installed) > _pad_version(latest):
+                if updater.pad_version(installed) > updater.pad_version(latest):
                     up_to_date = True
             except (ValueError, IndexError):
                 pass
@@ -3072,430 +3073,6 @@ class MasterFetchServer:
         else:
             raise ValueError(f"Unknown tool: {name}")
 
-def _check_version():
-    """Check installed version and compare with PyPI latest. Returns (installed, latest, is_current).
-
-    Note: Uses synchronous urllib (blocking). Acceptable because this is called
-    from the version tool which runs infrequently and is not latency-sensitive.
-    """
-    from importlib.metadata import version as _get_version
-    try:
-        installed = _get_version("hound-mcp")
-    except Exception:
-        installed = "unknown"
-
-    latest = None
-    try:
-        import json
-        from urllib.request import urlopen, Request
-        req = Request(
-            "https://pypi.org/pypi/hound-mcp/json",
-            headers={"User-Agent": "Hound/" + installed},
-        )
-        with urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-            latest = data.get("info", {}).get("version")
-    except Exception:
-        pass
-
-    return installed, latest, (latest == installed if latest else None)
-
-
-def _pad_version(v: str) -> tuple:
-    parts = v.split(".")
-    return tuple(int(p) for p in parts[:3])
-
-
-def _hound_launcher_path() -> str | None:
-    """Locate the installed hound launcher executable.
-
-    Cross-platform: returns the path to the launcher that `hound` resolves to
-    (hound.exe on Windows, a Python script named `hound` on macOS/Linux), or
-    None if it can't be found. Only meaningfully used on Windows for launcher
-    staging; on POSIX there is no file-lock so staging is unnecessary.
-    """
-    import shutil
-    # Primary: whatever 'hound' on PATH resolves to (what the user just ran).
-    candidate = shutil.which("hound")
-    if candidate and os.path.exists(candidate):
-        return candidate
-    # Windows fallback: the Scripts dir next to the running interpreter.
-    scripts_dir = os.path.join(os.path.dirname(sys.executable), "Scripts")
-    for name in ("hound.exe", "hound"):
-        fallback = os.path.join(scripts_dir, name)
-        if os.path.exists(fallback):
-            return fallback
-    # POSIX fallback: the bin dir next to the running interpreter.
-    posix_bin = os.path.dirname(sys.executable)
-    posix_fallback = os.path.join(posix_bin, "hound")
-    if os.path.exists(posix_fallback):
-        return posix_fallback
-    return None
-
-
-def _stage_running_launcher() -> str | None:
-    """Stage the running Windows launcher aside so pip can replace it.
-
-    Windows locks a running .exe against overwrite but permits renaming it.
-    Rename hound.exe -> hound.exe.old so `pip install --upgrade` can write a
-    fresh hound.exe. Returns the .old path on success, None otherwise.
-
-    No-op on non-Windows (POSIX has no file lock) and when the launcher
-    can't be located or renamed (read-only install). The .old is swept on
-    the next launch by _cleanup_old_launcher().
-    """
-    if sys.platform != "win32":
-        return None
-    exe = _hound_launcher_path()
-    if not exe or not exe.lower().endswith(".exe"):
-        return None
-    old = exe + ".old"
-    try:
-        if os.path.exists(old):
-            os.remove(old)
-    except OSError:
-        pass
-    try:
-        os.rename(exe, old)
-        return old
-    except OSError:
-        return None
-
-
-def _cleanup_old_launcher() -> None:
-    """Remove a stale hound.exe.old left by a previous self-update.
-
-    Windows locks the running .exe against deletion, so _stage_running_launcher
-    renames the live launcher to hound.exe.old before letting pip write a fresh
-    one. The .old can only be deleted once the process running from it has
-    exited, so we sweep it on the next launch instead. No-op on non-Windows.
-    """
-    if sys.platform != "win32":
-        return
-    exe = _hound_launcher_path()
-    if not exe:
-        return
-    old = exe + ".old"
-    try:
-        if os.path.exists(old):
-            os.remove(old)
-    except OSError:
-        # Still locked (another hound -u running concurrently) — leave it.
-        pass
-
-
-def _looks_like_file_lock_error(stderr: str) -> bool:
-    """Detect pip failure caused by a locked running launcher (WinError 32)."""
-    if not stderr:
-        return False
-    s = stderr.lower()
-    return ("winerror 32" in s or "being used by another process" in s
-            or "permission denied" in s and "hound" in s)
-
-
-def _other_hound_pids() -> list[int]:
-    """PIDs of OTHER running hound launcher processes (excludes this one).
-
-    Cross-platform. Detects a long-running hound MCP server that holds the
-    launcher (hound.exe on Windows, `hound` on POSIX) against an in-place
-    upgrade. Returns [] on detection failure (we never block the update just
-    because we couldn't enumerate processes — the pip-failure path handles it).
-    """
-    import subprocess
-    my_pid = os.getpid()
-    pids: list[int] = []
-    try:
-        if sys.platform == "win32":
-            out = subprocess.check_output(
-                ["tasklist", "/FI", "IMAGENAME eq hound.exe", "/FO", "CSV", "/NH"],
-                text=True, timeout=10, creationflags=0x08000000,  # CREATE_NO_WINDOW
-            )
-            for line in out.splitlines():
-                # Line: "hound.exe","PID","Session","SessionNum","Mem"
-                parts = [p.strip().strip('"') for p in line.split('","')]
-                if len(parts) >= 2 and parts[0].lower() == "hound.exe":
-                    try:
-                        pid = int(parts[1])
-                    except ValueError:
-                        continue
-                    if pid != my_pid:
-                        pids.append(pid)
-        else:
-            out = subprocess.check_output(["ps", "-eo", "pid=,comm="], text=True, timeout=10)
-            for line in out.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    pid_s, comm = line.split(None, 1)
-                    pid = int(pid_s)
-                except ValueError:
-                    continue
-                if os.path.basename(comm.strip()) == "hound" and pid != my_pid:
-                    pids.append(pid)
-    except Exception:
-        return []
-    return pids
-
-
-def _stop_hound_cmd() -> str:
-    """Platform command to stop all running hound launcher processes."""
-    if sys.platform == "win32":
-        return "taskkill /IM hound.exe /F"
-    return "pkill -f hound"
-
-
-def _reinstall_cmd(ver: str) -> str:
-    """Platform pip command to force-reinstall a specific hound-mcp version."""
-    return f"pip install --force-reinstall --no-deps hound-mcp=={ver}"
-
-
-def _spawn_console_updater(pip_cmd: list, target_ver: str) -> bool:
-    """Windows: spawn a child python.exe (NOT hound.exe) that inherits this
-    console, waits for the hound.exe launcher to exit, then runs pip.
-
-    This is the reliable fix for the self-update lock: the running `hound -u`
-    command IS hound.exe, so pip can't overwrite it while it runs. The child is
-    a separate python.exe that doesn't lock hound.exe; once the parent launcher
-    exits, hound.exe is free and pip replaces it. The child prints pip progress
-    and the result to the inherited console, so the user sees everything.
-
-    The child re-checks for a REAL running hound MCP server AFTER the parent
-    exits (by then the current command's launcher is gone, so no false positive
-    — unlike an upfront check, which can't distinguish the current launcher
-    from a server because the launcher is a grandparent of the python process).
-    Returns True if the child was spawned.
-    """
-    import subprocess
-    stop_cmd = _stop_hound_cmd()
-    reinstall = _reinstall_cmd(target_ver)
-    pip_repr = ", ".join(repr(c) for c in pip_cmd)
-    # Generated as source so the child has NO dependency on the about-to-be-
-    # replaced master_fetch package. Uses chr(34) for embedded quotes.
-    child_src = f'''import time, subprocess, sys, os
-time.sleep(2)  # let the parent hound.exe launcher exit and release the file
-
-# By now the parent has exited and the shell has reclaimed this console,
-# printing its prompt (e.g. the PowerShell prompt). Move to a fresh line below
-# it BEFORE we print, so our output does not overlap the prompt line (the
-# "ghost prompt" bug where "Running pip..." landed on top of the prompt).
-try:
-    sys.stdout.write(chr(10)); sys.stdout.flush()
-except Exception:
-    pass
-
-def _hound_pids():
-    my = os.getpid()
-    try:
-        o = subprocess.check_output(
-            ["tasklist", "/FI", "IMAGENAME eq hound.exe", "/FO", "CSV", "/NH"],
-            text=True, timeout=10, creationflags=0x08000000)
-    except Exception:
-        return []
-    out = []
-    for ln in o.splitlines():
-        ps = [x.strip().strip(chr(34)) for x in ln.split(chr(34) + "," + chr(34))]
-        if len(ps) >= 2 and ps[0].lower() == "hound.exe":
-            try:
-                pid = int(ps[1])
-            except ValueError:
-                continue
-            if pid != my:
-                out.append(pid)
-    return out
-
-others = _hound_pids()
-if others:
-    print("  Hound  cannot update - a hound MCP server holds the launcher:")
-    for p in others:
-        print("    PID %d" % p)
-    print("  stop it:  {stop_cmd}")
-    print("  then:  hound -u   (or recover:  {reinstall})")
-    sys.exit(1)
-
-r = subprocess.run([{pip_repr}])
-if r.returncode != 0:
-    print("  Hound  update failed (pip returned %d)" % r.returncode)
-    print("  stop any running hound server:  {stop_cmd}")
-    print("  or recover:  {reinstall}")
-    sys.exit(1)
-
-from importlib.metadata import version as _v
-try:
-    new_ver = _v("hound-mcp")
-except Exception:
-    new_ver = "unknown"
-target = {target_ver!r}
-def _pad(v):
-    try:
-        return tuple(int(x) for x in v.split(".")[:3])
-    except Exception:
-        return None
-np_, tp_ = _pad(new_ver), _pad(target)
-if new_ver == "unknown" or (np_ and tp_ and np_ < tp_):
-    print("  Hound  upgrade to v%s did not complete (a running server holds the launcher)" % target)
-    print("  stop it:  {stop_cmd}")
-    print("  then:  hound -u   (or recover:  {reinstall})")
-    sys.exit(1)
-print("  Hound  v" + new_ver + "  updated")
-'''
-    try:
-        # Inherit the parent console (no DETACHED / CREATE_NEW_PROCESS_GROUP)
-        # so the child's output appears in the same window after the parent exits.
-        subprocess.Popen([sys.executable, "-c", child_src])
-        return True
-    except Exception:
-        return False
-
-
-def _run_pip_sync(pip_cmd: list, target_ver: str) -> None:
-    """Run pip synchronously with bulletproof, platform-aware messaging.
-
-    Used on POSIX (no file lock) and as a Windows fallback if the detached
-    console updater can't be spawned. Detects a silent no-op (pip returns 0
-    but the version didn't advance) and every failure path. Clean one-line
-    status via cli_ui; pip itself is quiet (--quiet in pip_cmd).
-    """
-    from master_fetch import cli_ui as ui
-    import subprocess
-    try:
-        result = subprocess.run(pip_cmd, timeout=300)
-        rc = result.returncode
-    except subprocess.TimeoutExpired:
-        print("  " + ui.err("update timed out"))
-        print("  " + ui.warn("re-run") + "  " + ui.cmd("hound -u"))
-        print("  " + ui.warn("or recover") + "  " + ui.cmd(_reinstall_cmd(target_ver)))
-        sys.exit(1)
-    except Exception as e:
-        print("  " + ui.err(f"update failed: {e}"))
-        print("  " + ui.warn("recover") + "  " + ui.cmd(_reinstall_cmd(target_ver)))
-        sys.exit(1)
-    if rc != 0:
-        print("  " + ui.err(f"update failed (pip returned {rc})"))
-        print("  " + ui.warn("stop any running hound server") + "  " + ui.cmd(_stop_hound_cmd()))
-        print("  " + ui.warn("or recover") + "  " + ui.cmd(_reinstall_cmd(target_ver)))
-        sys.exit(1)
-    new_ver = _check_version()[0]
-    if new_ver == "unknown":
-        print("  " + ui.err("package metadata missing after update"))
-        print("  " + ui.warn("recover") + "  " + ui.cmd(_reinstall_cmd(target_ver)))
-        sys.exit(1)
-    try:
-        advanced = _pad_version(new_ver) >= _pad_version(target_ver)
-    except (ValueError, IndexError):
-        advanced = (new_ver == target_ver)
-    if not advanced:
-        print("  " + ui.err(f"upgrade to v{target_ver} did not complete (a running hound server holds the launcher)"))
-        print("  " + ui.warn("stop it") + "  " + ui.cmd(_stop_hound_cmd()))
-        print("  " + ui.warn("then") + "  " + ui.cmd("hound -u"))
-        print("  " + ui.warn("or recover") + "  " + ui.cmd(_reinstall_cmd(target_ver)))
-        sys.exit(1)
-    print(ui.branded(ui.ver(new_ver), ui.ok("updated")))
-
-
-def _do_update():
-    """Update hound-mcp via pip. Cross-platform; just works on Windows.
-
-    On Windows the running `hound -u` command IS hound.exe, so pip can't
-    overwrite the launcher while it runs. We spawn a child python.exe (not
-    hound.exe) that inherits the console, waits for the launcher to exit, then
-    runs pip — at which point hound.exe is free and pip replaces it. The child
-    prints pip progress and the result to the same window. It re-checks for a
-    real hound MCP server AFTER the launcher exits (so the current command's
-    own launcher is never mistaken for a server — the bug that made `hound -u`
-    refuse to run on itself).
-
-    On macOS/Linux there's no file lock, so pip runs synchronously. Other
-    hound processes don't block the file replace, but a running MCP server
-    keeps the old code in memory until restarted — we warn so the user knows.
-    Every failure path prints an actionable, platform-aware recovery command.
-    """
-    from master_fetch import cli_ui as ui
-    installed, latest, is_current = _check_version()
-
-    if installed == "unknown":
-        print(ui.branded(ui.red("install corrupted"), ui.dim("reinstalling to recover...")))
-
-    if not latest:
-        print(ui.branded(ui.ver(installed), ui.dim("couldn't reach PyPI")))
-        print("  " + ui.warn("check your connection, then") + "  " + ui.cmd("hound -u"))
-        return
-
-    try:
-        if _pad_version(installed) >= _pad_version(latest):
-            print(ui.branded(ui.ver(installed), ui.ok("up to date")))
-            return
-    except (ValueError, IndexError):
-        # installed is "unknown" or unparseable — fall through and reinstall.
-        pass
-
-    # Quiet pip: no progress-bar wall. We print our own clean status lines; on
-    # failure we surface a clean error + the manual recovery command.
-    pip_cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "hound-mcp[all]",
-               "--quiet", "--no-cache-dir", "--disable-pip-version-check",
-               "--no-python-version-warning"]
-
-    if sys.platform == "win32":
-        if _spawn_console_updater(pip_cmd, latest):
-            print(ui.branded(ui.ver_transition(installed, latest), ui.dim("updating...")))
-            print("  " + ui.dim("(finishes in this window once this command exits)"))
-            return
-        # Spawn failed — best-effort synchronous attempt with honest messaging.
-        print(ui.branded(ui.ver_transition(installed, latest), ui.dim("updating...")))
-        _run_pip_sync(pip_cmd, latest)
-        return
-
-    # POSIX: no file lock. Run pip synchronously. Warn about running servers
-    # (they'll keep old code until restarted) but don't refuse — pip works.
-    others = _other_hound_pids()
-    if others:
-        print(ui.branded(ui.dim("note"), ui.dim(f"{len(others)} other hound process(es) running - restart them after")))
-        for p in others:
-            print(f"    {ui.dim('PID')} {p}")
-    print(ui.branded(ui.ver_transition(installed, latest), ui.dim("updating...")))
-    _run_pip_sync(pip_cmd, latest)
-
-
-def _print_version() -> None:
-    """Render `hound -v`: a compact bordered version panel (or a clean error
-    panel when the install is corrupted)."""
-    from master_fetch import cli_ui as ui
-    W = 50
-    inner = W - 4
-    installed, latest, is_current = _check_version()
-    if installed == "unknown":
-        ver_cmd = latest or "<latest>"
-        body = [
-            ui.dim("package metadata is missing - a previous update was"),
-            ui.dim("interrupted. The launcher works, but pip lost the version."),
-            "",
-            ui.dim("recover with:"),
-            "  " + ui.cmd(f"pip install --force-reinstall --no-deps hound-mcp=={ver_cmd}"),
-        ]
-        print(ui.panel([ui.err("install corrupted")] + body, 62))
-        return
-    if latest is None:
-        print(ui.panel([
-            ui.lr(ui.wordmark(), "", inner),
-            ui.lr(ui.ver(installed), ui.dim("couldn't reach PyPI"), inner),
-        ], W))
-        print("  " + ui.warn("check your connection, then") + "  " + ui.cmd("hound -v"))
-        return
-    try:
-        up_to_date = _pad_version(installed) >= _pad_version(latest)
-    except (ValueError, IndexError):
-        up_to_date = bool(is_current)
-    if up_to_date:
-        print(ui.panel([
-            ui.lr(ui.wordmark(), "", inner),
-            ui.lr(ui.ver(installed), ui.ok("up to date"), inner),
-        ], W))
-    else:
-        print(ui.panel([
-            ui.lr(ui.wordmark(), "", inner),
-            ui.lr(ui.ver(installed), ui.magenta(f"v{latest} available"), inner),
-        ], W))
-        print("  " + ui.warn("update with") + "  " + ui.cmd("hound -u"))
 
 
 def _help_epilog() -> str:
@@ -3507,6 +3084,8 @@ def _help_epilog() -> str:
         f"  {ui.cyan('hound --http')}     {ui.dim('serve · streamable HTTP (Open WebUI), use --host/--port')}",
         f"  {ui.cyan('hound -v')}         {ui.dim('version + update check')}",
         f"  {ui.cyan('hound -u')}         {ui.dim('update to the latest version')}",
+        f"  {ui.cyan('hound --doctor')}   {ui.dim('health check + fix advice')}",
+        f"  {ui.cyan('hound --rollback')} {ui.dim('undo the last update')}",
         "",
         ui.dim("docs:") + "  " + ui.cyan("https://github.com/dondai1234/master-fetch"),
     ])
@@ -3515,6 +3094,7 @@ def _help_epilog() -> str:
 def main():
     """Entry point for the hound CLI."""
     from master_fetch import cli_ui as ui
+    from master_fetch import updater
     import argparse
     parser = argparse.ArgumentParser(
         prog="hound",
@@ -3534,21 +3114,30 @@ def main():
                         help="show version + update status")
     parser.add_argument("-u", "--update", action="store_true",
                         help="update hound to the latest version")
+    parser.add_argument("--doctor", action="store_true",
+                        help="diagnose the install and suggest fixes")
+    parser.add_argument("--rollback", action="store_true",
+                        help="reinstall the version from before the last update")
     args = parser.parse_args()
 
     # Sweep a stale launcher left by a previous `hound -u` (Windows only).
-    _cleanup_old_launcher()
+    updater.cleanup_old_launcher()
 
     if args.update:
-        _do_update()
+        updater.do_update()
         return
-
+    if args.rollback:
+        updater.rollback()
+        return
+    if args.doctor:
+        updater.doctor()
+        return
     if args.version:
-        _print_version()
+        updater.print_version()
         return
 
     # HTTP mode: stdout is free (not an MCP stdio pipe), so a one-line banner is
-    # safe. uvicorn follows with its own URL line. Stdio mode stays silent — any
+    # safe. uvicorn follows with its own URL line. Stdio mode stays silent - any
     # stdout/stderr noise corrupts the MCP protocol or reads as a crash.
     if args.http:
         print(ui.branded(ui.cyan("serving HTTP"), ui.dim(f"http://{args.host}:{args.port}/mcp")))
