@@ -219,16 +219,6 @@ def test_next_action_stale_article():
     assert "smart_search" in out.next_action
 
 
-def test_next_action_archive_source_wins_precedence():
-    # source=archive.org takes precedence over page_type branches.
-    r = _ok_result(source="archive.org", archived_at="2024-06-01", page_type="list")
-    out = _with_agent_hints(r)
-    assert "archive.org snapshot" in out.next_action
-    assert "2024-06-01" in out.next_action
-    # The list branch should NOT have fired:
-    assert "list page" not in out.next_action
-
-
 def test_next_action_fresh_article_no_hint():
     # A fresh, normal article with no special signal -> no envelope next_action.
     r = _ok_result(page_type="article", metadata={"published_time": "2026-07-10"})

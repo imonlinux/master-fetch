@@ -1,5 +1,38 @@
 # Changelog
 
+## [10.4.1] - 2026-07-20
+
+### Removed: Internet Archive fallback
+
+The archive fallback feature (auto-recover dead pages from the Wayback Machine)
+was removed. It was slow, unreliable in practice, and added latency to every
+hard-blocked fetch. Hard-blocks now return clean errors immediately instead of
+spending time querying archive.org.
+
+Removed:
+- `archive.py` module (213 lines)
+- `archive_fallback` parameter from smart_fetch
+- `archive_fallback` from tool defs + options schema + dispatch allowlist
+- `_ARCHIVE_FALLBACK` contextvar + `_ARCHIVE_ENABLED` env var (`HOUND_ARCHIVE_FALLBACK`)
+- `_is_archive_worthy` function
+- Archive.org branch in `_agent_hints` next_action logic
+- `test_v10_archive.py` (entire test file)
+- Archive-specific tests from `test_error_detection.py` and `test_v10_envelope.py`
+
+Kept: `source` and `archived_at` fields on ResponseModel (always default to
+`"live"` and `""` now; harmless, no behavior change for existing clients).
+
+### Added: hound --reinstall command
+
+Full reinstall with all deps + [all] extras, pinned to the latest PyPI version.
+Uses `--force-reinstall --no-deps` to avoid breaking transitive deps
+(pydantic vs pydantic-core version conflict).
+
+### Fixed: doctor [all] extras check
+
+Was checking `rapidocr_onnxruntime` (old v1 package name) instead of `rapidocr`
+(v3 import name). Now checks: onnxruntime, tokenizers, rapidocr.
+
 ## [10.4.0] - 2026-07-20
 
 ### Universal error detection: 4xx/5xx no longer treated as real content

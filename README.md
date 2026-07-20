@@ -47,6 +47,17 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
+## ✨ New in 10.4.1
+
+**Removed archive fallback + added hound --reinstall.**
+
+- 🗄️ **Removed Internet Archive fallback.** The archive recovery feature was slow and unreliable in practice. Hard-blocks now return clean errors immediately instead of spending time querying archive.org.
+- 🔧 **hound --reinstall.** Full reinstall with all deps + [all] extras, pinned to the latest PyPI version. Uses `--force-reinstall --no-deps` to avoid breaking transitive deps.
+- 🩺 **Fixed doctor [all] extras check.** Was checking `rapidocr_onnxruntime` (old v1 name) instead of `rapidocr` (v3). Now correctly detects installed extras.
+- 🔧 **Professional internals.** 705 tests.
+
+---
+
 ## ✨ New in 10.3.0
 
 **Optimized for AI agents + official Pi agent extension.**
@@ -77,8 +88,7 @@ Hound is one [MCP](https://modelcontextprotocol.io) server that gives any agent 
 - 🆓 **$0 forever, MIT**: no keys, no accounts, no per-request billing, no data routed to a third-party scraper. Search is keyless and local.
 - 🧠 **Mastered on connect**: a one-time `instructions` block hands the agent the mental model, the #1 workflow, and the known limits. Effective on turn one.
 - 📐 **~2.7K tokens, 6 tools**: hand-crafted tool defs, no Pydantic schema bloat. More capability than tools shipping 5K+.
-- 🎯 **Every response is actionable**: `content_ok`, `next_action`, `summary`, `page_type`, `content_age_days`/`is_stale`, `source_type`/`is_official`, `relevance_score`, `fetch_relevance`. Agents branch on structured fields, not error text. And when the live site blocks, `source=archive.org` tells them the content came from the Internet Archive.
-- 🗄️ **Never gives up.** A live hard-block (404, bot wall, paywall) is no longer a dead end. Hound auto-recovers the page from the Internet Archive, honestly marked with the snapshot date.
+- 🎯 **Every response is actionable**: `content_ok`, `next_action`, `summary`, `page_type`, `content_age_days`/`is_stale`, `source_type`/`is_official`, `relevance_score`, `fetch_relevance`. Agents branch on structured fields, not error text. Hard-blocks (404/bot/auth) return clean errors, not fake content.
 - 🛡️ **Production-safe startup + shutdown**: cold start under 1s so the MCP handshake never times out; exits 0 with clean stderr, no crash-like teardown noise.
 
 > Hound is for the agent itself. You install it once; the agent calls it whenever it needs the web.

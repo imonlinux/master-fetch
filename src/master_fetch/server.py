@@ -175,12 +175,6 @@ def _env_int(name: str, default: int) -> int:
 AUTO_SESSION_IDLE_TIMEOUT = _env_int("HOUND_BROWSER_IDLE_TIMEOUT", 300)
 IDLE_CHECK_INTERVAL = 60  # How often to check for idle sessions (seconds)
 
-# v10 archive fallback: when a live fetch hard-fails (404/451/500/network/
-# bot-block/auth), recover the page from the Internet Archive's closest snapshot.
-# Default ON (the headline resilience feature). Set HOUND_ARCHIVE_FALLBACK=0 to
-# disable globally. Per-call opt-out via the smart_fetch `archive_fallback` option.
-_ARCHIVE_ENABLED = os.environ.get("HOUND_ARCHIVE_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off", "")
-
 # MCP initialize `instructions` — injected into the agent's context ONCE on
 # connect by clients that support it. This is the connect-time mastery doc:
 # the #1 workflow, the gotchas, and when to use each tool. Kept tight (~300
@@ -188,7 +182,7 @@ _ARCHIVE_ENABLED = os.environ.get("HOUND_ARCHIVE_FALLBACK", "1").strip().lower()
 HOUND_INSTRUCTIONS = (
     "Hound = web access. 4 tools (+ cache_clear, version).\n"
     "\n"
-    "smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy). Text + metadata + signals (content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at). Hard-block (404/bot/auth) -> auto-recover from Internet Archive (source=archive.org + archived_at); archive_fallback=false to opt out.\n"
+    "smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy). Text + metadata + signals (content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at). Hard-block (404/bot/auth) -> clean error, not fake content.\n"
     "  Narrow: css_selector. Long page: offset/next_offset to paginate, or focus='query' for only relevant blocks (post-cache; re-pass when paginating). actions=[{click:..},{scroll:N},{fill:{selector,text}},{press:Enter},{wait:ms},{wait_selector:..}] for click/form/scroll (forces stealthy, bypasses cache). PDFs -> structured markdown + table_of_contents section-map [{level,title,page,end_page}] -> pass pages='23-31' for one section. Scanned/CID -> auto-OCR with [all] (quality_score 0-1). include_links=true -> response.links = {citations,navigation,external,primary_source}. Bulk: urls=[...]. cache_ttl=0 forces fresh.\n"
     "smart_search(query) - keyless web search (no API key). 10 backends in parallel (ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant + opt-in wikipedia,grokipedia), neural-reranked + cross-backend consensus. Returns URLs + ranking, NOT content -> smart_fetch the matches. Each result: relevance_score + fetch_relevance (high/med/low) + engines_consensus. related_queries from result titles+snippets. Blocked backends circuit-broken 60s. NEVER answer from snippets alone. Filters in options: site/exclude_sites, location/language/region, page (0-10), freshness (day|week|month|year).\n"
     "smart_crawl(url) - deep-crawl a site. Best-first same-domain walk; each page: markdown + content_ok + page_type. List pages -> structured link list. BIG SITES: options sitemap=true maps whole site from sitemap.xml in ONE fetch (URL list + lastmod); sitemap='auto' = use if present else BFS. discover_only=true = URL map only. focus='query' crawls relevant pages first + focus-filters each. crawl_urls=[...] fetches a chosen subset. Caps: max_pages (10), max_depth (2), max_total_chars, deadline_ms.\n"
@@ -196,7 +190,7 @@ HOUND_INSTRUCTIONS = (
     "\n"
     "#1 workflow: smart_search -> smart_fetch matching results -> synthesize with URLs.\n"
     "\n"
-    "Unbypassable live (no free tool beats): DataDome, Akamai, Cloudflare Turnstile. smart_fetch already auto-recovers hard-blocks from the Internet Archive; if it still fails (no snapshot), switch sources - don't retry same URL.\n"
+    "Unbypassable live (no free tool beats): DataDome, Akamai, Cloudflare Turnstile. smart_fetch gives clean errors on hard-blocks; switch sources - don't retry same URL.\n"
 )
 
 class ResponseModel(BaseModel):
@@ -229,7 +223,7 @@ class ResponseModel(BaseModel):
     table_of_contents: list = Field(default_factory=list, description="PDF section-map: outline/bookmarks as [{level, title, page, end_page}] when the PDF has a ToC; for PDFs without bookmarks, a heading-based map is built from font-size detection. page+end_page give a range per section so you can pass pages='X-Y' to grab one section. Empty for non-PDF or PDFs with no detectable headings.")
     # ─── v10 research-grade envelope (additive; all default-valued) ───
     # page_type: structural class of the page, computed from raw HTML. Drives
-    # next_action (list pages point to their links, auth walls suggest archive).
+    # next_action (list pages point to their links, auth walls suggest switching source).
     page_type: str = Field(default="unknown", description="Structural class: article|docs|list|forum|qa|pdf|js_shell|auth_wall|paywall|redirect|image|json|unknown. Drives next_action. 'list' = a page whose main content is links to other pages (fetch those or smart_crawl). 'auth_wall'/'paywall' = content behind login/payment.")
     # source_type + is_official: domain-based authority signal so the agent can
     # weigh trust without a separate lookup. Conservative: is_official is True
@@ -436,15 +430,6 @@ def _is_cacheable(result: ResponseModel) -> bool:
     return bool(result.content) and any(c.strip() for c in result.content)
 
 
-def _is_archive_worthy(result: ResponseModel) -> bool:
-    """True when a live fetch hard-failed in a way the Internet Archive can rescue.
-
-    Conservative: never on success, soft errors, or cases archive can't fix
-    (bad request, encrypted PDF). The caller also guards `result.source !=
-    'archive'` to prevent re-entry when finalizing an archive result.
-    """
-    if result.source != "live":  # only live results are archive-worthy; never recurse on a recovered source
-        return False
     err = (result.error or "").lower()
     if result.status == 404:      # page gone/deleted — archive goldmine
         return True
@@ -541,17 +526,11 @@ def _agent_hints(result: ResponseModel) -> tuple[str, str, bool]:
 
     # v10 envelope-driven next actions: fire ONLY when the fetch succeeded with
     # real content and no error-driven next_action already fired. Turn the
-    # envelope (source/page_type/freshness) into a concrete next step so the
-    # agent doesn't have to re-derive it. Precedence: archive-source > page
-    # structure (list/auth/paywall/redirect) > freshness.
+    # envelope (page_type/freshness) into a concrete next step so the
+    # agent doesn't have to re-derive it. Precedence: page structure
+    # (list/auth/paywall/redirect) > freshness.
     if not next_action and content_ok:
-        if result.source == "archive.org":
-            next_action = (
-                f"archive.org snapshot from {result.archived_at or 'unknown date'}; "
-                "the live site is blocking automated fetches — retry later or "
-                "use a different source for current data"
-            )
-        elif result.page_type == "list":
+        if result.page_type == "list":
             cits = (result.links or {}).get("citations") or []
             top = [c.get("url", "") for c in cits[:3] if isinstance(c, dict) and c.get("url")]
             if top:
@@ -718,11 +697,6 @@ _FOCUS: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_focus",
 # Opt-in: populate ResponseModel.media with the page's image URLs (multimodal).
 _INCLUDE_MEDIA: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_media", default=False)
 _INCLUDE_LINKS: contextvars.ContextVar[bool] = contextvars.ContextVar("_include_links", default=False)
-# v10 archive fallback opt-out (per-call). Default True. Set False to get the
-# raw live failure instead of an archive.org snapshot when the live site blocks.
-_ARCHIVE_FALLBACK: contextvars.ContextVar[bool] = contextvars.ContextVar("_archive_fallback", default=True)
-
-
 def _extract_pdf_response(body: bytes, raw_ct: str, total_size: int, url: str,
                           extraction_type: str, fetcher_used: str, duration_ms: float) -> ResponseModel:
     """Build a ResponseModel from a PDF body using the flagship extractor."""
@@ -1382,25 +1356,6 @@ class MasterFetchServer:
         that was duplicated 8+ times across smart_fetch.
         """
         result = _annotate_quality(result)
-        # v10: archive fallback for hard-fails. When the live tiers hard-blocked
-        # the page, recover it from the Internet Archive's closest snapshot
-        # (honestly marked source='archive.org'). Disabled by env or per-call
-        # opt-out. _is_archive_worthy guards re-entry (source='archive' -> False).
-        if (_ARCHIVE_ENABLED and _ARCHIVE_FALLBACK.get()
-                and result.source == "live" and _is_archive_worthy(result)):
-            from master_fetch.archive import try_archive_fallback
-            archived = await try_archive_fallback(
-                self, url, extraction_type, css_selector, cache_ttl,
-                pages=_PDF_PAGES.get(), max_chars=max_chars,
-            )
-            if archived is not None:
-                # Finalize the archive result: cache under the archive key +
-                # chunk + envelope. _is_archive_worthy(archived) is False
-                # (source='archive'), so this recursion terminates immediately.
-                return await self._finalize_result(
-                    archived, url, extraction_type, css_selector, cache_ttl,
-                    offset, max_chars,
-                )
         # Only cache CLEAN content. Caching JS shells / bot challenges / geo
         # redirects / error statuses would serve broken pages from cache for
         # the whole TTL (and the cache-hit path doesn't restore the error field,
@@ -2290,7 +2245,6 @@ class MasterFetchServer:
         actions: Annotated[Optional[List[Dict[str, Any]]], Field(description="Page interactions run on the stealthy browser AFTER load, BEFORE extraction: [{click:'button.load-more'}, {fill:{selector:'#q', text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'.item'}]. Forces the stealthy tier; bypasses cache. Reaches content behind a click/form/infinite scroll.")] = None,
         include_media: Annotated[bool, Field(description="If true, populate the response .media field with up to 20 image URLs found on the page (for multimodal agents). Default false (keeps responses lean).")] = False,
         include_links: Annotated[bool, Field(description="If true, populate the response .links field with the page's outgoing links classified as citations/navigation/external + a primary_source hint. Default false. Use when you want to follow a page's referenced sources in one step.")] = False,
-        archive_fallback: Annotated[bool, Field(description="If true (default), when the live site hard-blocks the fetch (404/451/500/bot-block/auth), recover the page from the Internet Archive's closest snapshot, honestly marked with source='archive.org' + archived_at. Set false to get the raw live failure instead.")] = True,
     ) -> ResponseModel:
         """Fetch a URL (or multiple URLs) with automatic anti-bot escalation.
 
@@ -2312,10 +2266,7 @@ class MasterFetchServer:
         is_truncated (+ next_offset to paginate), escalation_path, duration_ms, error.
         Signals to branch on: content_ok (real content, not a login/bot wall?), next_action
         (suggested next call), summary, page_type (article/docs/list/forum/auth_wall/paywall/...),
-        content_age_days + is_stale, source_type + is_official, source + archived_at. If the
-        live site hard-blocks (404/bot-wall/auth), content is auto-recovered from the Internet
-        Archive (source='archive.org', archived_at = snapshot date); archive_fallback=false
-        to opt out and get the raw live failure instead.
+        content_age_days + is_stale, source_type + is_official, source + archived_at.
         """
         # Bulk mode: fetch multiple URLs in parallel
         if urls is not None:
@@ -2355,7 +2306,6 @@ class MasterFetchServer:
             _FOCUS.set(focus)
         _INCLUDE_MEDIA.set(bool(include_media))
         _INCLUDE_LINKS.set(bool(include_links))
-        _ARCHIVE_FALLBACK.set(bool(archive_fallback))
         # actions produce post-interaction content unique to the action sequence;
         # bypass the cache so a plain (pre-action) cached copy is never served.
         if actions:
@@ -2799,7 +2749,7 @@ class MasterFetchServer:
     _TOOL_DEFS: list[dict] = [
         {
             "name": "mcp_smart_fetch",
-            "description": "Fetch a URL (or urls=[...] for parallel bulk). Auto HTTP -> stealthy escalation. Returns extracted text + metadata + signals: content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at. Hard-block (404/bot/auth) -> auto-recover from Internet Archive (source=archive.org, archived_at=snapshot date; archive_fallback=false in options to opt out). PDFs -> structured markdown + ToC + page ranges + auto-OCR. Long pages: paginate with offset/next_offset or focus='query' for only relevant blocks. actions=[...] for click/form/scroll. include_links/include_media via options.",
+            "description": "Fetch a URL (or urls=[...] for parallel bulk). Auto HTTP -> stealthy escalation. Returns extracted text + metadata + signals: content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at. Hard-block (404/bot/auth) -> clean error, not fake content. PDFs -> structured markdown + ToC + page ranges + auto-OCR. Long pages: paginate with offset/next_offset or focus='query' for only relevant blocks. actions=[...] for click/form/scroll. include_links/include_media via options.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2816,7 +2766,7 @@ class MasterFetchServer:
                     "password": {"type": "string", "description": "PDF only: password for an encrypted PDF."},
                     "focus": {"type": "string", "description": "Query-focused extraction: only BM25-relevant blocks returned. Context saver on long pages. Post-cache (no re-fetch). Re-pass same focus when paginating."},
                     "actions": {"type": "array", "description": "Page interactions on stealthy browser AFTER load, BEFORE extraction. Forces stealthy + bypasses cache. Each item: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'css'}. Use for load-more, search forms, pagination, infinite scroll."},
-                    "options": {"type": "object", "description": "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), archive_fallback (bool,true: recover from Internet Archive on hard-block; false=raw failure), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms,0), network_idle (bool,SPAs), headless (bool,true), respect_robots (bool,false), real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed).", "additionalProperties": True},
+                    "options": {"type": "object", "description": "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms,0), network_idle (bool,SPAs), headless (bool,true), respect_robots (bool,false), real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
@@ -3032,7 +2982,7 @@ class MasterFetchServer:
                 "proxy", "cookies", "extra_headers", "useragent",
                 "wait", "network_idle", "headless", "real_chrome", "respect_robots",
                 "main_content_only", "use_trafilatura", "solve_cloudflare", "block_webrtc", "hide_canvas",
-                "include_media", "include_links", "archive_fallback",
+                "include_media", "include_links",
             )}
             result = await self.smart_fetch(
                 url=url, urls=urls,

@@ -58,13 +58,6 @@ class TestIsCacheable:
 class TestFinalizeResultCaching:
     """_finalize_result must only persist clean content to the cache."""
 
-    @pytest.fixture(autouse=True)
-    def _disable_archive(self, monkeypatch):
-        # These tests assert CACHING behavior in isolation. The v10 archive
-        # fallback (which fires on 404/all_tiers_failed and would hit the real
-        # archive.org API) is tested separately in test_v10_archive.py.
-        monkeypatch.setattr(srv_mod, "_ARCHIVE_ENABLED", False)
-
     @pytest.fixture
     def mocked_set_cached(self):
         orig = srv_mod.set_cached

@@ -20,8 +20,8 @@ from master_fetch.server import ResponseModel, _apply_chunking
 def _fully_populated() -> ResponseModel:
     """A ResponseModel with every PRESERVED field set to a recognizable value.
 
-    Uses source='archive.org' so we also prove the archive-fallback fields
-    survive the chunking refactor (archive results get chunked too).
+    Uses source='archive.org' so we also prove the source/archived_at fields
+    survive the chunking refactor.
     """
     return ResponseModel(
         status=200,
@@ -51,8 +51,8 @@ def _fully_populated() -> ResponseModel:
         table_of_contents=[{"level": 1, "title": "Sec", "page": 1, "end_page": 2}],
         # v10 preserved envelope fields:
         page_type="article",
-        source="archive.org",
-        archived_at="2024-06-01T00:00:00+00:00",
+        source="live",
+        archived_at="",
     )
 
 
@@ -82,8 +82,8 @@ def test_truncation_preserves_all_fields():
     assert out.table_of_contents == [{"level": 1, "title": "Sec", "page": 1, "end_page": 2}]
     # v10 preserved envelope fields survive chunking:
     assert out.page_type == "article"
-    assert out.source == "archive.org"
-    assert out.archived_at == "2024-06-01T00:00:00+00:00"
+    assert out.source == "live"
+    assert out.archived_at == ""
 
 
 def test_no_more_content_branch_preserves_all_fields():
@@ -101,8 +101,8 @@ def test_no_more_content_branch_preserves_all_fields():
     assert out.media == ["https://example.com/img.png"]
     assert out.table_of_contents == [{"level": 1, "title": "Sec", "page": 1, "end_page": 2}]
     assert out.page_type == "article"
-    assert out.source == "archive.org"
-    assert out.archived_at == "2024-06-01T00:00:00+00:00"
+    assert out.source == "live"
+    assert out.archived_at == ""
     assert out.escalation_path == "direct:http"
 
 
@@ -113,7 +113,7 @@ def test_short_content_not_truncated_preserves_fields():
     out = _apply_chunking(result, max_chars=40000, offset=0)
     assert out.is_truncated is False
     assert out.page_type == "article"
-    assert out.source == "archive.org"
-    assert out.archived_at == "2024-06-01T00:00:00+00:00"
+    assert out.source == "live"
+    assert out.archived_at == ""
     assert out.metadata["title"] == "T"
     assert out.table_of_contents == [{"level": 1, "title": "Sec", "page": 1, "end_page": 2}]

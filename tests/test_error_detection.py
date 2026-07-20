@@ -4,7 +4,6 @@ so error pages are never treated as real content.
 Tests:
 - _detect_content_issue flags 4xx/5xx statuses
 - _is_cacheable rejects error pages (no caching broken content)
-- _is_archive_worthy still works for 404/451/500 (archive fallback)
 - _auto_escalate escalates 429/500/502 to stealthy (not just 403/503)
 - 200 with real content stays clean (no false positives)
 """
@@ -12,7 +11,6 @@ import pytest
 from master_fetch.server import (
     _detect_content_issue,
     _is_cacheable,
-    _is_archive_worthy,
     ResponseModel,
 )
 
@@ -70,19 +68,6 @@ class TestErrorDetection:
     def test_200_real_content_cached(self):
         r = self._make(200, content=["Real content here."], total_size_bytes=500)
         assert _is_cacheable(r)
-
-    def test_404_archive_worthy(self):
-        r = self._make(404)
-        assert _is_archive_worthy(r)
-
-    def test_429_not_archive_worthy(self):
-        """429 is rate limiting, not a dead page. Archive can't help."""
-        r = self._make(429)
-        assert not _is_archive_worthy(r)
-
-    def test_500_archive_worthy(self):
-        r = self._make(500)
-        assert _is_archive_worthy(r)
 
     def test_error_does_not_override_existing(self):
         """If error is already set (e.g. by fetcher), _annotate_quality won't override."""
