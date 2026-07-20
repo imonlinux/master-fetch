@@ -332,6 +332,43 @@ function pick(params: Record<string, any>, keys: string[]): Record<string, any> 
   return out;
 }
 
+// Map technical error strings from the hound server to clean, agent-friendly
+// messages. The server sets result.error for all failure modes; this function
+// translates it so the agent sees "Page doesn't exist (404)" instead of
+// "http_error_404: server returned error status".
+function cleanError(error: string, status?: number): string {
+  if (!error) return "";
+  const e = error.toLowerCase();
+  // HTTP status errors
+  if (e.includes("http_error_404") || status === 404) return "Page doesn't exist (404)";
+  if (e.includes("http_error_410") || status === 410) return "Page has been removed (410)";
+  if (e.includes("http_error_403") || status === 403) return "Access blocked by the site (403)";
+  if (e.includes("http_error_429") || status === 429) return "Rate limited by the site (429)";
+  if (e.includes("http_error_451") || status === 451) return "Page legally blocked (451)";
+  if (e.includes("http_error_401") || status === 401) return "Login required (401)";
+  if (e.includes("http_error_5") || (status && status >= 500)) return `Server error (${status})`;
+  if (e.includes("http_error_4") || (status && status >= 400 && status < 500)) return `Request failed (${status})`;
+  // Network errors
+  if (e.includes("network_error") || status === 0) return "Couldn't reach the site";
+  if (e.includes("timeout") || e.includes("timed out")) return "Request timed out";
+  // Content quality errors
+  if (e.includes("js_shell")) return "Page needs JavaScript (empty shell returned)";
+  if (e.includes("bot_challenge")) return "Blocked by bot protection (Cloudflare)";
+  if (e.includes("geo_redirect")) return "Page returned a region redirect";
+  if (e.includes("all_tiers_failed")) return "Couldn't fetch this page - all methods failed";
+  if (e.includes("auth_required")) return "Login required";
+  if (e.includes("robots_txt")) return "Blocked by robots.txt";
+  if (e.includes("encrypted_pdf")) return "PDF is password-protected";
+  if (e.includes("pdf_deps_missing")) return "PDF support not installed (run: pip install hound-mcp[all])";
+  if (e.includes("scanned_pdf")) return "Scanned PDF - needs OCR (install hound-mcp[all])";
+  if (e.includes("not_a_pdf")) return "File is not a PDF";
+  if (e.includes("pdf_open") || e.includes("pdf_extract")) return "Couldn't parse this PDF";
+  // Fallback: strip the technical prefix for anything unmapped
+  const colonIdx = error.indexOf(":");
+  if (colonIdx > 0) return error.slice(colonIdx + 1).trim();
+  return error;
+}
+
 // -- Extension --
 
 export default function (pi: ExtensionAPI) {
@@ -412,12 +449,13 @@ export default function (pi: ExtensionAPI) {
         const fetcher = parsed.fetcher_used ?? "";
         const src = parsed.source === "archive.org" ? ` | ARCHIVE ${parsed.archived_at ?? ""}` : "";
         // When the server signals an error (http_error_*, network_error, etc.)
-        // AND content_ok is false, show the error prominently instead of
-        // dumping the error page HTML as if it were real content.
+        // AND content_ok is false, show a clean error instead of dumping the
+        // error page HTML as if it were real content.
         if (parsed.error && parsed.content_ok === false && parsed.source !== "archive.org") {
+          const msg = cleanError(parsed.error, parsed.status);
           return {
-            content: [{ type: "text", text: `Fetch failed: ${parsed.error}\nURL: ${args.url ?? ""}${parsed.next_action ? `\nNext: ${parsed.next_action}` : ""}` }],
-            details: { url: args.url, error: parsed.error, content_ok: false, source: parsed.source ?? "live", status: parsed.status },
+            content: [{ type: "text", text: msg + (args.url ? `\nURL: ${args.url}` : "") + (parsed.next_action ? `\nNext: ${parsed.next_action}` : "") }],
+            details: { url: args.url, error: msg, content_ok: false, source: parsed.source ?? "live", status: parsed.status },
           };
         }
         return {
@@ -425,7 +463,16 @@ export default function (pi: ExtensionAPI) {
           details: { url: args.url, chars: content.length, content_ok: parsed.content_ok, truncated: !!parsed.is_truncated, source: parsed.source ?? "live" },
         };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `web_fetch error: ${e.message}` }], details: { error: e.message } };
+        const msg = e.message.includes("Hound not found") || e.message.includes("Hound failed")
+          ? e.message
+          : e.message.includes("timeout")
+          ? "Request timed out"
+          : e.message.includes("cancelled")
+          ? "Request cancelled"
+          : e.message.includes("Hound closed")
+          ? "Connection to hound lost"
+          : e.message;
+        return { content: [{ type: "text", text: msg }], details: { error: msg } };
       }
     },
     renderCall(args, theme) {
@@ -436,13 +483,12 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("dim", "fetching..."), 0, 0);
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       if (d?.content_ok === false) return new Text(theme.fg("error", "failed"), 0, 0);
       if (d?.bulk) return new Text(theme.fg("accent", `${d.ok}/${d.total} URLs`), 0, 0);
       const kb = ((d?.chars ?? 0) / 1024).toFixed(1);
       const src = d?.source === "archive.org" ? " (archive)" : "";
-      const warn = d?.content_ok === false ? " !" : "";
-      return new Text(theme.fg("accent", `${kb}KB${src}${warn}`), 0, 0);
+      return new Text(theme.fg("accent", `${kb}KB${src}`), 0, 0);
     },
   });
 
@@ -482,7 +528,8 @@ export default function (pi: ExtensionAPI) {
           details: { query: params.query, count: results.length, related: parsed.related_queries ?? [], blocked: parsed.engine_blocked ?? [] },
         };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `web_search error: ${e.message}` }], details: { error: e.message } };
+        const msg = e.message.includes("Hound not found") || e.message.includes("Hound failed") ? e.message : e.message.includes("timeout") ? "Search timed out" : e.message.includes("cancelled") ? "Search cancelled" : e.message.includes("Hound closed") ? "Connection to hound lost" : `Search failed: ${e.message}`;
+        return { content: [{ type: "text", text: msg }], details: { error: msg } };
       }
     },
     renderCall(args, theme) {
@@ -493,7 +540,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("dim", "searching..."), 0, 0);
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       if (!d?.count) return new Text(theme.fg("dim", "no results"), 0, 0);
       const rel = d.related?.length ? ` + ${d.related.length} related` : "";
       return new Text(theme.fg("accent", `${d.count} results${rel}`), 0, 0);
@@ -539,7 +586,8 @@ export default function (pi: ExtensionAPI) {
           details: { url: params.url, pages: pages.length, sitemap: !!parsed.sitemap_used },
         };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `web_crawl error: ${e.message}` }], details: { error: e.message } };
+        const msg = e.message.includes("Hound not found") || e.message.includes("Hound failed") ? e.message : e.message.includes("timeout") ? "Crawl timed out" : e.message.includes("cancelled") ? "Crawl cancelled" : e.message.includes("Hound closed") ? "Connection to hound lost" : `Crawl failed: ${e.message}`;
+        return { content: [{ type: "text", text: msg }], details: { error: msg } };
       }
     },
     renderCall(args, theme) {
@@ -551,7 +599,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("dim", "crawling..."), 0, 0);
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       const sm = d.sitemap ? " (sitemap)" : "";
       return new Text(theme.fg("accent", `${d.pages} pages${sm}`), 0, 0);
     },
@@ -585,7 +633,8 @@ export default function (pi: ExtensionAPI) {
           details: { url: params.url, images: 0, error: parsed.error ?? "" },
         };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `web_screenshot error: ${e.message}` }], details: { error: e.message } };
+        const msg = e.message.includes("Hound not found") || e.message.includes("Hound failed") ? e.message : e.message.includes("timeout") ? "Screenshot timed out" : e.message.includes("cancelled") ? "Screenshot cancelled" : e.message.includes("Hound closed") ? "Connection to hound lost" : `Screenshot failed: ${e.message}`;
+        return { content: [{ type: "text", text: msg }], details: { error: msg } };
       }
     },
     renderCall(args, theme) {
@@ -596,7 +645,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("dim", "capturing..."), 0, 0);
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       if (!d?.images) return new Text(theme.fg("dim", "no image"), 0, 0);
       return new Text(theme.fg("accent", `${d.images} image`), 0, 0);
     },
@@ -617,7 +666,7 @@ export default function (pi: ExtensionAPI) {
         const result = await hound.call("cache_clear", args, 10_000, signal);
         return { content: [{ type: "text", text: getText(result) }], details: { all: args.all } };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `cache_clear error: ${e.message}` }], details: { error: e.message } };
+        return { content: [{ type: "text", text: e.message.includes("Hound") ? e.message : `Cache clear failed: ${e.message}` }], details: { error: e.message } };
       }
     },
     renderCall(_args, theme) {
@@ -625,7 +674,7 @@ export default function (pi: ExtensionAPI) {
     },
     renderResult(result, _meta, theme) {
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       return new Text(theme.fg("accent", "cleared"), 0, 0);
     },
   });
@@ -658,7 +707,7 @@ export default function (pi: ExtensionAPI) {
             return { content: [{ type: "text", text: out }], details: { fallback: true, extension: EXTENSION_VERSION } };
           }
         } catch {}
-        return { content: [{ type: "text", text: `hound_version error: ${e.message}` }], details: { error: e.message, extension: EXTENSION_VERSION } };
+        return { content: [{ type: "text", text: e.message.includes("Hound") ? e.message : `Version check failed: ${e.message}` }], details: { error: e.message, extension: EXTENSION_VERSION } };
       }
     },
     renderCall(_args, theme) {
@@ -666,7 +715,7 @@ export default function (pi: ExtensionAPI) {
     },
     renderResult(result, _meta, theme) {
       const d = result.details as any;
-      if (d?.error) return new Text(theme.fg("error", `error: ${d.error}`), 0, 0);
+      if (d?.error) return new Text(theme.fg("error", `${d.error}`), 0, 0);
       return new Text(theme.fg("accent", "ok"), 0, 0);
     },
   });

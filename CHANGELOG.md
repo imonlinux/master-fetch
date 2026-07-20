@@ -1,5 +1,50 @@
 # Changelog
 
+## [10.4.0] - 2026-07-20
+
+### Universal error detection: 4xx/5xx no longer treated as real content
+
+**The problem:** A 404 error page (or any 4xx/5xx response) was returned with
+`error=""` and `content_ok=false`, but the error page HTML was still in the
+`content` field. AI agents would see the error page content and mistake it for
+real data. Worse, some error statuses (429, 500, 502) didn't trigger stealthy
+browser escalation, so the error page was the final result with no retry.
+
+**The fix (3 layers):**
+
+1. `_detect_content_issue`: any 4xx/5xx status now sets `result.error` to
+   `http_error_{status}: server returned error status`. The error field is the
+   universal signal agents check. Before, only JS shells, geo redirects, and
+   403/503 bot challenges set it.
+
+2. `_auto_escalate`: stealthy browser escalation broadened from 403/503 to also
+   include 429 (rate limited) and 500/502 (server error). The stealthy browser
+   has a different fingerprint and may avoid rate limits or intermittent server
+   errors. 404/410/451 don't escalate (page is gone, stealthy gets the same
+   result).
+
+3. Pi extension (`hound.ts`): when `error` is set AND `content_ok` is false AND
+   source is not `archive.org`, shows `Fetch failed: {error}` instead of dumping
+   the error page content as if it were real content. Archive-recovered content
+   still shows normally.
+
+22 new tests (`test_error_detection.py`). 727 total.
+
+### Pi extension v10.4.0 (hardening)
+
+- `HOUND_EXE` re-resolved lazily (was stale forever if hound installed after
+  extension load)
+- `AbortSignal` support in `call()` (Esc cancellation now propagates to hound)
+- Kill existing process before respawn (prevent orphaned subprocesses)
+- Extension version read from `package.json` (no hardcoded version strings)
+- `session_start` notification when hound not found or failed to start
+- Best-effort version sync check at session start (warns on major mismatch)
+- Fixed screenshot `promptSnippet` (`options.full_page`, not top-level)
+- `hound_version` formatted nicely + fallback to `hound --version`
+- Root `package.json` for git install (was missing, git install discovered
+  nothing)
+- `scripts/check_pi_extension_sync.py` dev tool (catches description drift)
+
 ## [10.3.0] - 2026-07-20
 
 ### Token-optimized tool definitions + official Pi agent extension
