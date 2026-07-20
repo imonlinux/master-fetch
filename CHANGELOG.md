@@ -1,5 +1,48 @@
 # Changelog
 
+## [10.3.0] - 2026-07-20
+
+### Token-optimized tool definitions + official Pi agent extension
+
+Two major improvements in this release:
+
+**1. Tool-definition token compression (29.6% reduction)**
+
+Compressed the MCP `tools/list` + `instructions` from 3,900 to 2,746 tokens
+(-1,154). Same information, tighter LLM language. Every functional fact the
+model needs to use the tools is preserved; the 27 test-required keywords all
+pass.
+
+- `instructions`: 878 -> 634 tokens (-28%)
+- `tools/list`: 3,022 -> 2,112 tokens (-30%)
+- Per-tool: web_fetch -31%, web_crawl -33%, web_search -40%
+
+**2. Fixed two v10 bugs in the client-visible tool descriptions**
+
+- The v10 envelope signals (page_type, content_age_days/is_stale, source_type,
+  is_official, source/archived_at) were in the internal method docstrings but
+  NOT in the client-visible `_TOOL_DEFS` descriptions (the low-level MCP server
+  sends `_TOOL_DEFS`, not docstrings). Now surfaced.
+- `archive_fallback` was advertised as an opt-out in the instructions but was
+  NOT wired through `_dispatch` — the method param always defaulted True, no
+  MCP client could disable archive fallback. Now wired through the dispatch
+  allowlist + documented in the options schema.
+
+**3. Official Pi agent extension**
+
+New `pi-extension/` directory ships a distributable Pi package that gives Pi
+users all 6 Hound tools as native Pi tools with TUI rendering. Install:
+
+```
+pip install hound-mcp[all]
+pi install git:github.com/dondai1234/master-fetch@v10.3.0
+```
+
+The extension spawns Hound as a singleton MCP subprocess (prewarmed at session
+start, zero re-launch cost per call). No generic MCP adapter needed.
+
+705 tests. No tool behavior, schema, or response-shape change.
+
 ## [10.2.1] - 2026-07-18
 
 ### Tool-description awareness (no behavior change)

@@ -186,24 +186,18 @@ _ARCHIVE_ENABLED = os.environ.get("HOUND_ARCHIVE_FALLBACK", "1").strip().lower()
 # the #1 workflow, the gotchas, and when to use each tool. Kept tight (~300
 # tokens) since it is paid once, not per-turn-per-tool.
 HOUND_INSTRUCTIONS = (
-    "Hound = web access for this agent. 4 tools (+ cache_clear, version) cover 95% of web work.\n"
+    "Hound = web access. 4 tools (+ cache_clear, version).\n"
     "\n"
-    "• smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy Patchright browser). Returns extracted text + metadata + honest signals (content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official). If the live site hard-blocks (404/bot-wall/auth), auto-recovers from the Internet Archive (source=archive.org + archived_at); archive_fallback=false to opt out.\n"
-    "  - Narrow to one section: css_selector (e.g. 'article', '.main').\n"
-    "  - Long page: is_truncated + next_offset -> call again with offset=next_offset. Or focus='query' to get only the BM25-relevant blocks (post-cache, no re-fetch; re-pass when paginating).\n"
-    "  - Behind a click/form/load-more/infinite-scroll: actions=[{click:'button.load-more'},{scroll:3},{fill:{selector:'#q',text:'x'}},{press:'Enter'}] (forces stealthy; runs after load, before extraction; bypasses cache).\n"
-    "  - PDFs: auto-extracted to structured markdown (tables/headings/metadata). table_of_contents carries a section-map [{level,title,page,end_page}] - pass pages='23-31' to grab one section by range. Scanned + CID-corrupted fonts auto-OCR with [all] (quality_score tells you how clean). pages='1-5' extracts a subset.\n"
-    "  - Want the page's sources? include_links=true -> response.links = {citations, navigation, external, primary_source}. citations are the main-content references (papers/primary docs/related reads) - follow them in one step.\n"
-    "  - Many URLs: urls=['a','b'] (parallel bulk). Raw HTML: extraction_type='html'. cache_ttl=0 forces fresh.\n"
-    "• smart_search(query) - find pages. Local + keyless (no API key, no account). 10 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia); ranks by neural relevance + cross-backend consensus. Returns URLs + ranking, NOT content - smart_fetch the ones that match. Each result: relevance_score + fetch_relevance (high/med/low) + engines_consensus (how many independent indexes agree). related_queries = follow-up queries mined from the results (search one to refine a broad query). Backends that CAPTCHA/rate-limit are circuit-broken for 60s so healthy ones aren't held back. NEVER answer from snippets alone. Filters in options: site/exclude_sites, location/language/region, page (0-10), freshness (day|week|month|year).\n"
-    "• smart_crawl(url) - read a whole site/section. Best-first same-domain crawl; each page: markdown + content_ok + page_type (article/list/js_shell). List pages (HN/aggregators) come back as a structured link list. BIG SITES: options sitemap=true maps the whole site from sitemap.xml in ONE fetch (full URL list + lastmod, no BFS); sitemap='auto' uses it if the site has one, else BFS. discover_only=true = URL map only. focus='query' crawls relevant pages first + focus-filters each. crawl_urls=[...] fetches a chosen subset. Caps: max_pages (default 10), max_depth (default 2), max_total_chars (token budget), deadline_ms.\n"
-    "• screenshot(url) - image capture. Multimodal agents only (content rendered as images/canvas/visual layout). Text agents: use smart_fetch instead.\n"
+    "smart_fetch(url) - get any page. Auto anti-bot (HTTP -> stealthy). Text + metadata + signals (content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at). Hard-block (404/bot/auth) -> auto-recover from Internet Archive (source=archive.org + archived_at); archive_fallback=false to opt out.\n"
+    "  Narrow: css_selector. Long page: offset/next_offset to paginate, or focus='query' for only relevant blocks (post-cache; re-pass when paginating). actions=[{click:..},{scroll:N},{fill:{selector,text}},{press:Enter},{wait:ms},{wait_selector:..}] for click/form/scroll (forces stealthy, bypasses cache). PDFs -> structured markdown + table_of_contents section-map [{level,title,page,end_page}] -> pass pages='23-31' for one section. Scanned/CID -> auto-OCR with [all] (quality_score 0-1). include_links=true -> response.links = {citations,navigation,external,primary_source}. Bulk: urls=[...]. cache_ttl=0 forces fresh.\n"
+    "smart_search(query) - keyless web search (no API key). 10 backends in parallel (ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant + opt-in wikipedia,grokipedia), neural-reranked + cross-backend consensus. Returns URLs + ranking, NOT content -> smart_fetch the matches. Each result: relevance_score + fetch_relevance (high/med/low) + engines_consensus. related_queries from result titles+snippets. Blocked backends circuit-broken 60s. NEVER answer from snippets alone. Filters in options: site/exclude_sites, location/language/region, page (0-10), freshness (day|week|month|year).\n"
+    "smart_crawl(url) - deep-crawl a site. Best-first same-domain walk; each page: markdown + content_ok + page_type. List pages -> structured link list. BIG SITES: options sitemap=true maps whole site from sitemap.xml in ONE fetch (URL list + lastmod); sitemap='auto' = use if present else BFS. discover_only=true = URL map only. focus='query' crawls relevant pages first + focus-filters each. crawl_urls=[...] fetches a chosen subset. Caps: max_pages (10), max_depth (2), max_total_chars, deadline_ms.\n"
+    "screenshot(url) - image capture. Multimodal agents only (content as images/canvas/visual layout). Text agents: use smart_fetch.\n"
     "\n"
-    "#1 workflow (answer a factual question): smart_search -> smart_fetch the results that match (relevance ranking is a hint, trust your judgment) -> synthesize, citing URLs.\n"
+    "#1 workflow: smart_search -> smart_fetch matching results -> synthesize with URLs.\n"
     "\n"
-    "Known unbypassable live (no free tool beats these): DataDome, Akamai, Cloudflare Turnstile (interactive). smart_fetch already auto-recovers hard-blocks from the Internet Archive; if it still fails (no snapshot), switch sources - do not retry the same URL.\n"
+    "Unbypassable live (no free tool beats): DataDome, Akamai, Cloudflare Turnstile. smart_fetch already auto-recovers hard-blocks from the Internet Archive; if it still fails (no snapshot), switch sources - don't retry same URL.\n"
 )
-
 
 class ResponseModel(BaseModel):
     """Request's response information structure."""
@@ -2789,71 +2783,71 @@ class MasterFetchServer:
     _TOOL_DEFS: list[dict] = [
         {
             "name": "mcp_smart_fetch",
-            "description": "Fetch any URL with full content extraction. USE THIS whenever you need information from the web: this is your web access. Auto http -> stealthy escalation (plain HTTP first, then Patchright anti-detect browser if blocked). Bulk: pass urls. Narrow to one section with css_selector. PDFs: auto-extracted to structured markdown (tables, headings, metadata); table_of_contents is a section-map [{level,title,page,end_page}] so you can pass pages='23-31' to grab one section by range and save tokens; scanned PDFs AND CID-corrupted fonts auto-OCR with [all]; response carries quality_score (0-1, trust PDF content more the closer to 1.0). Long pages: paginate with offset (pages through EXTRACTED text; use extraction_type=html for raw HTML). focus='query' returns only the BM25-relevant blocks (token saver on long pages; re-pass it when paginating). actions=[{click:..},{scroll:N},{fill:{selector,text}},{press:Enter},{wait:ms},{wait_selector:..}] for load-more / search forms / pagination / infinite scroll (forces stealthy, bypasses cache). include_links=true populates response.links with the page's outgoing links classified as citations (main-content references, the ones worth following) / navigation / external + a primary_source hint - use to follow a page's source chain in one step. Response signals: content_ok (trust content only if true), next_action (do this next if non-empty), summary (one-line status), is_truncated+next_offset (more content available). cache_ttl=0 bypasses cache.",
+            "description": "Fetch a URL (or urls=[...] for parallel bulk). Auto HTTP -> stealthy escalation. Returns extracted text + metadata + signals: content_ok, next_action, summary, page_type, content_age_days/is_stale, source_type/is_official, source/archived_at. Hard-block (404/bot/auth) -> auto-recover from Internet Archive (source=archive.org, archived_at=snapshot date; archive_fallback=false in options to opt out). PDFs -> structured markdown + ToC + page ranges + auto-OCR. Long pages: paginate with offset/next_offset or focus='query' for only relevant blocks. actions=[...] for click/form/scroll. include_links/include_media via options.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "URL to fetch"},
-                    "urls": {"type": "array", "items": {"type": "string"}, "description": "Multiple URLs (fetched in parallel; returns per-URL results)"},
+                    "urls": {"type": "array", "items": {"type": "string"}, "description": "Multiple URLs (parallel; returns per-URL results)"},
                     "extraction_type": {"type": "string", "enum": ["markdown", "html", "text", "article", "structured"], "description": "Content format (default markdown). html = raw HTML."},
-                    "css_selector": {"type": "string", "description": "CSS selector to narrow extracted content (e.g. 'article', '.main-content', '#post'). Big token/context saver."},
-                    "max_content_chars": {"type": "integer", "description": "Max chars of extracted content to return (default 40000; min 500). Lower = less context per call; the rest is paginated via offset/next_offset."},
-                    "timeout": {"type": "integer", "description": "Max request time in ms (default 30000). HTTP tier capped at 30s."},
+                    "css_selector": {"type": "string", "description": "CSS selector to narrow extracted content (e.g. 'article', '.main'). Token saver."},
+                    "max_content_chars": {"type": "integer", "description": "Max chars of extracted content (default 40000, min 500). Lower = less context; rest paginated via offset/next_offset."},
+                    "timeout": {"type": "integer", "description": "Max request time in ms (default 30000)."},
                     "cache_ttl": {"type": "integer", "description": "Cache seconds (default 3600). 0 = force fresh."},
-                    "force_fetcher": {"type": "string", "enum": ["http", "stealthy"], "description": "Pin to one tier and skip auto-escalation. 'http' = fast HTTP-only (fails on JS/bot walls). 'stealthy' = anti-detect browser. Default = auto http->stealthy."},
-                    "offset": {"type": "integer", "description": "Char offset into EXTRACTED text to resume a truncated page. Use next_offset from the previous response."},
-                    "pages": {"type": "string", "description": "PDF only: page spec like '1-5' or '1,3,5-7' to extract a subset (saves tokens/time on big PDFs). Use the table_of_contents section-map page/end_page ranges to pick. None = all pages."},
+                    "force_fetcher": {"type": "string", "enum": ["http", "stealthy"], "description": "Pin to one tier, skip auto-escalation. 'http' = fast HTTP-only (fails on JS/bot walls). 'stealthy' = anti-detect browser. Default = auto."},
+                    "offset": {"type": "integer", "description": "Char offset into extracted text to resume a truncated page. Use next_offset from previous response."},
+                    "pages": {"type": "string", "description": "PDF only: page spec like '1-5' or '1,3,5-7'. Use table_of_contents page/end_page ranges to pick. None = all pages."},
                     "password": {"type": "string", "description": "PDF only: password for an encrypted PDF."},
-                    "focus": {"type": "string", "description": "Query-focused extraction: pass a query and only the BM25-relevant blocks (paragraphs/headings/tables) are returned, a big context saver on long pages. Runs post-cache (no re-fetch). Re-pass the same focus when paginating with offset."},
-                    "actions": {"type": "array", "description": "Page interactions run on the stealthy browser AFTER load, BEFORE extraction. Forces stealthy tier + bypasses cache. Each item is one action: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'} (or {press:{selector:'css',key:'Enter'}}), {wait:500} (ms), {scroll:3} (viewport steps, triggers lazy/infinite scroll), {wait_selector:'css'}. Use for 'load more', search forms, pagination, infinite scroll."},
-                    "options": {"type": "object", "description": "include_links (bool, default false: populate response.links with the page's outgoing links classified as citations/navigation/external + a primary_source hint), include_media (bool, default false: populate response.media with up to 20 page image URLs for multimodal agents), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms, default 0), network_idle (bool, for SPAs), headless (bool, default true), respect_robots (bool, default false). Anti-detect tuning knobs (real_chrome, solve_cloudflare, block_webrtc, hide_canvas, main_content_only, use_trafilatura) are also accepted here and default to good values; most agents never need them.", "additionalProperties": True},
+                    "focus": {"type": "string", "description": "Query-focused extraction: only BM25-relevant blocks returned. Context saver on long pages. Post-cache (no re-fetch). Re-pass same focus when paginating."},
+                    "actions": {"type": "array", "description": "Page interactions on stealthy browser AFTER load, BEFORE extraction. Forces stealthy + bypasses cache. Each item: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'css'}. Use for load-more, search forms, pagination, infinite scroll."},
+                    "options": {"type": "object", "description": "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), archive_fallback (bool,true: recover from Internet Archive on hard-block; false=raw failure), proxy (str|dict), cookies (list), extra_headers (dict), useragent (str), wait (ms,0), network_idle (bool,SPAs), headless (bool,true), respect_robots (bool,false), real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         },
         {
             "name": "mcp_smart_crawl",
-            "description": "Deep-crawl a site from a start URL: best-first walk of same-domain links, returning each page as clean markdown with content_ok + page_type. Content-adaptive: article/docs pages -> main content; list/index pages (HN, aggregators, directories) -> a structured link list; JS shells -> detected and reported honestly. BIG SITES: options sitemap=true maps the whole site from its sitemap.xml in ONE fetch (returns the full URL list + lastmod, no BFS, no content) - collapses a hundreds-of-pages discovery crawl into one call; sitemap='auto' uses the sitemap if the site has one, else falls back to BFS. discover_only=true returns the URL map only (BFS-based). focus='query' prioritizes relevant pages within the budget AND focus-filters each page. crawl_urls=[...] fetches a chosen subset of discovered URLs (second-phase selective crawl, no re-discovery). Same-domain only by default; URLs normalized so /docs and /docs/ are not crawled twice. Caps: max_pages (default 10), max_depth (default 2), max_total_chars (token budget), deadline_ms (overall time, default 120000). Each page carries content_ok + status + fetched_at; check them. next_action tells you if the crawl stopped early. cache_ttl=0 forces fresh. Reuses smart_fetch anti-bot + cache.",
+            "description": "Deep-crawl a site: best-first same-domain walk, each page as markdown + content_ok + page_type. List pages -> structured link list. sitemap=true (in options) maps whole site from sitemap.xml in one fetch; sitemap='auto' = use if present else BFS. discover_only=true = URL map only. focus='query' prioritizes relevant pages + focus-filters each. crawl_urls=[...] fetches a chosen subset. Caps: max_pages (10), max_depth (2), max_total_chars, deadline_ms. Reuses smart_fetch anti-bot + cache.",
             "inputSchema": {
                 "type": "object", "required": ["url"],
                 "properties": {
                     "url": {"type": "string", "description": "Start URL (crawl stays on this domain)"},
-                    "discover_only": {"type": "boolean", "description": "true = return the URL map only, no page content (BFS map mode). Default false. For big sites prefer options sitemap=true instead (one-fetch map)."},
-                    "focus": {"type": "string", "description": "Query: prioritize crawling links relevant to this, and focus-filter each page's content. Big token saver on doc sites."},
-                    "crawl_urls": {"type": "array", "items": {"type": "string"}, "description": "A chosen subset of URLs to fetch (second-phase selective crawl, no re-discovery). Use after a sitemap=true or discover_only=true map."},
-                    "options": {"type": "object", "description": "sitemap (true|'auto'|false, default false: true = map the site from sitemap.xml in one fetch; 'auto' = use sitemap if present else BFS; false = BFS only), max_pages (1-100, default 10), max_depth (0-5, default 2), path_include (list of path prefixes to crawl, e.g. ['/docs']), path_exclude (list to skip), max_content_chars_per (default 8000), max_total_chars (token budget, default max_pages*per), concurrency (1-5, default 3), cache_ttl (seconds, default 3600; 0 = force fresh), respect_robots (bool, default false), force_fetcher ('http'|'stealthy'), timeout (ms per page, default 30000), deadline_ms (overall crawl time cap, default 120000)", "additionalProperties": True},
+                    "discover_only": {"type": "boolean", "description": "true = return URL map only, no page content. For big sites prefer options sitemap=true (one-fetch map)."},
+                    "focus": {"type": "string", "description": "Query: prioritize crawling links relevant to this + focus-filter each page. Token saver on doc sites."},
+                    "crawl_urls": {"type": "array", "items": {"type": "string"}, "description": "Chosen subset of URLs to fetch (second-phase selective crawl, no re-discovery). Use after sitemap=true or discover_only=true."},
+                    "options": {"type": "object", "description": "sitemap (true|'auto'|false,false: true=map from sitemap.xml in one fetch; 'auto'=use if present else BFS), max_pages (1-100,10), max_depth (0-5,2), path_include (list of path prefixes), path_exclude (list to skip), max_content_chars_per (8000), max_total_chars (token budget), concurrency (1-5,3), cache_ttl (3600;0=fresh), respect_robots (false), force_fetcher ('http'|'stealthy'), timeout (ms,30000), deadline_ms (120000).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         },
         {
             "name": "mcp_screenshot",
-            "description": "Capture a screenshot of a URL as an image. For MULTIMODAL agents only: use when content is rendered as images/canvas/image-of-text that text extraction can't read, or you need visual layout. Text-only agents: prefer smart_fetch. A stealthy browser session is auto-managed.",
+            "description": "Screenshot a URL as an image. Multimodal agents only (content as images/canvas/visual layout). Text agents: use smart_fetch. Stealthy browser auto-managed.",
             "inputSchema": {
                 "type": "object", "required": ["url"],
                 "properties": {
                     "url": {"type": "string", "description": "URL to screenshot"},
                     "session_id": {"type": "string", "description": "Optional: reuse a specific open browser session. Omit to auto-manage."},
-                    "options": {"type": "object", "description": "full_page (bool, default false), image_type (png|jpeg, default png), quality (0-100, jpeg only), wait (ms), wait_selector (css), network_idle (bool), timeout (ms, default 30000)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "full_page (bool,false), image_type (png|jpeg,png), quality (0-100,jpeg), wait (ms), wait_selector (css), network_idle (bool), timeout (ms,30000).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         },
         {
             "name": "mcp_smart_search",
-            "description": "Local keyless web search. No API key, no account. Runs 10 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant + opt-in wikipedia, grokipedia - INDEPENDENT indexes), merges + ranks by neural relevance + cross-backend consensus. Returns URLs + ranking, NOT page content - smart_fetch the results you want. Each result has relevance_score + fetch_relevance (high/med/low) + engines_consensus (how many independent indexes returned it - a free authority signal). related_queries = follow-up queries mined from the result titles+snippets (no LLM); search one to refine a broad query. The response carries summary + next_action (the obvious next call) + engine_blocked (backends that rate-limited/CAPTCHA'd/timed out - these are circuit-broken for 60s so they aren't retried immediately). NEVER answer from snippets alone: smart_fetch the results that match what you need (ranked by relevance + consensus; the ranking is a hint, use your judgment - a lower-ranked result can be the right one). Filters in options: site/exclude_sites (domain include/exclude), location/language/region (geo), page (0-10), freshness (day|week|month|year).",
+            "description": "Keyless web search (no API key). 10 backends in parallel (ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant + opt-in wikipedia,grokipedia), neural-reranked + cross-backend consensus. Returns URLs + ranking, NOT content -> smart_fetch the ones that match. Each result: relevance_score + fetch_relevance (high/med/low) + engines_consensus. related_queries from result titles+snippets. Blocked backends circuit-broken 60s. NEVER answer from snippets alone. Filters in options: site, exclude_sites, location, language, region, page, freshness.",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "options": {"type": "object", "description": "max_results (1-50, default 6), cache_ttl (seconds, default 300), mode (auto|neural|find_similar; default auto = neural rerank if hound-mcp[all]+model present, else cross-backend consensus + engine-position order; neural = same, explicit; find_similar needs url= and finds pages similar to it), engines (list, default = the full pool: duckduckgo, brave, mojeek, yahoo, yandex, startpage, google, qwant; add 'wikipedia' or 'grokipedia' for encyclopedic queries), site (domain to restrict, e.g. 'docs.python.org'), exclude_sites (list of domains to exclude), location (e.g. 'US'), language (2-letter code, e.g. 'en'), region (e.g. 'us-en'), page (0-10, pagination), freshness (day|week|month|year), url (for mode='find_similar': the source URL to find pages similar to)", "additionalProperties": True},
+                    "options": {"type": "object", "description": "max_results (1-50,6), cache_ttl (300), mode (auto|neural|find_similar; auto=neural if [all]+model else consensus; find_similar needs url=), engines (list, default: ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant; add 'wikipedia'/'grokipedia'), site (domain restrict), exclude_sites (list), location, language (2-letter), region, page (0-10), freshness (day|week|month|year), url (for find_similar).", "additionalProperties": True},
                 },
             },
             "annotations": {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": True},
         },
         {
             "name": "cache_clear",
-            "description": "Clear fetch cache. all=true wipes all (default: expired only). NOTE: to re-fetch ONE url fresh, pass cache_ttl=0 to smart_fetch/smart_crawl instead of clearing the whole cache. Cache stores extracted text per URL+extraction_type+css_selector+pages (+ per query+filters for search); default TTL 1hr.",
+            "description": "Clear fetch cache. all=true wipes all (default: expired only). To re-fetch one URL fresh, pass cache_ttl=0 to smart_fetch/smart_crawl instead. Cache stores extracted text per URL+extraction_type+css_selector+pages (+ per query+filters for search); default TTL 1hr.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3022,7 +3016,7 @@ class MasterFetchServer:
                 "proxy", "cookies", "extra_headers", "useragent",
                 "wait", "network_idle", "headless", "real_chrome", "respect_robots",
                 "main_content_only", "use_trafilatura", "solve_cloudflare", "block_webrtc", "hide_canvas",
-                "include_media", "include_links",
+                "include_media", "include_links", "archive_fallback",
             )}
             result = await self.smart_fetch(
                 url=url, urls=urls,
