@@ -42,7 +42,7 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 <div align="center"><b>Pi + Hound</b></div>
 
-<video src="https://github.com/dondai1234/master-fetch/releases/download/v10.4.0/hound-pi-demo.mp4" controls muted width="860"></video>
+<video src="https://github.com/user-attachments/assets/18b502c0-1e7b-4cb3-a730-074a9fbd0993" controls muted width="860"></video>
 
 
 ---
