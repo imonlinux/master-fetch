@@ -290,21 +290,15 @@ Install the Hound MCP server on this machine. Follow every step. Do not skip any
 <details>
 <summary><b>For Pi agent users</b></summary>
 
+Install the Hound MCP server, then the Pi extension:
+
+```bash
+pip install hound-mcp[all]
+pi install npm:@houndmcp/hound-mcp-pi
 ```
-Install the Hound MCP server. Follow every step. Do not skip any.
 
-1. Run: pip install hound-mcp[all]
-   Then run: playwright install chromium (But only if it isnt installed already, verify first about its existence)
-   If either fails, stop and tell the user.
+No API keys, no config file, no MCP adapter needed. The extension spawns `hound` as a singleton subprocess and registers all 6 tools (`web_fetch`, `web_search`, `web_crawl`, `web_screenshot`, `cache_clear`, `hound_version`) as native Pi tools. Prewarmed at session start. Run `/reload` to activate.
 
-2. Check pi-mcp-adapter: pi list. If not installed: pi install npm:pi-mcp-adapter
-
-3. Backup ~/.pi/agent/mcp.json, then add this inside mcpServers:
-   "hound": { "command": "hound", "transport": "stdio", "lifecycle": "eager" }
-   No API keys or environment variables are needed (search is keyless and local).
-
-4. Tell the user: "Run /reload, then /mcp to verify. smart_fetch, smart_crawl and smart_search should be available."
-```
 </details>
 
 <details>
