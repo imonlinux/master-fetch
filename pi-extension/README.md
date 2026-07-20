@@ -15,11 +15,29 @@ Hound web research for the Pi agent. Six native tools, all routed through a sing
 # 1. Install Hound (the MCP server / engine)
 pip install hound-mcp[all]
 
-# 2. Install this Pi extension
+# 2. Install this Pi extension (npm, auto-updates)
+pi install npm:@houndmcp/hound-mcp-pi
+```
+
+Alternatively, install from git (pins to a specific tag):
+
+```bash
 pi install git:github.com/dondai1234/master-fetch@v10.3.0
 ```
 
 That's it. The extension auto-discovers `hound` on your PATH, spawns it as a singleton subprocess, and prewarms it at session start. No API key, no account, no config file.
+
+## Updating
+
+```bash
+# Update Hound (the MCP server)
+hound -u
+
+# Update the Pi extension (if installed via npm, unpinned)
+pi update npm:@houndmcp/hound-mcp-pi
+```
+
+The extension checks at session start whether the installed Hound version matches the extension version. If they diverge by a major version, it warns you to update both.
 
 ## How it works
 

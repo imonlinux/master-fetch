@@ -15,7 +15,7 @@
  * resolved from PATH so it tracks the installed Hound version automatically.
  *
  * Install: pip install hound-mcp[all]
- * Then:    pi install git:github.com/dondai1234/master-fetch@v10.3.0
+ * Then:    pi install npm:@houndmcp/hound-mcp-pi
  */
 
 import { Type } from "typebox";
@@ -26,9 +26,24 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
 
-// -- Hound executable resolution --
+// -- Version (read from package.json at load time) --
+
+function readPkgVersion(): string {
+  try {
+    const pkgPath = path.join(__dirname, "..", "package.json");
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    return pkg.version || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const EXTENSION_VERSION = readPkgVersion();
+
+// -- Hound executable resolution (lazy, re-tried on each ensureReady if null) --
 
 function resolveHoundExe(): string | null {
+  // 1. PATH lookup (covers 99% of installs)
   try {
     const cmd = process.platform === "win32" ? "where hound.exe" : "which hound";
     const out = execSync(cmd, {
@@ -39,14 +54,17 @@ function resolveHoundExe(): string | null {
     const first = out.split(/\r?\n/)[0];
     if (first && fs.existsSync(first)) return first;
   } catch {}
-  const fallback = path.join(
-    os.homedir(),
-    "AppData", "Local", "Programs", "Python", "Python311", "Scripts", "hound.exe",
-  );
-  return fs.existsSync(fallback) ? fallback : null;
+  // 2. Fallback: common Windows install paths (multiple Python versions)
+  if (process.platform === "win32") {
+    const home = os.homedir();
+    for (const v of ["Python311", "Python312", "Python313", "Python310"]) {
+      const p = path.join(home, "AppData", "Local", "Programs", "Python", v, "Scripts", "hound.exe");
+      if (fs.existsSync(p)) return p;
+    }
+  }
+  return null;
 }
 
-const HOUND_EXE = resolveHoundExe();
 const INIT_TIMEOUT_MS = 15_000;
 const CALL_TIMEOUT_MS = 90_000;
 const CRAWL_TIMEOUT_MS = 150_000;
@@ -54,20 +72,6 @@ const INIT_ATTEMPTS = 3;
 const INIT_BACKOFF_MS = 400;
 
 // -- MCP Stdio Client (singleton subprocess + JSON-RPC) --
-//
-// Hound is spawned once per Pi session and kept alive. Its startup prewarm
-// (stealthy browser + search-engine sessions + neural reranker ONNX load)
-// runs in the background during session_start, so by the time the agent
-// makes its first web_fetch/search call, Hound is already warm. A dead
-// subprocess (crash, OS kill) triggers a transparent re-init on the next
-// call - callers never see a raw spawn error, just a slightly slower call.
-//
-// The MCP initialize handshake has a hard timeout. Hound occasionally spawns
-// dead: its synchronous import playwright (via _get_scrapling) runs on the
-// single-threaded asyncio loop and freezes it so server.run can never write
-// the reply. The process is alive but mute - no stderr, no exit - so a longer
-// timeout cannot help. A fresh re-spawn reliably responds in ~2-3s, so we
-// kill the dead one and retry up to INIT_ATTEMPTS times.
 
 interface Pending {
   resolve: (v: any) => void;
@@ -77,6 +81,8 @@ interface Pending {
 
 class HoundClient {
   private proc: ChildProcess | null = null;
+  private houndExe: string | null = null;
+  private houndVersion: string | null = null;
   private ready: Promise<boolean> | null = null;
   private initInFlight: Promise<boolean> | null = null;
   private nextId = 0;
@@ -84,9 +90,17 @@ class HoundClient {
   private stdoutBuf = "";
   private lastStderr = "";
 
+  getExe(): string | null { return this.houndExe; }
+
+  hasExe(): boolean { return this.houndExe !== null; }
+
   async ensureReady(): Promise<boolean> {
     if (this.ready) return this.ready;
-    if (!HOUND_EXE) return false;
+    // Re-resolve hound exe if not found yet (handles install-after-load)
+    if (!this.houndExe) {
+      this.houndExe = resolveHoundExe();
+    }
+    if (!this.houndExe) return false;
     if (this.initInFlight) return this.initInFlight;
     const p = this._initWithRetry();
     this.initInFlight = p;
@@ -107,6 +121,13 @@ class HoundClient {
   }
 
   private _initOnce(): Promise<boolean> {
+    // Kill any existing process before spawning a new one (prevents orphans)
+    if (this.proc && !this.proc.killed) {
+      try { this.proc.stdin?.end(); } catch {}
+      try { this.proc.kill(); } catch {}
+    }
+    this.proc = null;
+
     return new Promise<boolean>((resolve) => {
       let settled = false;
       let initTimer: NodeJS.Timeout | undefined;
@@ -115,11 +136,11 @@ class HoundClient {
         if (settled) return;
         settled = true;
         if (initTimer) clearTimeout(initTimer);
-        if (!ok) this.kill();
+        if (!ok) this._killProcess();
         resolve(ok);
       };
       try {
-        this.proc = spawn(HOUND_EXE!, [], {
+        this.proc = spawn(this.houndExe!, [], {
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
           env: { ...process.env },
@@ -176,7 +197,7 @@ class HoundClient {
             params: {
               protocolVersion: "2025-03-26",
               capabilities: {},
-              clientInfo: { name: "pi-hound", version: "10.3.0" },
+              clientInfo: { name: "pi-hound", version: EXTENSION_VERSION },
             },
             id,
           }) + "\n",
@@ -215,10 +236,15 @@ class HoundClient {
     } catch {}
   }
 
-  async call(name: string, args: Record<string, any>, timeoutMs = CALL_TIMEOUT_MS): Promise<any> {
+  async call(
+    name: string,
+    args: Record<string, any>,
+    timeoutMs = CALL_TIMEOUT_MS,
+    signal?: AbortSignal,
+  ): Promise<any> {
     const ready = await this.ensureReady();
     if (!ready) {
-      const hint = HOUND_EXE
+      const hint = this.houndExe
         ? `Hound failed to start after ${INIT_ATTEMPTS} attempts. ${this.lastStderr || "Silent dead hang."} Run: hound --doctor`
         : "Hound not found. Install: pip install hound-mcp[all]";
       throw new Error(hint);
@@ -228,25 +254,44 @@ class HoundClient {
         reject(new Error("Hound not running"));
         return;
       }
+      if (signal?.aborted) {
+        reject(new Error(`Hound cancelled: ${name}`));
+        return;
+      }
       const id = ++this.nextId;
-      const timer = setTimeout(() => {
+      let timer: NodeJS.Timeout;
+      let onAbort: () => void;
+      const cleanup = () => {
+        clearTimeout(timer);
         this.pending.delete(id);
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      };
+      timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`Hound timeout: ${name}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      onAbort = () => {
+        cleanup();
+        reject(new Error(`Hound cancelled: ${name}`));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.pending.set(id, {
+        resolve: (v: any) => { cleanup(); resolve(v); },
+        reject: (e: Error) => { cleanup(); reject(e); },
+        timer,
+      });
       try {
         this.proc.stdin!.write(
           JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name, arguments: args }, id }) + "\n",
         );
       } catch (e) {
-        clearTimeout(timer);
-        this.pending.delete(id);
+        cleanup();
         reject(e as Error);
       }
     });
   }
 
-  kill() {
+  private _killProcess() {
     if (this.proc && !this.proc.killed) {
       try { this.proc.stdin?.end(); } catch {}
       try { this.proc.kill(); } catch {}
@@ -257,6 +302,8 @@ class HoundClient {
     for (const [, { timer }] of this.pending) clearTimeout(timer);
     this.pending.clear();
   }
+
+  kill() { this._killProcess(); }
 }
 
 const hound = new HoundClient();
@@ -288,7 +335,38 @@ function pick(params: Record<string, any>, keys: string[]): Record<string, any> 
 // -- Extension --
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", () => { hound.ensureReady().catch(() => {}); });
+  pi.on("session_start", async (_event, ctx) => {
+    const ok = await hound.ensureReady().catch(() => false);
+    if (!ok) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          hound.hasExe()
+            ? "Hound found but failed to start. Run: hound --doctor"
+            : "Hound not found. Install: pip install hound-mcp[all]",
+          "warn",
+        );
+      }
+      return;
+    }
+    // Best-effort version sync check (non-blocking)
+    if (ctx.hasUI && EXTENSION_VERSION !== "unknown") {
+      hound.call("version", {}, 5_000).then((result) => {
+        const parsed = tryJson(getText(result));
+        if (parsed.version) {
+          hound["houndVersion"] = parsed.version;
+          const extMajor = EXTENSION_VERSION.split(".")[0];
+          const hMajor = String(parsed.version).split(".")[0];
+          if (extMajor !== hMajor) {
+            ctx.ui.notify(
+              `Hound extension v${EXTENSION_VERSION} vs hound v${parsed.version} (major mismatch). Update: hound -u && pi update npm:@houndmcp/hound-mcp-pi`,
+              "warn",
+            );
+          }
+        }
+      }).catch(() => {});
+    }
+  });
+
   pi.on("session_shutdown", () => { hound.kill(); });
 
   // -- web_fetch --
@@ -313,10 +391,10 @@ export default function (pi: ExtensionAPI) {
       actions: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }), { description: "Page interactions on stealthy browser AFTER load, BEFORE extraction. Forces stealthy + bypasses cache. Each item: {click:'css'}, {fill:{selector:'css',text:'x'}}, {press:'Enter'}, {wait:500}, {scroll:3}, {wait_selector:'css'}." })),
       options: Type.Optional(Type.Object({}, { additionalProperties: true, description: "include_links (bool,false: response.links=citations/navigation/external+primary_source), include_media (bool,false: up to 20 page image URLs), archive_fallback (bool,true: recover from Internet Archive on hard-block; false=raw failure), proxy, cookies, extra_headers, useragent, wait, network_idle, headless, respect_robots, real_chrome/solve_cloudflare/block_webrtc/hide_canvas/main_content_only/use_trafilatura (anti-detect tuning, good defaults, rarely needed)." })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const args = pick(params, ["url", "urls", "extraction_type", "css_selector", "max_content_chars", "timeout", "cache_ttl", "force_fetcher", "offset", "pages", "password", "focus", "actions", "options"]);
-        const result = await hound.call("mcp_smart_fetch", args, CALL_TIMEOUT_MS);
+        const result = await hound.call("mcp_smart_fetch", args, CALL_TIMEOUT_MS, signal);
         const text = getText(result);
         const parsed = tryJson(text);
         if (Array.isArray(parsed.results)) {
@@ -368,11 +446,11 @@ export default function (pi: ExtensionAPI) {
       query: Type.String({ description: "Search query" }),
       options: Type.Optional(Type.Object({}, { additionalProperties: true, description: "max_results (1-50,6), cache_ttl (300), mode (auto|neural|find_similar), engines (list), site, exclude_sites, location, language, region, page, freshness, url (for find_similar)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const args: Record<string, any> = { query: params.query };
         if (params.options && Object.keys(params.options).length) args.options = params.options;
-        const result = await hound.call("mcp_smart_search", args, 60_000);
+        const result = await hound.call("mcp_smart_search", args, 60_000, signal);
         const text = getText(result);
         const parsed = tryJson(text);
         const results: any[] = parsed.results ?? [];
@@ -425,10 +503,10 @@ export default function (pi: ExtensionAPI) {
       crawl_urls: Type.Optional(Type.Array(Type.String(), { description: "Chosen subset of URLs to fetch (second-phase selective crawl, no re-discovery). Use after sitemap=true or discover_only=true." })),
       options: Type.Optional(Type.Object({}, { additionalProperties: true, description: "sitemap (true|'auto'|false,false: true=map from sitemap.xml in one fetch; 'auto'=use if present else BFS), max_pages (1-100,10), max_depth (0-5,2), path_include (list of path prefixes), path_exclude (list to skip), max_content_chars_per (8000), max_total_chars (token budget), concurrency (1-5,3), cache_ttl (3600;0=fresh), respect_robots (false), force_fetcher ('http'|'stealthy'), timeout (ms,30000), deadline_ms (120000)." })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const args = pick(params, ["url", "focus", "discover_only", "crawl_urls", "options"]);
-        const result = await hound.call("mcp_smart_crawl", args, CRAWL_TIMEOUT_MS);
+        const result = await hound.call("mcp_smart_crawl", args, CRAWL_TIMEOUT_MS, signal);
         const text = getText(result);
         const parsed = tryJson(text);
         const pages: any[] = Array.isArray(parsed.pages) ? parsed.pages : [];
@@ -474,16 +552,16 @@ export default function (pi: ExtensionAPI) {
     name: "web_screenshot",
     label: "Web Screenshot",
     description: "Screenshot a URL as an image. Multimodal agents only (content as images/canvas/visual layout). Text agents: use web_fetch. Stealthy browser auto-managed.",
-    promptSnippet: "web_screenshot(url, full_page, image_type) - anti-bot one-shot screenshot of a URL (stealthy browser). Multimodal agents only.",
+    promptSnippet: "web_screenshot(url, options.full_page, options.image_type) - anti-bot one-shot screenshot of a URL (stealthy browser). Multimodal agents only.",
     parameters: Type.Object({
       url: Type.String({ description: "URL to screenshot" }),
       options: Type.Optional(Type.Object({}, { additionalProperties: true, description: "full_page (bool,false), image_type (png|jpeg,png), quality (0-100,jpeg), wait (ms), wait_selector (css), network_idle (bool), timeout (ms,30000)." })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const args: Record<string, any> = { url: params.url };
         if (params.options && Object.keys(params.options).length) args.options = params.options;
-        const result = await hound.call("mcp_screenshot", args, CALL_TIMEOUT_MS);
+        const result = await hound.call("mcp_screenshot", args, CALL_TIMEOUT_MS, signal);
         const images = getImages(result);
         if (images.length) {
           const out: any[] = [];
@@ -523,10 +601,10 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       all: Type.Optional(Type.Boolean({ description: "Wipe all (default: expired only)" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const args = { all: params.all ?? false };
-        const result = await hound.call("cache_clear", args, 10_000);
+        const result = await hound.call("cache_clear", args, 10_000, signal);
         return { content: [{ type: "text", text: getText(result) }], details: { all: args.all } };
       } catch (e: any) {
         return { content: [{ type: "text", text: `cache_clear error: ${e.message}` }], details: { error: e.message } };
@@ -549,12 +627,28 @@ export default function (pi: ExtensionAPI) {
     description: "Hound version + update status.",
     promptSnippet: "hound_version() - hound version + update status.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
       try {
-        const result = await hound.call("version", {}, 10_000);
-        return { content: [{ type: "text", text: getText(result) }], details: {} };
+        const result = await hound.call("version", {}, 10_000, signal);
+        const parsed = tryJson(getText(result));
+        const v = parsed.version || "unknown";
+        const latest = parsed.latest || "";
+        const upToDate = parsed.up_to_date;
+        const extInfo = EXTENSION_VERSION !== "unknown" ? ` | extension v${EXTENSION_VERSION}` : "";
+        const text = upToDate
+          ? `Hound ${v} (up to date)${extInfo}`
+          : `Hound ${v} (update available: ${latest})${extInfo}. Run: hound -u`;
+        return { content: [{ type: "text", text }], details: { version: v, latest, up_to_date: upToDate, extension: EXTENSION_VERSION } };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `hound_version error: ${e.message}` }], details: { error: e.message } };
+        // Fallback: try hound --version via execSync (works even when MCP server is down)
+        try {
+          const exe = hound.getExe();
+          if (exe) {
+            const out = execSync(`"${exe}" --version`, { timeout: 5000, windowsHide: true }).toString().trim();
+            return { content: [{ type: "text", text: out }], details: { fallback: true, extension: EXTENSION_VERSION } };
+          }
+        } catch {}
+        return { content: [{ type: "text", text: `hound_version error: ${e.message}` }], details: { error: e.message, extension: EXTENSION_VERSION } };
       }
     },
     renderCall(_args, theme) {

@@ -310,6 +310,15 @@ pi install npm:@houndmcp/hound-mcp-pi
 
 No API keys, no config file, no MCP adapter needed. The extension spawns `hound` as a singleton subprocess and registers all 6 tools (`web_fetch`, `web_search`, `web_crawl`, `web_screenshot`, `cache_clear`, `hound_version`) as native Pi tools. Prewarmed at session start. Run `/reload` to activate.
 
+Updating:
+
+```bash
+hound -u                              # update the MCP server
+pi update npm:@houndmcp/hound-mcp-pi  # update the extension
+```
+
+The extension checks version sync at session start and warns if the extension and hound diverge by a major version.
+
 </details>
 
 <details>

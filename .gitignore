@@ -69,3 +69,5 @@ V7-SEARCH-PLAN.md
 V10_PLAN.md
 docs/hound-demo.mp4
 pi-extension/.npmrc
+node_modules/
+package-lock.json
