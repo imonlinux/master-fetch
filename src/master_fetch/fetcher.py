@@ -151,16 +151,18 @@ class Response:
             self._root = etree.fromstring(b"<html></html>")
             return
         try:
-            from lxml import etree
-            # Use etree.HTMLParser directly for cross-platform consistency.
-            # lxml.html.fromstring() returns different root elements on
-            # different platforms (e.g. ubuntu CI returns the first child
-            # element, not the <html> root). HTMLParser always returns
-            # the <html> root with all content as descendants.
-            parser = etree.HTMLParser(recover=True)
-            self._root = etree.fromstring(self._body, parser=parser)
+            from io import BytesIO
+            from lxml import html as lxml_html
+            # Use lxml.html.parse() from BytesIO for cross-platform
+            # consistency. lxml.html.fromstring() returns different root
+            # elements on different platforms (e.g. ubuntu CI returns the
+            # first child element, not the <html> root), which breaks
+            # CSSSelector (it only searches descendants, not the root).
+            # parse() always returns a full tree with <html> as root.
+            tree = lxml_html.parse(BytesIO(self._body))
+            self._root = tree.getroot()
             if self._root is None:
-                self._root = etree.fromstring(b"<html></html>")
+                raise ValueError("parse returned empty tree")
         except Exception:
             try:
                 from lxml import html as lxml_html

@@ -1,5 +1,17 @@
 # Changelog
 
+## [11.1.3] - 2026-07-21
+
+### Fixed: CI failure (CSS selector parsing, take 3)
+
+Both prior fixes (div wrapping, etree.HTMLParser) failed on CI because lxml
+returns different root elements on different platforms. Final fix: use
+`lxml.html.parse()` from BytesIO, which ALWAYS returns a full document tree
+with `<html>` as root, regardless of platform. This is the documented,
+cross-platform-safe way to parse HTML in lxml.
+
+804 tests. No behavior change.
+
 ## [11.1.2] - 2026-07-21
 
 ### Fixed: CI failure (CSS selector parsing, take 2)
