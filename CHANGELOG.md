@@ -1,5 +1,47 @@
 # Changelog
 
+## [11.0.3] - 2026-07-21
+
+### Reliability: self-healing entry point + stale process cleanup
+
+Three reliability fixes that make hound brick-proof across major version upgrades.
+
+**1. Self-healing CLI entry point (cli.py)**
+
+New `master_fetch/cli.py` module replaces `master_fetch.server:main` as the pip
+entry point. It is deliberately lightweight (stdlib only, no heavy imports at
+module level). When `hound` runs, it tries `from master_fetch.server import
+main` inside a try/except. If the import fails (missing dep, corrupted
+install, half-failed update), it:
+- Detects the ImportError
+- Checks if `~/.hound/repair.py` exists
+- If yes: runs it automatically (kills hound + force-reinstalls)
+- If no: writes an inline repair script and runs it
+- Prints a clean one-line error (not a traceback)
+
+Users never see a raw `ModuleNotFoundError` traceback again. A broken install
+auto-recovers on the next `hound` command.
+
+**2. Stale process cleanup during updates**
+
+The detached Windows helper (spawned by `hound -u`) now kills ALL hound.exe
+processes before running pip, not just in the `--reinstall` path. This
+prevents stale hound servers (e.g. a Pi extension's singleton subprocess)
+from surviving an update and running old code. The POSIX path also kills
+stale servers before pip.
+
+**3. Doctor detects stale processes**
+
+`hound --doctor` now includes a "no stale servers" check. If hound.exe
+processes are running, it reports their PIDs and suggests the kill command.
+
+**4. Doctor browser deps check fixed**
+
+Removed `curl_cffi` from the browser deps check (no longer a dependency
+since v11.0.0 removed scrapling). Now checks `playwright` + `patchright` only.
+
+761 tests (8 new in test_self_heal.py).
+
 ## [11.0.2] - 2026-07-21
 
 ### Fixed: smart_fetch and smart_crawl broken (follow_redirects type error)

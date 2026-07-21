@@ -179,6 +179,27 @@ def _other_hound_pids() -> list[int]:
     return pids
 
 
+def _stop_all_hound() -> None:
+    """Kill all running hound launcher processes (except this one)."""
+    import subprocess
+    pids = _other_hound_pids()
+    if not pids:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/IM", "hound.exe", "/F"],
+                         capture_output=True, timeout=10,
+                         creationflags=0x08000000)
+        else:
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)  # SIGTERM
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def cleanup_old_launcher() -> None:
     """Sweep a stale hound.exe.old left by a previous self-update (Windows).
 
@@ -475,8 +496,10 @@ except Exception:
     pass
 
 servers_before = _hound_pids()
-if FULL:
+if servers_before:
+    print("  stopping " + str(len(servers_before)) + " running hound server(s)...")
     _stop_all_hound()
+    time.sleep(1)
     servers_before = []
 _stage()
 
@@ -570,10 +593,11 @@ def do_update(target: str | None = None) -> None:
         print("  " + ui.warn("recover with") + "  " + ui.cmd(f'python "{repair}"'))
         return
 
-    # POSIX: no file lock. Run pip inline with self-heal + verify.
+    # POSIX: no file lock. Kill stale servers, run pip with self-heal + verify.
     others = _other_hound_pids()
     if others:
-        print("  " + ui.dim(f"{len(others)} hound server(s) running - restart them after"))
+        print("  " + ui.dim(f"stopping {len(others)} hound server(s)..."))
+        _stop_all_hound()
     rc, stderr = _run_pip(_pip_cmd(target))
     if not _advanced(check_version()[0], target):
         print("  " + ui.dim("first pass did not complete - recovering..."))
@@ -585,8 +609,6 @@ def do_update(target: str | None = None) -> None:
             sys.exit(1)
     new_ver = check_version()[0]
     print(ui.branded(ui.ver(new_ver), ui.ok("updated")))
-    if others:
-        print("  " + ui.dim(f"restart PID {', '.join(str(p) for p in others)} to use the new version"))
 
 
 def reinstall() -> None:
@@ -758,6 +780,11 @@ def doctor() -> None:
     rp = repair_script_path()
     checks.append(("repair script ready", os.path.exists(rp), _short(rp)))
 
+    # 5b. stale hound processes (warns if old servers are running)
+    stale_pids = _other_hound_pids()
+    stale_detail = f"{len(stale_pids)} running: PID {', '.join(str(p) for p in stale_pids[:5])}" if stale_pids else "none running"
+    checks.append(("no stale servers", not stale_pids, stale_detail))
+
     # 6. core deps importable
     missing = []
     for mod in ("httpx", "aiosqlite", "mcp", "pydantic"):
@@ -782,7 +809,7 @@ def doctor() -> None:
     # These may not install on all platforms (playwright has no aarch64/Termux
     # wheels). When missing, hound runs in HTTP-only mode.
     browser_missing = []
-    for mod in ("playwright", "patchright", "curl_cffi"):
+    for mod in ("playwright", "patchright"):
         try:
             __import__(mod)
         except Exception:
@@ -827,6 +854,8 @@ def doctor() -> None:
         print("  " + ui.warn("fix deps") + "  " + ui.cmd("pip install --force-reinstall hound-mcp"))
     if any(not ok for _, ok, _ in checks) and not missing:
         print("  " + ui.warn("repair") + "  " + ui.cmd(f'python "{_short(rp, 46)}"'))
+    if stale_pids:
+        print("  " + ui.warn("stop stale servers") + "  " + ui.cmd("taskkill /IM hound.exe /F") if sys.platform == "win32" else ui.cmd("pkill -x hound"))
     if not optional_ok:
         print("  " + ui.warn("install extras") + "  " + ui.cmd("pip install hound-mcp[all]"))
     if not browser_ok:
