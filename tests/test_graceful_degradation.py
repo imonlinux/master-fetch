@@ -172,6 +172,21 @@ def test_response_empty_body():
     assert r.css("div") == []
 
 
+def test_response_css_invalid_selector_raises():
+    """Response.css() raises on invalid selector instead of silently returning []."""
+    import pytest
+    from master_fetch.fetcher import Response
+    r = Response(
+        url="https://example.com",
+        body=b"<html><body><div class='main'>Content</div></body></html>",
+        status=200,
+        encoding="utf-8",
+    )
+    # Invalid CSS selector should raise, not silently return []
+    with pytest.raises(Exception):
+        r.css(">>>invalid<<<")
+
+
 # ─── Browser availability ────────────────────────────────────────────────────
 
 def test_browser_available_in_dev_env():

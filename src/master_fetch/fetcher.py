@@ -180,13 +180,10 @@ class Response:
         self._ensure_parsed()
         if self._root is None:
             return []
-        try:
-            from lxml.cssselect import CSSSelector
-            sel = CSSSelector(selector)
-            matches = sel(self._root)
-            return [ElementWrapper(m, self._url) for m in matches]
-        except Exception:
-            return []
+        from lxml.cssselect import CSSSelector
+        sel = CSSSelector(selector)
+        matches = sel(self._root)
+        return [ElementWrapper(m, self._url) for m in matches]
 
     @property
     def first(self) -> "Response":

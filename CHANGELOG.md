@@ -1,58 +1,33 @@
 # Changelog
 
+## [11.1.5] - 2026-07-21
+
+### Fixed: Response.css() no longer silently returns [] on errors
+
+Follow-up to the cssselect dependency fix (#3). `Response.css()` had a broad
+`except Exception: return []` that silently swallowed ALL errors, including
+`ImportError` when `cssselect` was missing and `SelectorSyntaxError` for invalid
+selectors. This meant broken CSS selectors produced empty results instead of
+an error, making debugging impossible.
+
+Fix: removed the broad except. Errors now propagate to the caller. The action
+layer validates selectors upstream via `validate_css_selector()`, so invalid
+selectors are caught before reaching `css()`. The `cssselect>=1.2` dependency
+added in v11.1.4 ensures the import never fails.
+
+805 tests (1 new: `test_response_css_invalid_selector_raises`).
+
 ## [11.1.4] - 2026-07-21
 
-### Fixed: CI failure (root cause: missing cssselect dependency)
+### Fixed: missing cssselect dependency breaks Response.css()
 
-The actual root cause of all CI failures since v11.0.0: `lxml` does NOT list
-`cssselect` as a dependency. On CI (where `cssselect` isn't installed by other
-packages), `lxml.cssselect.CSSSelector` import fails, and the broad `except`
-in `Response.css()` silently returns `[]`. This affected `test_response_css_selector`
-on all platforms.
+`lxml` does NOT list `cssselect` as a dependency. On environments where
+`cssselect` isn't installed by other packages, `lxml.cssselect.CSSSelector`
+import fails, and `Response.css()` silently returns `[]`.
 
-Fix: add `cssselect>=1.2` as an explicit core dependency.
-
-Also kept the `lxml.html.parse()` from BytesIO parsing fix (better cross-platform
-consistency than `lxml.html.fromstring()`).
-
-804 tests. No behavior change.
-
-## [11.1.3] - 2026-07-21
-
-### Fixed: CI failure (CSS selector parsing, take 3)
-
-Both prior fixes (div wrapping, etree.HTMLParser) failed on CI because lxml
-returns different root elements on different platforms. Final fix: use
-`lxml.html.parse()` from BytesIO, which ALWAYS returns a full document tree
-with `<html>` as root, regardless of platform. This is the documented,
-cross-platform-safe way to parse HTML in lxml.
-
-804 tests. No behavior change.
-
-## [11.1.2] - 2026-07-21
-
-### Fixed: CI failure (CSS selector parsing, take 2)
-
-Previous fix (wrapping in a div) created invalid HTML that lxml.html.fromstring()
-normalizes differently per platform. New fix: use etree.HTMLParser() directly,
-which is part of libxml2 and has consistent behavior across all platforms.
-Always returns the <html> root with all content as descendants.
-
-804 tests. No behavior change.
-
-## [11.1.1] - 2026-07-21
-
-### Fixed: CI failure on Linux + Windows (CSS selector parsing)
-
-`Response.css()` failed on CI (ubuntu 3.11/3.12/3.13, windows 3.11) because
-`lxml.html.fromstring()` returns different root elements on different
-platforms. On some platforms, it returns the first child element directly
-instead of the `<html>` root, and `CSSSelector(".main")` only searches
-descendants, not the root element itself.
-
-Fix: wrap the HTML content in a parent `<div id='__hound_root__'>` before
-parsing, ensuring CSSSelector always searches descendants regardless of
-how `fromstring()` handles the root element.
+Fix: add `cssselect>=1.2` as an explicit core dependency. Also switched HTML
+parsing from `lxml.html.fromstring()` to `lxml.html.parse()` from BytesIO for
+cross-platform consistency.
 
 804 tests. No behavior change.
 
