@@ -1,5 +1,16 @@
 # Changelog
 
+## [11.1.2] - 2026-07-21
+
+### Fixed: CI failure (CSS selector parsing, take 2)
+
+Previous fix (wrapping in a div) created invalid HTML that lxml.html.fromstring()
+normalizes differently per platform. New fix: use etree.HTMLParser() directly,
+which is part of libxml2 and has consistent behavior across all platforms.
+Always returns the <html> root with all content as descendants.
+
+804 tests. No behavior change.
+
 ## [11.1.1] - 2026-07-21
 
 ### Fixed: CI failure on Linux + Windows (CSS selector parsing)

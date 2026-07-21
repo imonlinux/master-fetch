@@ -151,23 +151,21 @@ class Response:
             self._root = etree.fromstring(b"<html></html>")
             return
         try:
-            from lxml import html as lxml_html
-            # Wrap in a parent div so CSSSelector always searches
-            # descendants. Without this, lxml.html.fromstring() may return
-            # the first child element directly on some platforms (e.g. ubuntu
-            # CI), and CSSSelector(".main") on that element won't match it
-            # because XPath // only searches descendants, not the root.
-            wrapped = f"<div id='__hound_root__'>{self.content}</div>"
-            self._root = lxml_html.fromstring(wrapped)
+            from lxml import etree
+            # Use etree.HTMLParser directly for cross-platform consistency.
+            # lxml.html.fromstring() returns different root elements on
+            # different platforms (e.g. ubuntu CI returns the first child
+            # element, not the <html> root). HTMLParser always returns
+            # the <html> root with all content as descendants.
+            parser = etree.HTMLParser(recover=True)
+            self._root = etree.fromstring(self._body, parser=parser)
+            if self._root is None:
+                self._root = etree.fromstring(b"<html></html>")
         except Exception:
             try:
-                from lxml import etree
-                parser = etree.HTMLParser(recover=True)
-                self._root = etree.fromstring(
-                    self._body, parser=parser
-                )
+                from lxml import html as lxml_html
+                self._root = lxml_html.fromstring(self.content)
             except Exception:
-                # Last resort: empty tree
                 from lxml import etree
                 self._root = etree.fromstring(b"<html></html>")
 
