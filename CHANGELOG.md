@@ -1,5 +1,22 @@
 # Changelog
 
+## [11.1.4] - 2026-07-21
+
+### Fixed: CI failure (root cause: missing cssselect dependency)
+
+The actual root cause of all CI failures since v11.0.0: `lxml` does NOT list
+`cssselect` as a dependency. On CI (where `cssselect` isn't installed by other
+packages), `lxml.cssselect.CSSSelector` import fails, and the broad `except`
+in `Response.css()` silently returns `[]`. This affected `test_response_css_selector`
+on all platforms.
+
+Fix: add `cssselect>=1.2` as an explicit core dependency.
+
+Also kept the `lxml.html.parse()` from BytesIO parsing fix (better cross-platform
+consistency than `lxml.html.fromstring()`).
+
+804 tests. No behavior change.
+
 ## [11.1.3] - 2026-07-21
 
 ### Fixed: CI failure (CSS selector parsing, take 3)
