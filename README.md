@@ -47,27 +47,17 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
-## ✨ New in 11.0.0
+## ✨ New in 11.1.5
 
-**Scrapling dependency removed entirely. Hound now uses primp + patchright directly.**
+**Next-gen stealth engine. Hound now passes the hardest anti-bot targets.**
 
-- 🐍 **No more scrapling.** All scrapling functionality replaced with hound's own modules: `fetcher.py` (primp-based HTTP), `browser.py` (patchright-based browser + Cloudflare solver), `extractor.py` (trafilatura + markdownify).
-- 📦 **Smaller install.** Drop scrapling + ~15 transitive deps (curl_cffi, msgspec, protego, click, etc.).
-- 🔧 **Full control.** Fix bugs and add features without waiting for scrapling releases. The entire fetch pipeline is now hound's own code.
-- 🚀 **Faster cold start.** No scrapling import chain.
-- 🛡️ **Cloudflare solver ported.** The Turnstile solver (~80 lines of standard Playwright page manipulation) is now hound's own.
-- 🔧 **753 tests** (29 new tests for the replacement modules).
-
----
-
-## ✨ New in 10.5.0
-
-**Termux/Android support + HTTP-only graceful degradation.**
-
-- 📱 **Lean install works everywhere.** `pip install hound-mcp` no longer pulls `playwright` (which has no wheels for Termux/aarch64). Browser deps moved to `[all]` extra with loose pins. On platforms without playwright, hound runs in HTTP-only mode.
-- 🔧 **Graceful degradation.** When browser deps are unavailable, `web_fetch` uses httpx + trafilatura directly. `web_search` and `web_crawl` work normally. Stealthy browser escalation is skipped with a clear `browser_unavailable` error. `web_screenshot` raises a clear RuntimeError with install instructions.
-- 🩺 **Doctor browser check.** `hound --doctor` now checks for browser deps (non-blocking, shows HTTP-only mode when missing).
-- 🔧 **742 tests** (18 new graceful degradation tests).
+- 🧬 **Stealth engine**: system Chrome auto-detection (`channel=chrome` for real TLS fingerprint), 4 coherent fingerprint profiles, JS-layer patches (HeadlessChrome UA fix, `navigator.webdriver=undefined`, canvas noise via `getImageData`+`toDataURL` interception, permissions API). Human behavior simulation (Bezier mouse curves, natural scroll, dwell time). CF Turnstile solver with human-like mouse movement.
+- 📊 **Real-world results**: passes bot.sannysoft.com (all checks), bypasses Cloudflare Turnstile on CanadianInsider (hardest in a 31-site benchmark), Medium, StackOverflow, NowSecure, Glassdoor (DataDome). See the [stealth benchmark](#-stealth-benchmark) below.
+- 🧠 **Memory optimized**: `--renderer-process-limit=1`, V8 heap cap 512MB, `Memory.simulatePressureNotification` via CDP after each fetch (triggers Chrome GC). CDP session leak fixed. RSS stays flat across sequential fetches.
+- 🐍 **No more scrapling.** All scrapling functionality replaced with hound's own modules: `fetcher.py` (primp-based HTTP), `browser.py` (patchright-based browser), `extractor.py` (trafilatura + markdownify). Smaller install, fewer transitive deps, faster cold start.
+- 📱 **Works everywhere.** Lean install `pip install hound-mcp` pulls no browser deps. On platforms without playwright (Termux, aarch64), hound runs in HTTP-only mode with graceful degradation.
+- 🔒 **Fixed `Response.css()`**: added `cssselect` as explicit dependency (was missing from lxml's dependency tree). Removed silent `[]` return on errors; invalid selectors now raise.
+- 🔧 **805 tests**.
 
 ---
 
