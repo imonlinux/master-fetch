@@ -152,8 +152,13 @@ class Response:
             return
         try:
             from lxml import html as lxml_html
-            # Use html_fromstring which handles malformed HTML gracefully
-            self._root = lxml_html.fromstring(self.content)
+            # Wrap in a parent div so CSSSelector always searches
+            # descendants. Without this, lxml.html.fromstring() may return
+            # the first child element directly on some platforms (e.g. ubuntu
+            # CI), and CSSSelector(".main") on that element won't match it
+            # because XPath // only searches descendants, not the root.
+            wrapped = f"<div id='__hound_root__'>{self.content}</div>"
+            self._root = lxml_html.fromstring(wrapped)
         except Exception:
             try:
                 from lxml import etree

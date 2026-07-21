@@ -1,5 +1,21 @@
 # Changelog
 
+## [11.1.1] - 2026-07-21
+
+### Fixed: CI failure on Linux + Windows (CSS selector parsing)
+
+`Response.css()` failed on CI (ubuntu 3.11/3.12/3.13, windows 3.11) because
+`lxml.html.fromstring()` returns different root elements on different
+platforms. On some platforms, it returns the first child element directly
+instead of the `<html>` root, and `CSSSelector(".main")` only searches
+descendants, not the root element itself.
+
+Fix: wrap the HTML content in a parent `<div id='__hound_root__'>` before
+parsing, ensuring CSSSelector always searches descendants regardless of
+how `fromstring()` handles the root element.
+
+804 tests. No behavior change.
+
 ## [11.1.0] - 2026-07-21
 
 ### Stealth fetch: next-generation anti-detection
