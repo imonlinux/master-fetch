@@ -11,9 +11,11 @@ is the exact command that bricks it.
 
 This rewrite fixes all of that:
 
-- **--no-deps, no extras.** The self-update only touches hound-mcp itself.
-  Dependencies already installed are left alone; the `[all]` extra a user
-  already has is preserved. Fast, deterministic, cannot fail on a heavy dep.
+- **Core deps installed, no extras.** The self-update installs hound-mcp
+  WITH its core deps (so new core deps introduced in major versions are
+  installed), but WITHOUT the `[all]` extra (so the heavy onnxruntime /
+  tokenizers / rapidocr are NOT pulled). Fast, deterministic, cannot fail on
+  a heavy dep. Existing deps already satisfied are left alone by pip.
 - **Windows: a detached helper runs pip after the launcher exits.** The running
   `hound -u` command IS hound.exe, which Windows locks against overwrite. The
   helper is a standalone `python -c` (no master_fetch dependency) that waits
@@ -241,7 +243,7 @@ def main():
     print("Hound repair: stopping any running hound...")
     _stop()
     print("Hound repair: force-reinstalling hound-mcp from PyPI...")
-    r = _pip("--force-reinstall", "--no-deps", "--upgrade", "hound-mcp")
+    r = _pip("--force-reinstall", "--upgrade", "hound-mcp")
     if r.returncode != 0:
         print("Hound repair: reinstall failed (pip exit %d)." % r.returncode)
         print("  Try manually:  %s -m pip install --force-reinstall hound-mcp" % sys.executable)
@@ -291,15 +293,25 @@ def _read_last_version() -> str | None:
 # ─── pip commands + runner ─────────────────────────────────────────────────
 
 def _pip_cmd(target: str) -> list[str]:
-    """Install exactly `target` with no deps / no extras (fast, reliable)."""
-    return [sys.executable, "-m", "pip", "install", "--no-deps",
+    """Install `target` with core deps (no extras). Fast, reliable.
+
+    Uses NO --no-deps (unlike v10.x) so new core deps introduced in major
+    versions are installed. Does NOT include [all] so the heavy extras
+    (onnxruntime, tokenizers, rapidocr) are NOT pulled. Existing deps that
+    are already satisfied are left alone by pip.
+    """
+    return [sys.executable, "-m", "pip", "install",
             f"hound-mcp=={target}", "--quiet", "--disable-pip-version-check",
             "--no-python-version-warning"]
 
 
 def _heal_cmd(target: str) -> list[str]:
-    """Force-reinstall `target` (no deps) - the self-heal / brick-recovery pass."""
-    return [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+    """Force-reinstall `target` (with core deps) - the self-heal / brick-recovery pass.
+
+    Uses NO --no-deps so missing core deps are installed. Does NOT include [all]
+    so heavy extras are not pulled.
+    """
+    return [sys.executable, "-m", "pip", "install", "--force-reinstall",
             f"hound-mcp=={target}", "--quiet", "--disable-pip-version-check",
             "--no-python-version-warning"]
 
@@ -471,13 +483,13 @@ _stage()
 if FULL:
     rc, stderr = _pip("--force-reinstall", "--no-deps", "hound-mcp[all]==" + TARGET)
 else:
-    rc, stderr = _pip("--no-deps", "hound-mcp==" + TARGET)
+    rc, stderr = _pip("hound-mcp==" + TARGET)
 if not _advanced(_ver()):
     print("  first pass did not complete - recovering...")
     if FULL:
         rc2, stderr2 = _pip("--force-reinstall", "--no-deps", "hound-mcp[all]==" + TARGET)
     else:
-        rc2, stderr2 = _pip("--force-reinstall", "--no-deps", "hound-mcp==" + TARGET)
+        rc2, stderr2 = _pip("--force-reinstall", "hound-mcp==" + TARGET)
     if not _advanced(_ver()):
         print("  Hound  " + ("reinstall" if FULL else "update") + " failed - " + (stderr2 or stderr or "pip failed").strip().splitlines()[-1:][0] if (stderr2 or stderr) else "pip failed")
         print("  recover with:  python \\"" + REPAIR + "\\"")

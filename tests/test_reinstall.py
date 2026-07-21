@@ -148,30 +148,32 @@ class TestReinstallVsUpdate:
         reinstall_cmd = _pip_cmd_full("10.4.0")
         assert update_cmd != reinstall_cmd
 
-    def test_update_and_reinstall_both_have_no_deps(self):
-        """Both update and reinstall use --no-deps (different reasons):
-        - update: can't fail on heavy deps (the brick root cause)
-        - reinstall: can't break transitive dep compatibility (pydantic vs pydantic-core)
+    def test_update_installs_core_deps_reinstall_uses_no_deps(self):
+        """Update installs WITH core deps (so new deps in major versions are
+        installed), but WITHOUT [all] extras. Reinstall uses --no-deps to
+        avoid breaking transitive dep compatibility (pydantic vs pydantic-core).
         The difference is [all] extras + --force-reinstall in reinstall."""
         from master_fetch.updater import _pip_cmd, _pip_cmd_full
-        assert "--no-deps" in _pip_cmd("10.4.0")
-        assert "--no-deps" in _pip_cmd_full("10.4.0")
+        # Update first pass: no --no-deps (installs core deps), no [all]
+        assert "--no-deps" not in _pip_cmd("11.0.0")
+        assert "[all]" not in " ".join(_pip_cmd("11.0.0"))
+        # Reinstall: --force-reinstall --no-deps hound-mcp[all]==VERSION
+        assert "--no-deps" in _pip_cmd_full("11.0.0")
+        assert "[all]" in " ".join(_pip_cmd_full("11.0.0"))
 
     def test_reinstall_has_force_reinstall_update_does_not(self):
-        """Both REINSTALL and UPDATE self-heal use --force-reinstall.
-        REINSTALL: --force-reinstall --no-deps hound-mcp[all]==VERSION
-        UPDATE self-heal: --force-reinstall --no-deps hound-mcp==VERSION
-        The key difference is [all] extras + the main cmd (no --force in the
-        first pass for update, --force in the first pass for reinstall)."""
+        """Update first pass has no --force-reinstall. Reinstall first pass does.
+        Update self-heal uses --force-reinstall (with core deps, no [all]).
+        Reinstall uses --force-reinstall --no-deps with [all]."""
         from master_fetch.updater import _pip_cmd, _pip_cmd_full, _heal_cmd
         # Update first pass: no --force-reinstall
-        assert "--force-reinstall" not in _pip_cmd("10.4.0")
+        assert "--force-reinstall" not in _pip_cmd("11.0.0")
         # Reinstall first pass: --force-reinstall --no-deps
-        assert "--force-reinstall" in _pip_cmd_full("10.4.0")
-        assert "--no-deps" in _pip_cmd_full("10.4.0")
-        # Update self-heal: --force-reinstall --no-deps
+        assert "--force-reinstall" in _pip_cmd_full("11.0.0")
+        assert "--no-deps" in _pip_cmd_full("11.0.0")
+        # Update self-heal: --force-reinstall (with core deps, no [all])
         assert "--force-reinstall" in _heal_cmd("10.4.0")
-        assert "--no-deps" in _heal_cmd("10.4.0")
+        assert "--no-deps" not in _heal_cmd("10.4.0")
 
     def test_reinstall_has_all_extra_update_does_not(self):
         from master_fetch.updater import _pip_cmd, _pip_cmd_full

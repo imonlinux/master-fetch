@@ -1,5 +1,29 @@
 # Changelog
 
+## [11.0.1] - 2026-07-21
+
+### Fixed: self-update installs core deps (not --no-deps)
+
+The v10.x self-update used `--no-deps` to avoid pulling the heavy `[all]`
+extras (onnxruntime, tokenizers, rapidocr). This was correct for v10.x where
+the core dep tree didn't change between minor versions.
+
+v11.0.0 added `markdownify` as a new core dep. The `--no-deps` flag meant
+pip skipped it. The old v10.4.1 install didn't have markdownify (it came
+via scrapling's transitive tree). After `--no-deps` update, `import
+master_fetch` crashed on `import markdownify` with `ModuleNotFoundError`.
+
+**Fix**: Drop `--no-deps` from the primary update pass. `pip install
+hound-mcp==TARGET` (no `--no-deps`, no `[all]`) installs hound-mcp + any
+missing core deps, but does NOT pull the heavy `[all]` extras. Existing
+deps already satisfied are left alone by pip. The self-heal pass also
+drops `--no-deps` for the same reason.
+
+The `reinstall` command (`hound --reinstall`) still uses `--no-deps` with
+`[all]` because its purpose is a full reinstall where the [all] extras are
+the point, and `--no-deps` prevents breaking transitive dep compatibility
+(pydantic vs pydantic-core).
+
 ## [11.0.0] - 2026-07-21
 
 ### Removed scrapling dependency entirely

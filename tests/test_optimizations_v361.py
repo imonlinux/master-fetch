@@ -308,15 +308,16 @@ class TestUpdaterHelpers:
         with patch.object(sp, "check_output", side_effect=FileNotFoundError("no tasklist")):
             assert _other_hound_pids() == []
 
-    def test_pip_cmd_is_no_deps_no_extras(self):
+    def test_pip_cmd_installs_core_deps_no_extras(self):
         cmd = _pip_cmd("10.2.0")
-        assert "--no-deps" in cmd
         assert "hound-mcp==10.2.0" in cmd
+        assert not any("--no-deps" in c for c in cmd), "must install core deps (no --no-deps)"
         assert not any("[all]" in c for c in cmd), "must NOT pull the heavy [all] extra"
 
-    def test_heal_cmd_is_force_reinstall_no_deps(self):
+    def test_heal_cmd_is_force_reinstall_with_deps(self):
         cmd = _heal_cmd("10.2.0")
-        assert "--force-reinstall" in cmd and "--no-deps" in cmd
+        assert "--force-reinstall" in cmd
+        assert not any("--no-deps" in c for c in cmd), "heal must install core deps too"
         assert "hound-mcp==10.2.0" in cmd
 
     def test_diagnose_categories(self):
