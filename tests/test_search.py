@@ -1,0 +1,286 @@
+"""Search tests: site/exclude_sites hostname filtering (PR #7), GitHub
+case-folding dedup (PR #8), URL normalization, multi_search mapping logic,
+RawResult consensus, EngineReport status mapping.
+
+The metasearch backend is mocked (no network), but the filtering, dedup,
+consensus, and mapping logic being tested is the REAL code that runs on
+real search results.
+"""
+
+import asyncio
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
+from master_fetch import search_engines as se
+from master_fetch.search_engines import (
+    _passes_site_filter, _normalize_domain, _is_domain_or_subdomain,
+    RawResult, EngineReport, multi_search, normalize_url,
+    DEFAULT_ENGINES, _INDEX_FAMILY,
+)
+
+
+# ─── Hostname boundary filtering (PR #7) ──────────────────────────
+
+class TestSiteFilter:
+
+    def test_exact_domain_passes_site_filter(self):
+        assert _passes_site_filter("https://github.com/repo", "github.com", None) is True
+
+    def test_subdomain_passes_site_filter(self):
+        assert _passes_site_filter("https://docs.github.com/en", "github.com", None) is True
+
+    def test_evil_prefix_rejected(self):
+        assert _passes_site_filter("https://evilgithub.com/repo", "github.com", None) is False
+
+    def test_evil_suffix_rejected(self):
+        assert _passes_site_filter("https://github.com.evil.test/repo", "github.com", None) is False
+
+    def test_similar_domain_rejected(self):
+        assert _passes_site_filter("https://notgithub.com/repo", "github.com", None) is False
+
+    def test_port_stripped_for_comparison(self):
+        assert _passes_site_filter("https://github.com:8443/repo", "github.com", None) is True
+
+    def test_www_prefix_stripped_correctly(self):
+        # www.github.com as site filter should match www.github.com
+        assert _passes_site_filter("https://www.github.com/repo", "www.github.com", None) is True
+        # But github.com as site should also match www.github.com (subdomain)
+        assert _passes_site_filter("https://www.github.com/repo", "github.com", None) is True
+
+    def test_ww_prefix_not_stripped_as_www(self):
+        # "wwgithub.com" must not be stripped as if it started with "www."
+        assert _passes_site_filter("https://github.com/repo", "wwgithub.com", None) is False
+
+
+class TestExcludeSitesFilter:
+
+    def test_exclude_exact_domain(self):
+        assert _passes_site_filter("https://github.com/repo", None, ["github.com"]) is False
+
+    def test_exclude_subdomain(self):
+        assert _passes_site_filter("https://docs.github.com/repo", None, ["github.com"]) is False
+
+    def test_exclude_does_not_block_evil_prefix(self):
+        assert _passes_site_filter("https://evilgithub.com/repo", None, ["github.com"]) is True
+
+    def test_exclude_does_not_block_evil_suffix(self):
+        assert _passes_site_filter("https://github.com.evil.test/repo", None, ["github.com"]) is True
+
+    def test_exclude_does_not_block_similar(self):
+        assert _passes_site_filter("https://notgithub.com/repo", None, ["github.com"]) is True
+
+
+class TestNormalizeDomain:
+
+    def test_strips_www_prefix(self):
+        assert _normalize_domain("www.example.com") == "example.com"
+
+    def test_does_not_strip_ww(self):
+        assert _normalize_domain("wwexample.com") == "wwexample.com"
+
+    def test_strips_trailing_dot(self):
+        assert _normalize_domain("example.com.") == "example.com"
+
+    def test_lowercases(self):
+        assert _normalize_domain("Example.COM") == "example.com"
+
+    def test_empty_returns_empty(self):
+        assert _normalize_domain("") == ""
+
+    def test_handles_url_with_scheme(self):
+        assert _normalize_domain("https://www.example.com/path") == "example.com"
+
+    def test_handles_url_without_scheme(self):
+        assert _normalize_domain("www.example.com") == "example.com"
+
+
+# ─── GitHub case-folding dedup (PR #8) ────────────────────────────
+
+class TestGitHubCaseFolding:
+
+    def test_owner_repo_casefolded(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/nousresearch/hermes-agent")
+        b = _normalize_url("https://github.com/NousResearch/hermes-agent")
+        assert a == b
+
+    def test_branch_case_preserved(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/NousResearch/Hermes-Agent/tree/Main")
+        b = _normalize_url("https://github.com/nousresearch/hermes-agent/tree/main")
+        assert a != b
+
+    def test_non_github_paths_case_sensitive(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://example.com/Docs/Readme")
+        b = _normalize_url("https://example.com/docs/readme")
+        assert a != b
+
+    def test_credential_urls_skip_folding(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://User:Secret@github.com/NousResearch/Hermes-Agent")
+        b = _normalize_url("https://user:secret@github.com/nousresearch/hermes-agent")
+        assert a != b
+
+
+# ─── URL normalization ─────────────────────────────────────────────
+
+class TestNormalizeUrl:
+
+    def test_lowercases_scheme_and_host(self):
+        assert normalize_url("HTTPS://Example.COM/Path") == "https://example.com/Path"
+
+    def test_strips_trailing_slash_on_non_root(self):
+        assert normalize_url("https://example.com/page/") == "https://example.com/page"
+
+    def test_preserves_root_slash(self):
+        assert normalize_url("https://example.com/") == "https://example.com/"
+
+    def test_handles_protocol_relative(self):
+        result = normalize_url("//example.com/path")
+        assert result.startswith("https://")
+
+    def test_empty_returns_empty(self):
+        assert normalize_url("") == ""
+
+
+# ─── multi_search mapping logic ────────────────────────────────────
+
+class TestMultiSearchMapping:
+    """Test the mapping from metasearch dicts to RawResult + EngineReport.
+    The metasearch backend is mocked, but the mapping/filtering is real."""
+
+    @pytest.mark.asyncio
+    async def test_site_filter_applied_on_results(self, monkeypatch):
+        fake_results = [
+            {"title": "A", "href": "https://github.com/repo", "body": "b", "backend": "brave", "backends": ["brave"]},
+            {"title": "B", "href": "https://evilgithub.com/repo", "body": "b", "backend": "brave", "backends": ["brave"]},
+        ]
+        async def fake_metasearch(q, n, **kw):
+            return fake_results, {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        ranked, reports = await multi_search("test", 6, site="github.com")
+        assert len(ranked) == 1
+        assert ranked[0].url == "https://github.com/repo"
+
+    @pytest.mark.asyncio
+    async def test_exclude_sites_filter_applied(self, monkeypatch):
+        fake_results = [
+            {"title": "A", "href": "https://github.com/repo", "body": "b", "backend": "brave", "backends": ["brave"]},
+            {"title": "B", "href": "https://example.com/repo", "body": "b", "backend": "brave", "backends": ["brave"]},
+        ]
+        async def fake_metasearch(q, n, **kw):
+            return fake_results, {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        ranked, _ = await multi_search("test", 6, exclude_sites=["github.com"])
+        assert len(ranked) == 1
+        assert ranked[0].url == "https://example.com/repo"
+
+    @pytest.mark.asyncio
+    async def test_consensus_from_multiple_backends(self, monkeypatch):
+        fake_results = [
+            {"title": "A", "href": "https://github.com/repo", "body": "b",
+             "backend": "brave", "backends": ["brave", "duckduckgo"]},
+        ]
+        async def fake_metasearch(q, n, **kw):
+            return fake_results, {"brave": "ok", "duckduckgo": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        ranked, _ = await multi_search("test", 6)
+        assert len(ranked) == 1
+        # brave and duckduckgo are different index families
+        assert ranked[0].consensus == 2
+
+    @pytest.mark.asyncio
+    async def test_consensus_same_index_family(self, monkeypatch):
+        # DDG and Yahoo both use Bing's index -> consensus = 1
+        fake_results = [
+            {"title": "A", "href": "https://example.com", "body": "b",
+             "backend": "duckduckgo", "backends": ["duckduckgo", "yahoo"]},
+        ]
+        async def fake_metasearch(q, n, **kw):
+            return fake_results, {"duckduckgo": "ok", "yahoo": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        ranked, _ = await multi_search("test", 6)
+        assert ranked[0].consensus == 1  # same index family (Bing)
+
+    @pytest.mark.asyncio
+    async def test_engine_reports_mapped(self, monkeypatch):
+        async def fake_metasearch(q, n, **kw):
+            return [], {"brave": "ok", "google": "blocked", "yahoo": "empty", "mojeek": "timeout"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        _, reports = await multi_search("test", 6)
+        report_map = {r.name: r for r in reports}
+        assert report_map["brave"].ok is True
+        assert report_map["google"].blocked is True
+        assert report_map["yahoo"].ok is False
+        assert report_map["mojeek"].blocked is True
+
+    @pytest.mark.asyncio
+    async def test_freshness_maps_to_timelimit(self, monkeypatch):
+        captured = {}
+        async def fake_metasearch(q, n, **kw):
+            captured["timelimit"] = kw.get("timelimit")
+            return [], {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        await multi_search("test", 6, freshness="week")
+        assert captured["timelimit"] == "w"
+
+    @pytest.mark.asyncio
+    async def test_page_zero_indexed_to_one(self, monkeypatch):
+        captured = {}
+        async def fake_metasearch(q, n, **kw):
+            captured["page"] = kw.get("page")
+            return [], {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        await multi_search("test", 6, page=0)
+        assert captured["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_site_prefix_added_to_query(self, monkeypatch):
+        captured = {}
+        async def fake_metasearch(q, n, **kw):
+            captured["query"] = q
+            return [], {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        await multi_search("test query", 6, site="github.com")
+        assert "site:github.com" in captured["query"]
+
+    @pytest.mark.asyncio
+    async def test_exclude_prefix_added_to_query(self, monkeypatch):
+        captured = {}
+        async def fake_metasearch(q, n, **kw):
+            captured["query"] = q
+            return [], {"brave": "ok"}
+        monkeypatch.setattr(se, "_metasearch", fake_metasearch)
+
+        await multi_search("test", 6, exclude_sites=["pinterest.com"])
+        assert "-site:pinterest.com" in captured["query"]
+
+
+# ─── DEFAULT_ENGINES and index family ─────────────────────────────
+
+class TestEngineConfig:
+
+    def test_default_engines_has_eight(self):
+        assert len(DEFAULT_ENGINES) == 8
+
+    def test_default_engines_contains_key_backends(self):
+        for engine in ("duckduckgo", "brave", "google", "mojeek", "yandex"):
+            assert engine in DEFAULT_ENGINES
+
+    def test_index_family_mapping(self):
+        # DDG and Yahoo share Bing's index
+        assert _INDEX_FAMILY["duckduckgo"] == _INDEX_FAMILY["yahoo"] == "bing"
+        # Google and Startpage share Google's index
+        assert _INDEX_FAMILY["google"] == _INDEX_FAMILY["startpage"] == "google"
+        # Brave has its own independent index
+        assert _INDEX_FAMILY["brave"] == "brave"
+        # Mojeek has its own independent index
+        assert _INDEX_FAMILY["mojeek"] == "mojeek"

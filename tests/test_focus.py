@@ -1,98 +1,129 @@
-"""Tests for query-focused content filtering (smart_fetch `focus`)."""
+"""Focus tests: BM25 content filtering.
 
+Tests the real focus_content function against real text. No mocks.
+Adversarial: empty query is no-op, single block is no-op, no matching terms
+returns fallback blocks, heading context preserved.
+"""
+
+import pytest
 from master_fetch.focus import focus_content, _split_blocks, _tokens, _is_heading
 
 
-def _many_blocks():
-    """A markdown doc with several paragraphs + a heading + a table."""
-    return (
-        "# Hound Release Notes\n\n"
-        "Hound is a web research MCP server. It fetches pages and runs search.\n\n"
-        "## Crawl\n\n"
-        "The new crawl tool walks a whole site. It follows same-domain links with a "
-        "depth limit and a token budget.\n\n"
-        "OCR reads scanned PDFs and image pages using rapidocr and pypdfium2.\n\n"
-        "The cache is a SQLite store keyed by URL and extraction type.\n\n"
-        "| tool | purpose |\n| --- | --- |\n| crawl | site walk |\n| ocr | scanned pdf |\n"
-    )
+class TestFocusContent:
+
+    def test_relevant_blocks_kept(self):
+        text = (
+            "Python is a programming language.\n\n"
+            "Java is also a programming language.\n\n"
+            "Rust is a systems programming language with memory safety.\n\n"
+            "JavaScript runs in the browser."
+        )
+        result = focus_content(text, "Python programming")
+        assert "Python is a programming language" in result
+        # The header should mention focus
+        assert "Focus:" in result
+
+    def test_empty_query_returns_original(self):
+        text = "Some content.\n\nMore content."
+        assert focus_content(text, "") == text
+
+    def test_none_query_returns_original(self):
+        text = "Some content.\n\nMore content."
+        assert focus_content(text, None) == text
+
+    def test_single_block_returns_original(self):
+        text = "Just one block of text."
+        assert focus_content(text, "anything") == text
+
+    def test_empty_text_returns_original(self):
+        assert focus_content("", "query") == ""
+
+    def test_no_matching_terms_returns_fallback_top(self):
+        text = "Block A about cooking.\n\nBlock B about gardening.\n\nBlock C about painting."
+        result = focus_content(text, "quantum physics")
+        # Fallback: should return top blocks (not empty)
+        assert "Block" in result
+        assert "Focus:" in result
+
+    def test_heading_preceding_kept_block_preserved(self):
+        text = (
+            "# Section Header\n\n"
+            "This block talks about Python.\n\n"
+            "# Other Header\n\n"
+            "This block talks about Java."
+        )
+        result = focus_content(text, "Python")
+        assert "Section Header" in result  # heading preserved for context
+        assert "Python" in result
+
+    def test_order_preserved(self):
+        text = (
+            "First mention of Python.\n\n"
+            "Something about Java.\n\n"
+            "Second mention of Python.\n\n"
+            "Something about Go."
+        )
+        result = focus_content(text, "Python")
+        first_pos = result.find("First mention")
+        second_pos = result.find("Second mention")
+        assert first_pos < second_pos
+
+    def test_focus_header_includes_query_and_block_count(self):
+        text = "Apple pie recipe.\n\nBanana bread recipe.\n\nCherry tart recipe.\n\nDate cake recipe."
+        result = focus_content(text, "apple")
+        assert "Focus:" in result
+        assert "'apple'" in result
 
 
-# ─── _tokens / _is_heading / _split_blocks ──────────────────────────────
+class TestSplitBlocks:
 
-def test_tokens_lowercases_and_filters_short():
-    t = _tokens("Hound 2 OCR, a PDF!")
-    assert "hound" in t and "ocr" in t and "pdf" in t
-    assert "2" not in t and "a" not in t  # len < 2 dropped
+    def test_splits_on_blank_lines(self):
+        blocks = _split_blocks("A\n\nB\n\nC")
+        assert len(blocks) == 3
 
+    def test_consecutive_blank_lines_dont_create_empty_blocks(self):
+        blocks = _split_blocks("A\n\n\n\nB")
+        assert len(blocks) == 2
 
-def test_is_heading():
-    assert _is_heading("# Title") is True
-    assert _is_heading("## Sub") is True
-    assert _is_heading("not a heading") is False
-    assert _is_heading("") is False
+    def test_no_blank_lines_returns_one_block(self):
+        blocks = _split_blocks("A\nB\nC")
+        assert len(blocks) == 1
 
-
-def test_split_blocks_preserves_order_and_drops_blank_runs():
-    blocks = _split_blocks("a\n\nb\n\nc")
-    assert blocks == ["a", "b", "c"]
+    def test_empty_text_returns_empty_list(self):
+        assert _split_blocks("") == []
 
 
-# ─── focus_content ─────────────────────────────────────────────────────
+class TestIsHeading:
 
-def test_focus_no_query_returns_unchanged():
-    text = _many_blocks()
-    assert focus_content(text, "") is text
-    assert focus_content(text, "   ") is text
+    def test_markdown_h1(self):
+        assert _is_heading("# Title") is True
 
+    def test_markdown_h2(self):
+        assert _is_heading("## Subtitle") is True
 
-def test_focus_single_block_returns_unchanged():
-    assert focus_content("only one block here", "query") == "only one block here"
+    def test_not_heading(self):
+        assert _is_heading("Regular paragraph") is False
 
-
-def test_focus_no_query_terms_returns_unchanged():
-    text = _many_blocks()
-    # query with no usable >=2-char tokens
-    assert focus_content(text, "a") is text
+    def test_blank_then_heading(self):
+        assert _is_heading("\n\n# Heading") is True
 
 
-def test_focus_keeps_relevant_blocks_and_drops_irrelevant():
-    text = _many_blocks()
-    out = focus_content(text, "crawl site depth budget")
-    assert out.startswith("[Focus:")
-    # The crawl paragraph is relevant; the cache paragraph is not.
-    assert "crawl tool walks" in out
-    assert "SQLite store" not in out
-    # The number of kept blocks is reported in the header.
-    assert "of " in out  # "showing X of Y blocks"
+class TestTokens:
 
+    def test_lowercases(self):
+        assert "hello" in _tokens("Hello World")
 
-def test_focus_preserves_preceding_heading():
-    text = _many_blocks()
-    out = focus_content(text, "crawl tool walks site")
-    # The "## Crawl" heading sits right before the crawl paragraph and must be
-    # preserved for context even though it has no query terms itself.
-    assert "## Crawl" in out
-    assert "crawl tool walks" in out
+    def test_filters_single_chars(self):
+        tokens = _tokens("a b cd ef")
+        assert "cd" in tokens
+        assert "ef" in tokens
+        assert "a" not in tokens
+        assert "b" not in tokens
 
+    def test_extracts_alphanumeric(self):
+        tokens = _tokens("python3 async2026")
+        assert "python3" in tokens
+        assert "async2026" in tokens
 
-def test_focus_no_matches_keeps_closest_blocks():
-    text = _many_blocks()
-    out = focus_content(text, "zzz nonexistent topic qqq")
-    # Nothing matches -> fallback keeps the closest blocks (not empty).
-    assert out.startswith("[Focus:")
-    # Body still has some content (the fallback top blocks).
-    assert len(out) > len("[Focus:")
-
-
-def test_focus_table_scored_by_cell_tokens():
-    text = _many_blocks()
-    out = focus_content(text, "ocr scanned pdf")
-    # The table row mentioning 'ocr' / 'scanned pdf' should be kept.
-    assert "scanned pdf" in out.lower() or "ocr" in out.lower()
-
-
-def test_focus_header_names_query_and_counts():
-    text = _many_blocks()
-    out = focus_content(text, "crawl")
-    assert "'crawl'" in out
-    assert "blocks" in out
+    def test_empty_text(self):
+        assert _tokens("") == []

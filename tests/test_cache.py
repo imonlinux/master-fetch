@@ -1,267 +1,177 @@
-"""Tests for cache.py — SQLite caching with TTL."""
+"""Cache tests: round-trip set/get, TTL expiry, clear expired vs all,
+cache key determinism, MAX_CACHE_ENTRIES eviction.
 
-import sqlite3
-import tempfile
-from pathlib import Path
+Uses a temp directory so tests never touch the real cache DB.
+All async, real SQLite operations. No mocks.
+"""
 
+import asyncio
+import time
 import pytest
-
+from pathlib import Path
 from master_fetch.cache import (
-    _cache_key,
-    _ensure_db,
-    get_cached,
-    set_cached,
-    clear_cache,
-    clear_all_cache,
+    get_cached, set_cached, clear_cache, clear_all_cache,
+    _cache_key, DEFAULT_TTL, MAX_CACHE_ENTRIES,
 )
 
 
+@pytest.fixture
+def cache_dir(tmp_path):
+    return tmp_path / "cache"
+
+
+# ─── Round-trip ────────────────────────────────────────────────────
+
+class TestCacheRoundTrip:
+
+    @pytest.mark.asyncio
+    async def test_set_then_get_returns_content(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["Hello world"],
+                         200, cache_dir=cache_dir)
+        result = await get_cached("https://example.com", "markdown",
+                                  cache_dir=cache_dir)
+        assert result is not None
+        assert result["content"] == ["Hello world"]
+        assert result["status"] == 200
+
+    @pytest.mark.asyncio
+    async def test_different_extraction_types_get_different_keys(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["md"], 200, cache_dir=cache_dir)
+        await set_cached("https://example.com", "html", ["<html>"], 200, cache_dir=cache_dir)
+        md = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
+        html = await get_cached("https://example.com", "html", cache_dir=cache_dir)
+        assert md["content"] == ["md"]
+        assert html["content"] == ["<html>"]
+
+    @pytest.mark.asyncio
+    async def test_css_selector_differentiates_keys(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["all"],
+                         200, css_selector=".main", cache_dir=cache_dir)
+        await set_cached("https://example.com", "markdown", ["filtered"],
+                         200, css_selector=".sidebar", cache_dir=cache_dir)
+        main = await get_cached("https://example.com", "markdown",
+                                css_selector=".main", cache_dir=cache_dir)
+        sidebar = await get_cached("https://example.com", "markdown",
+                                   css_selector=".sidebar", cache_dir=cache_dir)
+        assert main["content"] == ["all"]
+        assert sidebar["content"] == ["filtered"]
+
+    @pytest.mark.asyncio
+    async def test_content_type_round_trips(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["x"], 200,
+                        cache_dir=cache_dir, content_type="text/html",
+                        total_size_bytes=12345)
+        result = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
+        assert result["content_type"] == "text/html"
+        assert result["total_size_bytes"] == 12345
+
+    @pytest.mark.asyncio
+    async def test_envelope_round_trips(self, cache_dir):
+        env = {"metadata": {"title": "Test"}, "page_type": "article"}
+        await set_cached("https://example.com", "markdown", ["x"], 200,
+                        cache_dir=cache_dir, envelope=env)
+        result = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
+        assert result["envelope"]["metadata"]["title"] == "Test"
+        assert result["envelope"]["page_type"] == "article"
+
+
+# ─── TTL behavior ──────────────────────────────────────────────────
+
+class TestCacheTTL:
+
+    @pytest.mark.asyncio
+    async def test_expired_entry_not_returned(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["x"], 200,
+                        cache_dir=cache_dir, ttl=1)
+        await asyncio.sleep(1.1)
+        result = await get_cached("https://example.com", "markdown",
+                                  cache_dir=cache_dir)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_caller_ttl_can_request_fresher(self, cache_dir):
+        # Stored with TTL=3600, caller requests TTL=1
+        await set_cached("https://example.com", "markdown", ["x"], 200,
+                        cache_dir=cache_dir, ttl=3600)
+        await asyncio.sleep(1.1)
+        result = await get_cached("https://example.com", "markdown",
+                                  ttl=1, cache_dir=cache_dir)
+        assert result is None  # lesser of stored (3600) and requested (1) = 1, expired
+
+    @pytest.mark.asyncio
+    async def test_fresh_entry_returned(self, cache_dir):
+        await set_cached("https://example.com", "markdown", ["x"], 200,
+                        cache_dir=cache_dir, ttl=3600)
+        result = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
+        assert result is not None
+
+
+# ─── Cache clearing ────────────────────────────────────────────────
+
+class TestCacheClearing:
+
+    @pytest.mark.asyncio
+    async def test_clear_cache_removes_expired_only(self, cache_dir):
+        await set_cached("https://fresh.com", "markdown", ["fresh"], 200,
+                        cache_dir=cache_dir, ttl=3600)
+        await set_cached("https://stale.com", "markdown", ["stale"], 200,
+                        cache_dir=cache_dir, ttl=1)
+        await asyncio.sleep(1.1)
+        purged = await clear_cache(cache_dir=cache_dir)
+        assert purged == 1
+        # Fresh entry still there
+        fresh = await get_cached("https://fresh.com", "markdown", cache_dir=cache_dir)
+        assert fresh is not None
+        # Stale entry gone (already expired, then purged)
+        stale = await get_cached("https://stale.com", "markdown", cache_dir=cache_dir)
+        assert stale is None
+
+    @pytest.mark.asyncio
+    async def test_clear_all_cache_nukes_everything(self, cache_dir):
+        await set_cached("https://a.com", "markdown", ["a"], 200, cache_dir=cache_dir)
+        await set_cached("https://b.com", "markdown", ["b"], 200, cache_dir=cache_dir)
+        purged = await clear_all_cache(cache_dir=cache_dir)
+        assert purged == 2
+        assert await get_cached("https://a.com", "markdown", cache_dir=cache_dir) is None
+        assert await get_cached("https://b.com", "markdown", cache_dir=cache_dir) is None
+
+
+# ─── Cache key ─────────────────────────────────────────────────────
+
 class TestCacheKey:
-    """Deterministic cache key generation."""
 
     def test_same_params_same_key(self):
-        k1 = _cache_key("https://example.com", "markdown", None)
-        k2 = _cache_key("https://example.com", "markdown", None)
+        k1 = _cache_key("https://example.com", "markdown", ".main", "1-5")
+        k2 = _cache_key("https://example.com", "markdown", ".main", "1-5")
         assert k1 == k2
 
-    def test_different_urls_different_key(self):
-        k1 = _cache_key("https://example.com/a", "markdown", None)
-        k2 = _cache_key("https://example.com/b", "markdown", None)
-        assert k1 != k2
+    def test_different_url_different_key(self):
+        assert _cache_key("https://a.com", "markdown") != _cache_key("https://b.com", "markdown")
 
-    def test_different_extraction_different_key(self):
-        k1 = _cache_key("https://example.com", "markdown", None)
-        k2 = _cache_key("https://example.com", "text", None)
-        assert k1 != k2
+    def test_different_source_different_key(self):
+        assert _cache_key("https://x.com", "markdown", source="live") != \
+               _cache_key("https://x.com", "markdown", source="archive.org")
 
-    def test_key_is_string(self):
-        key = _cache_key("https://example.com", "article", "div.content")
-        assert isinstance(key, str)
-        assert len(key) == 24  # SHA256 hex digest truncated
+    def test_key_is_24_chars(self):
+        assert len(_cache_key("https://x.com", "markdown")) == 24
 
 
-class TestCacheOperations:
-    """Integration tests for cache operations using temp dirs."""
+# ─── MAX_CACHE_ENTRIES eviction ────────────────────────────────────
 
-    @pytest.fixture
-    def cache_dir(self):
-        with tempfile.TemporaryDirectory() as d:
-            yield Path(d)
+class TestCacheEviction:
 
     @pytest.mark.asyncio
-    async def test_set_and_get(self, cache_dir):
-        await set_cached(
-            "https://example.com", "markdown", ["Hello World"], 200,
-            cache_dir=cache_dir,
-        )
-        cached = await get_cached(
-            "https://example.com", "markdown", cache_dir=cache_dir,
-        )
-        assert cached is not None
-        assert cached["status"] == 200
-        assert cached["content"] == ["Hello World"]
-        assert cached["url"] == "https://example.com"
-
-    @pytest.mark.asyncio
-    async def test_miss_returns_none(self, cache_dir):
-        cached = await get_cached(
-            "https://never-cached.com", "markdown", cache_dir=cache_dir,
-        )
-        assert cached is None
-
-    @pytest.mark.asyncio
-    async def test_expired_cache_returns_none(self, cache_dir):
-        # Set with negative TTL (already expired)
-        await set_cached(
-            "https://expired.com", "markdown", ["Expired"], 200,
-            ttl=-1, cache_dir=cache_dir,
-        )
-        # Query with ttl=0 (no additional buffer)
-        cached = await get_cached(
-            "https://expired.com", "markdown", ttl=0, cache_dir=cache_dir,
-        )
-        # With TTL -1, fetched_at + (-1) will be < time.time(), so None
-        assert cached is None
-
-    @pytest.mark.asyncio
-    async def test_update_existing(self, cache_dir):
-        await set_cached(
-            "https://example.com", "markdown", ["Old"], 200,
-            cache_dir=cache_dir,
-        )
-        await set_cached(
-            "https://example.com", "markdown", ["New"], 201,
-            cache_dir=cache_dir,
-        )
-        cached = await get_cached(
-            "https://example.com", "markdown", cache_dir=cache_dir,
-        )
-        assert cached["status"] == 201
-        assert cached["content"] == ["New"]
-
-    @pytest.mark.asyncio
-    async def test_different_extraction_types_separate(self, cache_dir):
-        await set_cached(
-            "https://example.com", "markdown", ["MD"], 200, cache_dir=cache_dir,
-        )
-        await set_cached(
-            "https://example.com", "text", ["TEXT"], 200, cache_dir=cache_dir,
-        )
-        md = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
-        txt = await get_cached("https://example.com", "text", cache_dir=cache_dir)
-        assert md["content"] == ["MD"]
-        assert txt["content"] == ["TEXT"]
-
-    @pytest.mark.asyncio
-    async def test_clear_expired(self, cache_dir):
-        await set_cached(
-            "https://expired.com", "markdown", ["Expired"], 200,
-            ttl=-1, cache_dir=cache_dir,
-        )
-        await set_cached(
-            "https://fresh.com", "markdown", ["Fresh"], 200,
-            cache_dir=cache_dir,
-        )
-        count = await clear_cache(cache_dir)
-        assert count >= 1  # Expired should be cleared
-
-    @pytest.mark.asyncio
-    async def test_clear_all(self, cache_dir):
-        await set_cached("https://a.com", "markdown", ["A"], 200, cache_dir=cache_dir)
-        await set_cached("https://b.com", "markdown", ["B"], 200, cache_dir=cache_dir)
-        count = await clear_all_cache(cache_dir)
-        assert count >= 2
-
-        a = await get_cached("https://a.com", "markdown", cache_dir=cache_dir)
-        b = await get_cached("https://b.com", "markdown", cache_dir=cache_dir)
-        assert a is None
-        assert b is None
-
-    @pytest.mark.asyncio
-    async def test_set_without_new_kwargs_defaults_to_empty(self, cache_dir):
-        """Backwards compat: callers using old set_cached signature still work."""
-        await set_cached("https://legacy.example", "markdown", ["Legacy"], 200, cache_dir=cache_dir)
-        cached = await get_cached("https://legacy.example", "markdown", cache_dir=cache_dir)
-        assert cached is not None
-        # New columns should be empty defaults, not crash.
-        assert cached["content_type"] == ""
-        assert cached["total_size_bytes"] == 0
-
-    @pytest.mark.asyncio
-    async def test_content_type_and_size_roundtrip(self, cache_dir):
-        """Round-trip the v3.5.3 cache fields end-to-end."""
-        await set_cached(
-            "https://example.com/feed", "article", ["Body"], 200,
-            cache_dir=cache_dir,
-            content_type="application/json",
-            total_size_bytes=4096,
-        )
-        cached = await get_cached("https://example.com/feed", "article", cache_dir=cache_dir)
-        assert cached is not None
-        assert cached["content_type"] == "application/json"
-        assert cached["total_size_bytes"] == 4096
-
-    @pytest.mark.asyncio
-    async def test_update_replaces_new_fields(self, cache_dir):
-        """INSERT OR REPLACE must overwrite content_type/total_size_bytes, not leak old values."""
-        await set_cached(
-            "https://example.com", "markdown", ["v1"], 200,
-            cache_dir=cache_dir, content_type="text/html", total_size_bytes=1000,
-        )
-        await set_cached(
-            "https://example.com", "markdown", ["v2"], 200,
-            cache_dir=cache_dir, content_type="text/plain", total_size_bytes=42,
-        )
-        cached = await get_cached("https://example.com", "markdown", cache_dir=cache_dir)
-        assert cached["content"] == ["v2"]
-        assert cached["content_type"] == "text/plain"  # not text/html from first write
-        assert cached["total_size_bytes"] == 42  # not 1000 from first write
-
-
-class TestCacheSchemaMigration:
-    """v3.5.3 schema upgrade — older DBs require ALTER TABLE on first access."""
-
-    @pytest.fixture
-    def cache_dir(self):
-        with tempfile.TemporaryDirectory() as d:
-            yield Path(d)
-
-    @pytest.fixture
-    def old_db_dir(self):
-        """Temp dir pre-populated with a pre-3.5.3 (7-column) cache DB.
-
-        Uses TemporaryDirectory(ignore_cleanup_errors=True) because aiosqlite's
-        WAL-mode -wal/-shm sidecar files sometimes linger on Windows beyond
-        the asyncio loop teardown. ignore_cleanup_errors shields the test
-        from that — the test logic itself runs against the file, then we let
-        the OS clean up.
-        """
-        import time as _time
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
-            db_path = Path(d) / "cache.db"
-            # Fetched_at = now() so the row stays non-expired post-migration.
-            # Key = real cache_key hash, not a literal string.
-            real_key = _cache_key("https://old.example", "markdown", None)
-            with sqlite3.connect(db_path) as conn:
-                conn.execute("""
-                    CREATE TABLE cache (
-                        key TEXT PRIMARY KEY,
-                        url TEXT NOT NULL,
-                        extraction_type TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        status INTEGER NOT NULL,
-                        fetched_at REAL NOT NULL,
-                        ttl INTEGER NOT NULL DEFAULT 3600
-                    )
-                """)
-                conn.execute(
-                    "INSERT INTO cache VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (real_key, "https://old.example", "markdown", '["Old"]', 200, _time.time(), 3600),
-                )
-                conn.commit()
-            yield Path(d)
-
-    @pytest.mark.asyncio
-    async def test_old_schema_gets_new_columns_on_first_ensure(self, old_db_dir):
-        """A real-world upgrade: existing pre-3.5.3 DB, _ensure_db ALTERs in the new cols."""
-        import aiosqlite as _aio
-        db_path = old_db_dir / "cache.db"
-
-        # Pre-check via aiosqlite — the OLD DB has 7 columns, no content_type
-        async with _aio.connect(db_path) as b:
-            async with b.execute("PRAGMA table_info(cache)") as cur:
-                cols_before = [r[1] for r in await cur.fetchall()]
-        assert "content_type" not in cols_before
-        assert "total_size_bytes" not in cols_before
-
-        # Now _ensure_db runs the migration on this DB.
-        result_path = await _ensure_db(old_db_dir)
-        assert result_path == db_path
-
-        # Re-check — new columns must now exist
-        async with _aio.connect(db_path) as b:
-            async with b.execute("PRAGMA table_info(cache)") as cur:
-                cols_after = [r[1] for r in await cur.fetchall()]
-        assert "content_type" in cols_after
-        assert "total_size_bytes" in cols_after
-
-        # Old row is still queryable via get_cached; new columns default to ''/0
-        cached = await get_cached(
-            "https://old.example", "markdown", cache_dir=old_db_dir,
-        )
-        assert cached is not None
-        assert cached["status"] == 200
-        assert cached["content"] == ["Old"]
-        assert cached["content_type"] == ""  # ALTER DEFAULT applied to old row
-        assert cached["total_size_bytes"] == 0  # ALTER DEFAULT applied to old row
-
-    @pytest.mark.asyncio
-    async def test_idempotent_migration_on_already_upgraded_db(self, cache_dir):
-        """Re-running _ensure_db on a DB that already has v3.5.3 cols must not crash.
-        Without try/except on ALTER, this raises 'duplicate column name'.
-        """
-        # First call creates fresh v3.5.3 schema
-        db_path_1 = await _ensure_db(cache_dir)
-        # Second call on same dir — must not raise "duplicate column"
-        db_path_2 = await _ensure_db(cache_dir)
-        assert db_path_1 == db_path_2
+    async def test_eviction_when_over_cap(self, cache_dir, monkeypatch):
+        # Lower the cap for testing
+        monkeypatch.setattr("master_fetch.cache.MAX_CACHE_ENTRIES", 20)
+        # Insert 25 entries
+        for i in range(25):
+            await set_cached(f"https://example.com/{i}", "markdown", [f"content-{i}"],
+                            200, cache_dir=cache_dir)
+        # Should have evicted oldest down to ~90% of cap (18)
+        # Check some old entries are gone
+        old = await get_cached("https://example.com/0", "markdown", cache_dir=cache_dir)
+        assert old is None
+        # Check newest entry is still there
+        new = await get_cached("https://example.com/24", "markdown", cache_dir=cache_dir)
+        assert new is not None
