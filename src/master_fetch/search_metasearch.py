@@ -788,6 +788,30 @@ _SEARCH_TRACKING_PARAMS = {
 
 _GITHUB_REPO_HOSTS = {"github.com", "www.github.com"}
 
+_GITHUB_RESERVED_ROUTES = frozenset({
+    "about",
+    "apps",
+    "codespaces",
+    "collections",
+    "dashboard",
+    "explore",
+    "features",
+    "issues",
+    "login",
+    "marketplace",
+    "new",
+    "notifications",
+    "orgs",
+    "pricing",
+    "pulls",
+    "search",
+    "security",
+    "settings",
+    "sponsors",
+    "topics",
+    "trending",
+})
+
 
 def _normalize_url(url: str) -> str:
     """Normalize a URL for cross-backend dedup.
@@ -799,7 +823,9 @@ def _normalize_url(url: str) -> str:
     GitHub repository owner and name are case-insensitive, so their first two
     nonempty path segments are lowercased for github.com and www.github.com;
     later path segments remain unchanged because branches and file paths can be
-    case-sensitive. Credential-bearing URLs skip GitHub-specific path folding so
+    case-sensitive. GitHub system routes (topics, settings, explore, ...) are
+    excluded from path folding because they are not repositories and case can
+    carry meaning. Credential-bearing URLs skip GitHub-specific path folding so
     opaque userinfo is never part of a newly introduced canonical collision.
     www.github.com retains its distinct host rather than adding a separate
     host-alias canonicalization policy.
@@ -816,7 +842,10 @@ def _normalize_url(url: str) -> str:
     if p.hostname in _GITHUB_REPO_HOSTS and p.username is None and p.password is None:
         segments = path.split("/")
         repo_segment_indexes = [i for i, segment in enumerate(segments) if segment][:2]
-        if len(repo_segment_indexes) == 2:
+        if (
+            len(repo_segment_indexes) == 2
+            and segments[repo_segment_indexes[0]].lower() not in _GITHUB_RESERVED_ROUTES
+        ):
             for i in repo_segment_indexes:
                 segments[i] = segments[i].lower()
             path = "/".join(segments)

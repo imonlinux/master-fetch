@@ -122,6 +122,50 @@ class TestGitHubCaseFolding:
         assert a != b
 
 
+class TestGitHubReservedRoutes:
+    """PR #10: GitHub system routes (topics, settings, explore, etc.) should
+    NOT have their path segments case-folded, because they are not repositories
+    and case can carry meaning (e.g. /topics/Python vs /topics/python)."""
+
+    def test_reserved_route_not_folded(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/Settings/Keys")
+        b = _normalize_url("https://github.com/settings/keys")
+        assert a != b
+
+    def test_topics_route_case_preserved(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/topics/Python")
+        b = _normalize_url("https://github.com/topics/python")
+        assert a != b
+
+    def test_explore_route_case_preserved(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/Explore/Rust")
+        b = _normalize_url("https://github.com/explore/rust")
+        assert a != b
+
+    def test_repo_still_folded_after_fix(self):
+        from master_fetch.search_metasearch import _normalize_url
+        a = _normalize_url("https://github.com/NousResearch/Hermes-Agent")
+        b = _normalize_url("https://github.com/nousresearch/hermes-agent")
+        assert a == b
+
+    def test_reserved_route_lowercased_unchanged(self):
+        """Already-lowercase reserved routes should be unchanged."""
+        from master_fetch.search_metasearch import _normalize_url
+        assert _normalize_url("https://github.com/topics/python") == \
+               "https://github.com/topics/python"
+
+    def test_multiple_reserved_routes(self):
+        from master_fetch.search_metasearch import _normalize_url
+        for route in ["settings", "topics", "explore", "dashboard", "notifications",
+                      "marketplace", "sponsors", "collections", "trending", "search"]:
+            a = _normalize_url(f"https://github.com/{route.title()}/Sub")
+            b = _normalize_url(f"https://github.com/{route}/sub")
+            assert a != b, f"Route '{route}' should not be case-folded"
+
+
 # ─── URL normalization ─────────────────────────────────────────────
 
 class TestNormalizeUrl:

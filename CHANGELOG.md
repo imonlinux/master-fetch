@@ -16,6 +16,9 @@
   prompts and active, exact paywall data attributes remain signals; false-like
   values, foreign attribute names, and examples inside metadata, scripts,
   styles, fallbacks, templates, or comments are ignored.
+- GitHub system routes (topics, settings, explore, dashboard, etc.) are now
+  excluded from case-folding in `smart_search` dedup. Only actual repository
+  owner/name segments are case-folded; system route paths retain their casing.
 
 ## [11.1.6] - 2026-07-21
 
