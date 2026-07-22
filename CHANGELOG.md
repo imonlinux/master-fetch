@@ -4,18 +4,20 @@
 
 ### Changed: agent-optimized tool descriptions
 
-- `HOUND_INSTRUCTIONS` (connect-time orientation) rewritten from a flat tool
-  list to a structured guide with power-feature examples, optimal-workflow
-  decision tree, and anti-pattern guidance. Agents now see concrete examples:
-  `focus='embedding dimension'` on a 75-page paper returns only relevant
-  paragraphs in one call. Directives: "Don't search for something you already
-  have a URL for." and "Use focus= on each search result to target your
-  question." Net token change: -16 tokens (-0.6%), with dramatically better
-  agent guidance.
-- `mcp_smart_fetch` description front-loads `focus=` and `pages=` as POWER
-  FEATURES instead of burying them in parameter docs.
-- `mcp_smart_search` description now teaches agents to use `focus=` when
-  fetching search results.
+- Removed `HOUND_INSTRUCTIONS` (MCP `instructions` field). It was injected once
+  at connect time, gone after any context compact, and duplicated tool defs.
+  All guidance now lives in the tool descriptions, which are re-injected every
+  turn (tools/list) and survive compaction. Net token savings: -476 tokens
+  (-17.5%) vs the instructions+tools approach.
+- `mcp_smart_fetch` description absorbs workflow directives: "Have a URL + a
+  specific question? Use focus='your question'." "Have a PDF but don't know
+  which page? focus='your question' finds it via BM25." Added unbypassable
+  bot protection note (DataDome/Akamai/Turnstile -> switch sources).
+- `mcp_smart_search` description absorbs anti-pattern: "Don't search for
+  something you already have a URL for - use smart_fetch with focus= instead."
+- `mcp_smart_crawl` description absorbs whole-site workflow: "Need a whole
+  site? sitemap=true maps all URLs -> then crawl_urls=[...] to fetch the ones
+  you need."
 - `_agent_hints` next_action for truncated pages now suggests `focus=` first,
   then `offset=`. Large PDFs (>20K chars) now get a next_action suggesting
   `focus=` or `pages=`.
