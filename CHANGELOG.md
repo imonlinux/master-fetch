@@ -9,19 +9,21 @@
   All guidance now lives in the tool descriptions, which are re-injected every
   turn (tools/list) and survive compaction. Net token savings: -476 tokens
   (-17.5%) vs the instructions+tools approach.
-- `mcp_smart_fetch` description absorbs workflow directives: "Have a URL + a
-  specific question? Use focus='your question'." "Have a PDF but don't know
-  which page? focus='your question' finds it via BM25." Added unbypassable
-  bot protection note (DataDome/Akamai/Turnstile -> switch sources).
-- `mcp_smart_search` description absorbs anti-pattern: "Don't search for
-  something you already have a URL for - use smart_fetch with focus= instead."
-- `mcp_smart_crawl` description absorbs whole-site workflow: "Need a whole
-  site? sitemap=true maps all URLs -> then crawl_urls=[...] to fetch the ones
-  you need."
+- `mcp_smart_fetch` description now includes: structured POWER FEATURES section
+  (focus, pages, urls), DECISION GUIDE (have URL+question? focus=; have PDF+
+  know page? pages=; have PDF+don't know page? focus= finds it), RESPONSE
+  SIGNALS section (content_ok, next_action, page_type, is_truncated, content_age,
+  quality_score), css_selector vs focus distinction, bulk urls= guidance.
+- `mcp_smart_search` description now includes: WORKFLOW section (search ->
+  fetch with focus=), ANTI-PATTERN (don't search when you have a URL), FILTERS
+  section (site, exclude_sites, freshness with usage examples), RESULT FIELDS
+  section (relevance_score, fetch_relevance, engines_consensus, related_queries).
+- `mcp_smart_crawl` description now includes: WHEN TO USE guidance, TWO-PHASE
+  CRAWL pattern (sitemap -> crawl_urls), focus= for large doc sites.
 - `_agent_hints` next_action for truncated pages now suggests `focus=` first,
   then `offset=`. Large PDFs (>20K chars) now get a next_action suggesting
   `focus=` or `pages=`.
-- Pi extension descriptions mirrored to match new MCP defs.
+- Pi extension descriptions mirrored to match new MCP defs. Sync verified.
 
 ### Fixed
 
