@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [11.1.9] - 2026-07-22
+
+### Fixed: HOUND_SEARCH_PROXY reliability (3 bugs)
+
+**Bug 1: Proxy not stripped.** `HOUND_SEARCH_PROXY=" http://proxy:8080 "` (whitespace
+around a valid URL) crashed the DuckDuckGo backend (httpx) at construction
+while other backends (primp) tolerated it. Whitespace-only (`"   "`) crashed
+every backend. Fix: `_PROXY` is now `.strip()`-ed and validated at import time.
+
+**Bug 2: socks5 silently broken for DDG.** `pyproject.toml` declared
+`httpx[http2]` but not `httpx[socks]`. The `socksio` package (needed for socks5
+proxy support in httpx) was not a dependency. A fresh `pip install hound-mcp`
+would silently skip the DuckDuckGo backend when a socks5 proxy was configured.
+Fix: changed to `httpx[http2,socks]>=0.27`.
+
+**Bug 3: Bad proxy = silent 0 results.** When all engines failed to construct
+(bad proxy, missing deps), `metasearch()` returned `(0, {})` with no error.
+The user got 0 search results and no explanation. Fix: raises
+`MetaSearchException` with the proxy value and per-engine status when no engines
+can start.
+
+Also added proxy scheme validation: only `http`, `https`, `socks5`, `socks5h`
+are accepted. Invalid schemes are rejected with a warning and fall back to
+direct connection.
+
+6 new tests in `TestSearchProxyValidation` verify all cases.
+
 ## [11.1.8] - 2026-07-22
 
 ### Fixed: MCP server fails to start with -32001 REQUEST_TIMEOUT (issue #11)

@@ -50,6 +50,20 @@ random = SystemRandom()
 T = TypeVar("T")
 
 _PROXY = os.environ.get("HOUND_SEARCH_PROXY") or None
+if _PROXY:
+    _PROXY = _PROXY.strip()
+    if not _PROXY:
+        _PROXY = None
+    else:
+        # Validate scheme at import so a typo doesn't silently kill every backend.
+        _scheme = urlparse(_PROXY).scheme.lower()
+        if _scheme not in ("http", "https", "socks5", "socks5h"):
+            logger.warning(
+                "HOUND_SEARCH_PROXY has unsupported scheme '%s' (expected http, "
+                "https, socks5, or socks5h). Ignoring proxy, using direct connection.",
+                _scheme or "(none)",
+            )
+            _PROXY = None
 # Per-engine + overall deadline. Engines run in parallel + we early-return on
 # quorum, so a healthy search is ~1-2s; this bounds a fully-throttled one.
 _SEARCH_DEADLINE = float(os.environ.get("HOUND_SEARCH_DEADLINE", "8") or "8")
@@ -897,6 +911,17 @@ async def metasearch(
             instances[b] = cls(proxy=_PROXY, timeout=int(_SEARCH_DEADLINE), verify=True)
         except Exception as ex:  # construction failure (e.g. primp missing) -> skip
             logger.debug("engine %s init failed: %r", b, ex)
+            status[b] = f"init_error:{type(ex).__name__}"
+
+    # If every engine failed to construct (bad proxy, missing deps, etc),
+    # surface a clear error instead of silently returning 0 results.
+    if not instances:
+        proxy_note = f" (proxy in use: {_PROXY})" if _PROXY else ""
+        raise MetaSearchException(
+            f"No search engines could start{proxy_note}. "
+            f"Engine status: {status}. "
+            f"Check HOUND_SEARCH_PROXY and installed dependencies."
+        )
 
     seen: dict[str, dict[str, Any]] = {}
     order: list[dict[str, str]] = []
