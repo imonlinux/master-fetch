@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [11.1.7] - 2026-07-22
+
 ### Changed: agent-optimized tool descriptions
 
 - Removed `HOUND_INSTRUCTIONS` (MCP `instructions` field). It was injected once
@@ -42,6 +44,15 @@
 - GitHub system routes (topics, settings, explore, dashboard, etc.) are now
   excluded from case-folding in `smart_search` dedup. Only actual repository
   owner/name segments are case-folded; system route paths retain their casing.
+
+### Changed: test suite rewrite
+
+- Wiped 833 legacy tests (36 files, 9,663 lines) and wrote 376 new
+  behavior-focused adversarial tests (10 files, 2,219 lines). Organized by
+  capability, not version. Tests real code against real inputs. Covers SSRF
+  bypass vectors, paywall false positives, CF challenge detection, canvas
+  noise, hostname boundary filtering, GitHub case-folding, cache TTL +
+  eviction, BM25 focus filtering, chunking, stealth fingerprint profiles.
 
 ## [11.1.6] - 2026-07-21
 
