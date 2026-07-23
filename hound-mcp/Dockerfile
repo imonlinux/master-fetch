@@ -9,11 +9,17 @@ RUN apk add --no-cache \
     musl-dev \
     libffi-dev \
     openssl-dev \
-    cargo \
-    rust \
     jpeg-dev \
     zlib-dev \
     curl
+
+# Install runtime libraries for dependencies
+RUN apk add --no-cache \
+    libgcc \
+    libstdc++ \
+    libffi \
+    openssl \
+    jpeg
 
 # Set working directory
 WORKDIR /app
@@ -21,23 +27,19 @@ WORKDIR /app
 # Copy Hound application files
 COPY src/ /app/src/
 COPY pyproject.toml /app/
-COPY README.md /app/
 
-# Install Hound and its dependencies
-RUN pip install --no-cache-dir --break-system-packages -e .[all]
-
-# Install Playwright browsers
-RUN python3 -c "from playwright.sync_api import sync_playwright; sync_playwright().start(); install()" || \
-    pip install --break-system-packages playwright && \
-    python3 -m playwright install chromium
-
-# Create data directory for cache
-RUN mkdir -p /data/.hound && \
-    chown -R root:root /data
+# Install Hound with core dependencies only
+# Browser and OCR deps (onnxruntime, etc.) unavailable on Alpine
+# Hound will fall back to HTTP-only mode automatically
+RUN pip install --no-cache-dir --break-system-packages -e .
 
 # Copy run script
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
+
+# Create data directory for cache
+RUN mkdir -p /data/.hound && \
+    chown -R root:root /data
 
 # Labels for Home Assistant
 LABEL io.hass.type="app" \
