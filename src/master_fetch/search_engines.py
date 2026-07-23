@@ -56,6 +56,12 @@ _INDEX_FAMILY = {
     "google": "google", "startpage": "google",
     "brave": "brave", "grokipedia": "grokipedia", "wikipedia": "wikipedia",
     "mojeek": "mojeek", "yandex": "yandex", "qwant": "qwant",
+    # Specialized JSON-API backends (each is an independent index for consensus).
+    "semantic_scholar": "semantic_scholar", "github_api": "github_api",
+    "hackernews": "hackernews",
+    # BYOK (Bring Your Own Key) search API backends (each is an independent index).
+    "serper": "serper", "tavily": "tavily", "exa": "exa",
+    "firecrawl": "firecrawl", "tinyfish": "tinyfish",
 }
 
 _FRESHNESS_TO_TIMELIMIT = {"day": "d", "week": "w", "month": "m", "year": "y"}
@@ -187,6 +193,7 @@ async def multi_search(
     freshness: Optional[str] = None,
     page: int = 0,
     server=None,  # accepted for signature compat; search is 100% HTTP (no browser)
+    query_map: dict[str, str] | None = None,
 ) -> tuple[list[RawResult], list[EngineReport]]:
     """Run the keyless metasearch backends in parallel; return (ranked, reports).
 
@@ -198,11 +205,17 @@ async def multi_search(
     search never touches the browser).
     """
     # Build the query with site:/-site: prefixes (best-effort upstream filter).
-    q = query
-    if site:
-        q = f"site:{site} {q}"
-    for ex in exclude_sites or []:
-        q = f"-site:{ex} {q}"
+    def _apply_site(q: str) -> str:
+        if site:
+            q = f"site:{site} {q}"
+        for ex in exclude_sites or []:
+            q = f"-site:{ex} {q}"
+        return q
+
+    q = _apply_site(query)
+    # Apply site: filters to each per-engine query in the query_map (v12).
+    if query_map:
+        query_map = {eng: _apply_site(qq) for eng, qq in query_map.items()}
     timelimit = _FRESHNESS_TO_TIMELIMIT.get(freshness) if freshness else None
     backend_page = page + 1  # hound 0-indexed -> backends 1-indexed
 
@@ -213,6 +226,7 @@ async def multi_search(
     results_dicts, status = await metasearch(
         q, max_results, region=region, timelimit=timelimit,
         page=backend_page, engines=mapped,
+        query_map=query_map,
     )
 
     # Map to RawResult with cross-backend consensus + apply the final site filter.

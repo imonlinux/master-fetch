@@ -67,6 +67,8 @@ master-fetch-bug-report.md
 /.release_notes*.md
 V7-SEARCH-PLAN.md
 V10_PLAN.md
+V12_BYOK_PLAN.md
+v12plan.md
 docs/hound-demo.mp4
 pi-extension/.npmrc
 node_modules/

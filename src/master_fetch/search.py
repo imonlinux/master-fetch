@@ -1,7 +1,9 @@
 """Hound local web search (v8: multi-signal ranking, zero-latency quality signals).
 
 Scrapes public search engines (DuckDuckGo, Brave, Mojeek, Yahoo, Yandex,
-Startpage, Google, Qwant + opt-in Wikipedia, Grokipedia) via the hound-native
+Startpage, Google, Qwant + opt-in Wikipedia, Grokipedia) + auto-fired
+specialized JSON-API backends (Semantic Scholar, GitHub, Hacker News) via the
+hound-native
 engine layer in search_engines.py - no third-party API, no key, no account.
 Results are merged across engines, deduped by normalized URL, and ranked by a
 six-signal composite: neural cross-encoder (topical relevance) + cross-engine
@@ -31,6 +33,7 @@ import json
 import logging
 import re
 from collections import Counter
+from datetime import datetime
 from time import time
 from typing import Optional
 from urllib.parse import urlparse
@@ -177,6 +180,184 @@ async def ensure_reranker(*, download: bool = True):
     return await _ensure_reranker(download=download)
 
 
+# ─── query intelligence: intent detection + multi-query fan-out (v12) ─────────
+# The core v12 innovation: instead of sending one query verbatim to all 8
+# engines, detect the query intent and generate an expanded query variant that
+# is more likely to surface primary sources. Different engines get different
+# query variants (per-engine query_map), so the total request count stays the
+# same (8 requests, not 16) but recall increases dramatically because different
+# queries surface different pages. Zero-latency: all engines run in parallel,
+# same deadline. Cross-variant consensus: a URL surfaced by different queries
+# from different engines is a STRONGER authority signal than one from a single
+# query.
+
+_INTENT_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # Ambiguous standalone words removed (e.g., "code" → "area code", "paper" →
+    # "toilet paper", "update" → "database update"). Replaced with compounds that
+    # are unambiguous in search context. False negatives (missed intent) are cheap
+    # (same as v11, no expansion). False positives are expensive (dilute diversity
+    # engines with irrelevant expansion terms).
+    ("comparison", re.compile(r"\b(?:vs\.?|versus|compare|comparison|difference\s+between|pros\s+and\s+cons|which\s+is\s+better)\b", re.I)),
+    ("howto", re.compile(r"\b(?:how\s+to|how\s+do\s+i|guide|tutorial|step\s+by\s+step|walkthrough)\b", re.I)),
+    ("research", re.compile(r"\b(?:arxiv|research|benchmark|literature|state\s+of\s+the\s+art|case\s+study|white\s+paper)\b", re.I)),
+    ("code", re.compile(r"\b(?:implement|function|api|method|class|snippet|script|debug|error|exception|source\s+code|code\s+example)\b", re.I)),
+    ("reference", re.compile(r"\b(?:what\s+is|definition|explain|meaning|overview|introduction|understand)\b", re.I)),
+    ("news", re.compile(r"\b(?:latest|newest|recent|announcement|breaking|changelog|release\s+notes|new\s+release|just\s+released)\b", re.I)),
+]
+
+_INTENT_EXPANSIONS: dict[str, str] = {
+    "research": " paper arxiv benchmark results",
+    "factual": " specifications table data parameters",
+    # Other intents (code, news, howto, comparison, reference, general) do NOT
+    # get expansion. Testing showed expanded terms for these intents returned
+    # tutorial spam and beginner guides instead of primary sources. For research/
+    # factual, the expansion terms ("paper arxiv", "specifications table") actually
+    # help diversity engines surface primary sources the original query missed.
+    "comparison": "",
+    "howto": "",
+    "code": "",
+    "reference": "",
+    "news": "",
+    "general": "",
+}
+
+# Expanded set of data/spec signal words for factual intent detection. Catches
+# queries asking for concrete numbers/config, not just general tech discussion.
+_FACTUAL_DATA_WORDS = frozenset({
+    "dimension", "size", "parameters", "count", "value", "spec",
+    "specification", "d_model", "architecture", "layer",
+    "config", "hidden", "precision", "vocab", "vocabulary",
+    "encoder", "decoder", "context", "window", "throughput",
+    "latency", "memory", "token", "batch", "sequence", "flops",
+    "compute", "gpu", "head", "heads", "embedding", "optimizer",
+})
+
+
+def _detect_intent(query: str) -> str:
+    """Detect query intent for multi-query fan-out. Returns one of:
+    comparison, howto, research, code, reference, news, factual, general.
+    Rule-based pattern matching (no LLM needed). Priority order: comparison >
+    howto > research > code > reference > news > factual > general."""
+    q_lower = query.lower()
+    for intent, pattern in _INTENT_PATTERNS:
+        if pattern.search(q_lower):
+            return intent
+    # Factual: technical query with data/spec signals (not caught by patterns)
+    if _is_technical_query(query) and any(
+        w in q_lower for w in _FACTUAL_DATA_WORDS
+    ):
+        return "factual"
+    return "general"
+
+
+def _expand_query(query: str, intent: str) -> str:
+    """Generate an expanded query variant by appending intent-specific terms.
+    Only appends terms NOT already in the query. Returns the original query
+    unchanged if no expansion applies (general intent, all terms present, or
+    query too long). The expanded query surfaces pages that contain primary-
+    source data (tables, specs, code examples) rather than blog posts that
+    merely discuss the topic."""
+    expansion = _INTENT_EXPANSIONS.get(intent, "")
+    if not expansion:
+        return query
+    # Don't expand very long queries — expansion terms could exceed engine
+    # query-length limits (most engines cap at ~256-2048 chars).
+    if len(query.split()) >= 15:
+        return query
+    # Dynamic year for news intent (avoid hardcoded stale year).
+    if intent == "news":
+        expansion = expansion.replace("{year}", str(datetime.now().year))
+    q_lower = query.lower()
+    new_terms = [t for t in expansion.split() if t.lower() not in q_lower]
+    if not new_terms:
+        return query
+    return query + " " + " ".join(new_terms)
+
+
+# Specialized JSON-API backends that fire when the query intent matches.
+# Each searches an authoritative index directly, complementing the 8 general
+# HTML-scraping engines. They run in parallel (zero added latency) and merge
+# into the same ranking pipeline. Only added when engines is None (default pool)
+# so explicit engine selections are respected.
+_INTENT_BACKENDS: dict[str, list[str]] = {
+    "research": ["semantic_scholar"],
+    "factual": ["semantic_scholar"],
+    "code": ["github_api"],
+    "news": ["hackernews"],
+    "howto": ["hackernews"],
+    "reference": ["wikipedia"],
+    "comparison": [],
+    "general": [],
+}
+
+
+def _intent_backends(intent: str) -> list[str]:
+    """Return specialized backend names for the given intent. Empty for
+    comparison/general (8 general engines suffice)."""
+    return _INTENT_BACKENDS.get(intent, [])
+
+
+def _generate_query_map(query: str, intent: str, engines: list[str]) -> dict[str, str]:
+    """Assign per-engine query variants for multi-query fan-out.
+
+    Core engines (DDG, Brave, Mojeek, Yahoo) get the original query (most
+    reliable for general matching). Diversity engines (Yandex, Startpage,
+    Google, Qwant) get the expanded query (different indexes surface different
+    results with the expanded terms, surfacing primary sources the original
+    query missed). Returns {} if no expansion applies (all engines get the
+    same original query = backward-compatible with v11)."""
+    expanded = _expand_query(query, intent)
+    if expanded == query:
+        return {}
+    core = {"duckduckgo", "brave", "mojeek", "yahoo"}
+    query_map: dict[str, str] = {}
+    for eng in engines:
+        query_map[eng] = query if eng in core else expanded
+    return query_map
+
+
+# ─── result diversity: prevent same-domain domination ─────────────────────
+# After quality boost, if 3+ results are from the same domain (e.g., all
+# medium.com), defer the excess to the bottom so top results are from diverse
+# sources. The agent gets a broader view instead of 4 variations of the same
+# blog post. Only applied when no site: filter is set (user didn't restrict
+# to one domain).
+
+def _get_domain(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _diversify(ranked: list[RawResult], scores: list[float],
+                max_per_domain: int = 2) -> tuple[list[RawResult], list[float]]:
+    """Limit same-domain results in top positions. Excess results from an
+    already-represented domain are deferred to the bottom (not dropped).
+    Returns re-ordered (ranked, scores) with same objects (id() preserved for
+    quality_signals mapping)."""
+    if not ranked:
+        return ranked, scores
+    domain_counts: Counter = Counter()
+    kept: list[RawResult] = []
+    kept_scores: list[float] = []
+    deferred: list[RawResult] = []
+    deferred_scores: list[float] = []
+    for r, s in zip(ranked, scores):
+        domain = _get_domain(r.url)
+        if domain_counts[domain] < max_per_domain:
+            kept.append(r)
+            kept_scores.append(s)
+            domain_counts[domain] += 1
+        else:
+            deferred.append(r)
+            deferred_scores.append(s)
+    return kept + deferred, kept_scores + deferred_scores
+
+
 SEARCH_CACHE_TTL = 300  # 5 minutes
 
 
@@ -203,13 +384,15 @@ def _query_tokens(query: str) -> set[str]:
     return {w.lower() for w in _WORD_RE.findall(query or "") if w.lower() not in _STOPWORDS}
 
 
-def _related_queries(query: str, results: list["SearchResult"], *, n: int = 6) -> list[str]:
+def _related_queries(query: str, results: list["SearchResult"], *, n: int = 5) -> list[str]:
     """Mine follow-up queries from result titles + snippets.
 
     Ranks bigrams by document frequency (in how many results they appear),
-    drops bigrams that overlap the original query or duplicate each other, and
-    falls back to high-frequency unigrams if too few bigrams. Returns up to n
-    phrases. Robust + cheap; never raises.
+    drops bigrams that overlap the original query or duplicate each other.
+    Only returns multi-word phrases (bigrams+) — single-word unigrams are almost
+    never useful as search queries ("function", "descent") and agents waste calls
+    searching them. Requires bigrams to appear in 3+ results (not just 2) to
+    surface genuine patterns, not coincidental word adjacency.
     """
     if not results:
         return []
@@ -223,7 +406,6 @@ def _related_queries(query: str, results: list["SearchResult"], *, n: int = 6) -
         return []
 
     bigram_docfreq: Counter[str] = Counter()
-    unigram_docfreq: Counter[str] = Counter()
     for words in docs:
         uniq_bi = set()
         for i in range(len(words) - 1):
@@ -233,9 +415,6 @@ def _related_queries(query: str, results: list["SearchResult"], *, n: int = 6) -
             uniq_bi.add(f"{a} {b}")
         for bi in uniq_bi:
             bigram_docfreq[bi] += 1
-        for w in set(words):
-            if len(w) >= 3:
-                unigram_docfreq[w] += 1
 
     def _overlaps_query(phrase: str) -> bool:
         toks = phrase.split()
@@ -250,7 +429,7 @@ def _related_queries(query: str, results: list["SearchResult"], *, n: int = 6) -
 
     scored = []
     for bi, df in bigram_docfreq.items():
-        if df < 2:  # appears in only one result -> not a pattern
+        if df < 3:  # appears in fewer than 3 results -> not a strong pattern
             continue
         if _overlaps_query(bi):
             continue
@@ -268,14 +447,6 @@ def _related_queries(query: str, results: list["SearchResult"], *, n: int = 6) -
         if len(out) >= n:
             break
 
-    if len(out) < n:  # fall back to unigrams
-        for w, df in unigram_docfreq.most_common():
-            if df < 2 or w in q_tokens or w in seen_words:
-                continue
-            out.append(w)
-            seen_words.add(w)
-            if len(out) >= n:
-                break
     return out[:n]
 
 
@@ -477,8 +648,16 @@ def compute_fetch_hint(results: list[SearchResult]) -> str:
         if r.source_type:
             type_counts[r.source_type] += 1
     type_str = ", ".join(f"{t}:{c}" for t, c in type_counts.most_common()) if type_counts else ""
-    hint = (f"{high} high, {med} med, {low} low. Ranked by relevance_score + consensus + domain + answer signals; "
-            f"smart_fetch what fits your need (high first, but a lower tier can be the right call).")
+    # Concrete fetch count: give the agent a specific number, not "what fits"
+    if high >= 3:
+        fetch_rec = "smart_fetch #1-2 (high-quality, diverse sources)"
+    elif high >= 1:
+        fetch_rec = f"smart_fetch #1 (high), consider #2 if more detail needed"
+    elif med >= 2:
+        fetch_rec = "smart_fetch #1-2 (med quality), rephrase if thin"
+    else:
+        fetch_rec = "smart_fetch #1, rephrase if results are thin"
+    hint = f"{high} high, {med} med, {low} low. {fetch_rec}."
     if type_str:
         hint += f" Source types: {type_str}."
     return hint
@@ -496,22 +675,83 @@ def _search_summary(query: str, results: list[SearchResult], engines_used: list[
 
 
 def _search_next_action(results: list[SearchResult], engine_blocked: list[str],
-                         error: str) -> str:
-    """A judgment-empowering nudge, not a rigid directive. The ranking is a HINT:
-    the agent may legitimately need a lower-ranked result, so we point it at the
-    signals (relevance_score + fetch_relevance) and trust it to pick, instead of
-    prescribing 'fetch N'. This avoids the LLM stressing over whether to 'break'
-    the instruction when a lower-ranked result is the one it actually needs."""
+                         error: str, query: str = "") -> str:
+    """An intent-aware, source-type-aware nudge that points the agent at specific
+    results instead of a generic 'fetch 1-2'. The agent reads this field every
+    turn, so it must be concrete and actionable — not wishy-washy.
+
+    Strategy:
+    - Detect intent (reference, code, comparison, factual, howto, research, general)
+    - Point to specific result positions (#1, #1-2, #1-3)
+    - Include a focus= suggestion when the query is specific enough
+    - Note snippet sufficiency: if the top snippet is long and the query is
+      simple (reference/factual), tell the agent to check the snippet first
+    - Recommend source types that match the intent
+    """
     if not results:
         if error and ("rate-limited" in error.lower() or "timed out" in error.lower() or engine_blocked):
             return ("No results (engines rate-limited/timed out). Retry in a moment, "
                     "or set HOUND_SEARCH_PROXY for sustained heavy use.")
         return "No results. Rephrase (more specific / different terms) or try mode=neural for semantic matching."
     high = [r for r in results if r.fetch_relevance == "high"]
-    base = ("Results ranked by relevance + cross-engine consensus. "
-            "smart_fetch the 1-2 that match your need.")
-    if not high:
-        base += " No 'high' matches - rephrase (more specific) or try mode=neural."
+    # Detect intent for tailored guidance
+    intent = _detect_intent(query) if query else "general"
+    top = results[0]
+    top_domain = _get_domain(top.url)
+    # Snippet sufficiency: long snippet from a reference/known domain on a
+    # simple query likely already has the answer. Tells the agent to check
+    # before committing to a fetch.
+    snippet_sufficient = (
+        len(top.snippet) > 200
+        and intent in ("reference", "factual", "general")
+        and top.source_type in ("reference", "docs")
+    )
+    # Build a focus= suggestion from the query (shortened to key terms)
+    focus_terms = query.split()[:5]  # first 5 words is a good focus hint
+    focus_hint = " ".join(focus_terms) if focus_terms else ""
+    if intent == "comparison":
+        base = f"Fetch #1-2 from different sources for a balanced comparison."
+        if snippet_sufficient:
+            base = f"#1 snippet may contain key data — check it first. {base}"
+    elif intent == "code":
+        # Prefer repo/docs sources for code queries
+        code_sources = [r for r in results if r.source_type in ("repo", "docs")]
+        if code_sources:
+            pos = results.index(code_sources[0]) + 1
+            base = f"smart_fetch #{pos} ({top_domain if pos == 1 else _get_domain(code_sources[0].url)}, {code_sources[0].source_type})"
+            if focus_hint:
+                base += f" with focus='{focus_hint}'"
+            base += ". Prefer repo/docs for code."
+        else:
+            base = f"smart_fetch #1 ({top_domain}, {top.source_type})"
+            if focus_hint:
+                base += f" with focus='{focus_hint}'"
+    elif intent == "research":
+        paper_sources = [r for r in results if r.source_type in ("paper", "repo")]
+        if paper_sources:
+            pos = results.index(paper_sources[0]) + 1
+            base = f"smart_fetch #{pos} ({_get_domain(paper_sources[0].url)}, {paper_sources[0].source_type}) for primary source."
+        else:
+            base = "smart_fetch #1-2. Prefer paper/repo sources for research."
+    elif intent in ("reference", "factual"):
+        if snippet_sufficient:
+            base = f"#1 snippet ({top_domain}, {top.source_type}) may already have the answer — check it first. smart_fetch #1 if you need more detail."
+        else:
+            base = f"smart_fetch #1 ({top_domain}, {top.source_type})"
+            if focus_hint:
+                base += f" with focus='{focus_hint}'"
+    elif intent == "howto":
+        base = "smart_fetch #1-2. Prefer docs/forum sources for how-to guides."
+        if focus_hint:
+            base += f" Use focus='{focus_hint}' to extract only the relevant steps."
+    else:  # general
+        n_high = len(high)
+        if n_high >= 3:
+            base = f"smart_fetch #1-2 (top results are high-quality)."
+        elif n_high >= 1:
+            base = f"smart_fetch #1 (high). Fetch #2 if #1 is insufficient."
+        else:
+            base = "No 'high' matches — rephrase (more specific) or try mode=neural."
     if engine_blocked:
         base += " Some engines didn't contribute; retry shortly for more recall."
     return base
@@ -545,9 +785,10 @@ def _validate_engines(engines):
         return None
     if not isinstance(engines, list) or not engines:
         raise SecurityError("engines must be a non-empty list")
-    if len(engines) > 9:
-        raise SecurityError("engines list too long (max 9)")
-    valid = set(DEFAULT_ENGINES) | {"wikipedia", "grokipedia", "yahoo", "bing", "qwant"}
+    if len(engines) > 12:
+        raise SecurityError("engines list too long (max 12)")
+    valid = set(DEFAULT_ENGINES) | {"wikipedia", "grokipedia", "yahoo", "bing", "qwant",
+                                   "semantic_scholar", "github_api", "hackernews"}
     for e in engines:
         if not isinstance(e, str) or e.lower() not in valid:
             raise SecurityError(f"Invalid engine: {e!r} (one of {sorted(valid)})")
@@ -762,7 +1003,7 @@ async def smart_search(
         region = f"{loc}-{lang}" if len(loc) == 2 else "us-en"
 
     cache_query = find_sim_url or query
-    cache_type = (f"search:v8:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
+    cache_type = (f"search:v12:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
     if cache_ttl > 0:
         cached = await get_cached(cache_query, cache_type, None, ttl=cache_ttl)
         if cached and cached.get("content"):
@@ -783,7 +1024,7 @@ async def smart_search(
                     duration_ms=(time() - t0) * 1000,
                     fetch_hint=compute_fetch_hint(results_list),
                     summary=_search_summary(cache_query, results_list, _eu, _rm),
-                    next_action=_search_next_action(results_list, _eb, ""),
+                    next_action=_search_next_action(results_list, _eb, "", cache_query),
                 )
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.warning(f"Corrupt search cache for '{cache_query[:50]}': {e}")
@@ -812,11 +1053,23 @@ async def smart_search(
                 error="could not fetch the source URL for find_similar (blocked or offline).",
                 next_action="Retry, or smart_fetch the source URL first to confirm it is reachable, then call smart_search with mode=find_similar.")
         derived_query = src_title or " ".join(src_text.split()[:8]) or query
+        _fs_intent = _detect_intent(derived_query)
+        _fs_engines = list(engines) if engines else list(DEFAULT_ENGINES)
+        _fs_specialized: list[str] = []
+        if engines is None:
+            _fs_specialized = _intent_backends(_fs_intent)
+            for b in _fs_specialized:
+                if b not in _fs_engines:
+                    _fs_engines.append(b)
+        _fs_qmap = _generate_query_map(derived_query, _fs_intent, _fs_engines)
+        for b in _fs_specialized:
+            _fs_qmap[b] = derived_query
         try:
             ranked, reports = await multi_search(
-                derived_query, max_results, engines=engines, site=site,
+                derived_query, max_results, engines=_fs_engines, site=site,
                 exclude_sites=exclude_sites, region=region, freshness=freshness,
                 page=page, server=server,
+                query_map=_fs_qmap if _fs_qmap else None,
             )
         except Exception as e:
             error = redact_api_key(str(e)[:200])
@@ -858,11 +1111,32 @@ async def smart_search(
             fetch_hint = (fetch_hint + " | " + rerank_note) if fetch_hint else rerank_note
         sim_related = _related_queries(derived_query, results_list)
     else:
+        _intent = _detect_intent(query)
+        _effective_engines = list(engines) if engines else list(DEFAULT_ENGINES)
+        _specialized: list[str] = []
+        if engines is None:
+            _specialized = _intent_backends(_intent)
+            for b in _specialized:
+                if b not in _effective_engines:
+                    _effective_engines.append(b)
+            # Include BYOK (Bring Your Own Key) engines when user has configured API keys.
+            # These become the PRIMARY search source; local engines are fallback.
+            try:
+                from master_fetch.search_api_keys import get_byok_engines
+                for byok_name in get_byok_engines():
+                    if byok_name not in _effective_engines:
+                        _effective_engines.append(byok_name)
+            except Exception:
+                pass  # no BYOK keys configured, or module not available
+        _qmap = _generate_query_map(query, _intent, _effective_engines)
+        for b in _specialized:
+            _qmap[b] = query
         try:
             ranked, reports = await multi_search(
-                query, max_results, engines=engines, site=site,
+                query, max_results, engines=_effective_engines, site=site,
                 exclude_sites=exclude_sites, region=region, freshness=freshness,
                 page=page, server=server,
+                query_map=_qmap if _qmap else None,
             )
         except Exception as e:
             error = redact_api_key(str(e)[:200])
@@ -889,6 +1163,8 @@ async def smart_search(
         _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
         total_families = len(_efams) or 1
         ranked_list, scores, qsig = _apply_quality_boost(ranked_list, scores, query)
+        if not site:
+            ranked_list, scores = _diversify(ranked_list, scores, max_per_domain=2)
         ranked_list, scores = ranked_list[:max_results], scores[:max_results]
         results_list = _build_results(query, ranked_list, scores, total_families, quality_signals=qsig)
         results_list = _quality_filter(results_list)
@@ -932,5 +1208,5 @@ async def smart_search(
         duration_ms=(time() - t0) * 1000, error=error,
         fetch_hint=fetch_hint,
         summary=_search_summary(cache_query, results_list, engines_used, rerank_used),
-        next_action=_search_next_action(results_list, engine_blocked, error),
+        next_action=_search_next_action(results_list, engine_blocked, error, cache_query),
     )

@@ -6,6 +6,31 @@ import os
 from pathlib import Path
 
 
+@pytest.fixture(autouse=True)
+def _clean_byok_state():
+    """Reset BYOK (Bring Your Own Key) state between tests to prevent leakage.
+
+    BYOK pools (_POOLS) and engine registrations in _TEXT_ENGINES are
+    module-level singletons that persist across tests. This fixture cleans
+    them up after each test so no test pollutes another.
+    """
+    yield
+    # Clean up after each test.
+    try:
+        from master_fetch.search_api_keys import _reset_byok_pools
+        _reset_byok_pools()
+    except Exception:
+        pass
+    # Remove any BYOK engines that tests may have registered in _TEXT_ENGINES.
+    try:
+        import master_fetch.search_metasearch as m
+        for name in ("serper", "tavily", "exa", "firecrawl", "tinyfish"):
+            m._TEXT_ENGINES.pop(name, None)
+            m._HOUND_TO_BACKEND.pop(name, None)
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for test artifacts."""

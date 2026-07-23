@@ -2,6 +2,99 @@
 
 ## [Unreleased]
 
+## [12.1.0] - 2026-07-23
+
+### Added: Bring Your Own Key (BYOK) search API system
+
+Hound now supports user-provided search API keys from 5 providers: Serper,
+Tavily, Exa, Firecrawl, and TinyFish. When keys are configured (via env vars
+or `~/.hound/search_keys.json`), those API-backed engines become the primary
+search source, with Hound's keyless local engines as automatic fallback.
+
+Key features:
+- **Key rotation**: add multiple keys per provider. If one key gets rate-limited
+  (429), Hound automatically switches to the next key for the same provider.
+  Only when all keys are exhausted does Hound fall back to local keyless search.
+- **CLI key management**: `hound keys add/list/test/remove/clear` commands.
+- **Environment variables**: `HOUND_SEARCH_SERPER_KEYS`, `HOUND_SEARCH_TAVILY_KEYS`,
+  `HOUND_SEARCH_EXA_KEYS`, `HOUND_SEARCH_FIRECRAWL_KEYS`, `HOUND_SEARCH_TINYFISH_KEYS`
+  (comma-separated for multiple keys). Env vars override config file.
+- **Config file**: `~/.hound/search_keys.json` for persistent key storage.
+- **Doctor integration**: `hound --doctor` reports BYOK key configuration status.
+- **Zero added latency**: BYOK engines run in parallel with local engines.
+  Results from BYOK providers are sorted first in the ranking.
+
+### Fixed: Search quality regressions
+
+- Search deadline restored from 5s to 8s (was too aggressive, cancelled slower
+  engines with better results)
+- Soft deadline restored from 2s to 4s with quorum requirement
+- Multi-query fan-out restricted to research and factual intents only (other
+  intents returned tutorial spam instead of primary sources)
+- API backend results sorted after general engine results in fallback scoring
+
+## [12.0.0] - 2026-07-23
+
+### Added: Intent-aware multi-query fan-out
+
+Hound now detects query intent and generates an expanded query variant that is
+sent to diversity engines (Yandex, Startpage, Google, Qwant) while core engines
+(DDG, Brave, Mojeek, Yahoo) receive the original query. Same 8 requests, zero
+added latency (all parallel), but dramatically higher recall because different
+queries surface different pages.
+
+Intent detection is rule-based (no LLM needed). Priority order: comparison > howto
+> research > code > reference > news > factual > general. Each intent type has
+specific expansion terms (e.g., code queries append "code example implementation
+documentation", research queries append "paper arxiv benchmark results").
+
+Cross-variant consensus: a URL surfaced by different queries from different
+engines is a STRONGER authority signal than one from a single query. This
+strengthens the existing engines_consensus field.
+
+Backward-compatible: general queries (no intent match) produce an empty query
+map, meaning all engines get the original query identical to v11 behavior.
+
+### Added: Result diversity
+
+After quality boost, results from the same domain are capped at 2 in top
+positions. Excess results are deferred to the bottom (not dropped). This
+prevents same-domain domination (e.g., 4 medium.com results at the top) and
+gives the agent a broader view of available sources. Only applied when no
+site: filter is set (user didn't restrict to one domain).
+
+### Fixed: Intent detection hardened against false positives
+
+Ambiguous standalone words removed from intent patterns (e.g., "code" →
+"area code", "paper" → "toilet paper", "update" → "database update",
+"difference" → "make a difference"). Replaced with compound patterns that are
+unambiguous in search context (e.g., "difference between", "case study",
+"release notes"). False negatives are cheap (same as v11, no expansion). False
+positives are expensive (dilute diversity engines with irrelevant expansion
+terms), so the patterns are deliberately conservative.
+
+### Fixed: Factual intent detection expanded
+
+Expanded the data-signal word set from 8 words to 30+ (added: architecture,
+layer, config, hidden, precision, vocab, encoder, decoder, context, window,
+throughput, latency, memory, token, batch, sequence, etc.). Queries like
+"GPT-3 architecture layers heads" and "LLM inference throughput latency" now
+correctly trigger factual fan-out (were "general" with no expansion before).
+
+### Fixed: News expansion uses dynamic year
+
+News intent expansion now uses `datetime.now().year` instead of a hardcoded
+"2026". Prevents stale year in future.
+
+### Fixed: Query length guard
+
+Queries with 15+ words are no longer expanded (expansion terms could exceed
+engine query-length limits).
+
+### Changed: Cache version v8 to v12
+
+Invalidates old v8 caches.
+
 ## [11.2.0] - 2026-07-23
 
 ### Added: Six-signal search ranking

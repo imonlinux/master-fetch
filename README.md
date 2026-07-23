@@ -189,6 +189,60 @@ Scraping public engines from your IP can be rate-limited or CAPTCHA'd. No keyles
 Same gray-area posture as SearXNG / ddgs; no search-engine ToS compliance is claimed.
 </details>
 
+### 🔑 Bring Your Own Key (BYOK)
+
+Hound's local keyless search is the default and works with zero configuration. If you want **superior search quality** from paid API providers, you can add your own API keys. When keys are configured, those providers become the **primary search source**, with Hound's local engines as automatic fallback when all API keys are exhausted or rate-limited.
+
+**Supported providers** (all offer free tiers):
+
+| Provider | Free tier | Auth | Endpoint |
+|----------|-----------|------|----------|
+| [Serper](https://serper.dev) | 2,500 credits one-time | `X-API-KEY` | Google SERP |
+| [Tavily](https://tavily.com) | 1,000 credits/month | `Bearer` | AI search |
+| [Exa](https://exa.ai) | 1,000 searches/month | `x-api-key` | Neural search |
+| [Firecrawl](https://firecrawl.dev) | 1,000 credits/month | `Bearer` | Web search |
+| [TinyFish](https://tinyfish.ai) | 30 req/min (~43K/month) | `X-API-Key` | Web search |
+
+**Key rotation**: add multiple keys per provider. If one key hits a rate limit (429), Hound automatically switches to the next key for the same provider instead of falling back to local search. Only when ALL keys for ALL providers are exhausted does Hound fall back to its keyless local engines.
+
+**CLI key management**:
+
+```bash
+# Add a key
+hound keys add serper YOUR_SERPER_KEY
+hound keys add tavily YOUR_TAVILY_KEY
+
+# List configured keys (redacted)
+hound keys list
+
+# Test all keys (makes a live API call per key)
+hound keys test
+
+# Test a specific provider
+hound keys test serper
+
+# Remove a specific key (by index)
+hound keys remove serper 0
+
+# Remove all keys for a provider
+hound keys remove serper
+
+# Remove all keys
+hound keys clear
+```
+
+**Environment variables** (comma-separated for multiple keys):
+
+```bash
+export HOUND_SEARCH_SERPER_KEYS=key1,key2
+export HOUND_SEARCH_TAVILY_KEYS=key1
+export HOUND_SEARCH_EXA_KEYS=key1
+export HOUND_SEARCH_FIRECRAWL_KEYS=key1
+export HOUND_SEARCH_TINYFISH_KEYS=key1
+```
+
+Env vars override the config file for any provider that has env vars set. Providers without env vars fall back to the config file at `~/.hound/search_keys.json`.
+
 ---
 
 ## 🌐 Fetch & anti-bot

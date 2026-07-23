@@ -66,7 +66,7 @@ if _PROXY:
             _PROXY = None
 # Per-engine + overall deadline. Engines run in parallel + we early-return on
 # quorum, so a healthy search is ~1-2s; this bounds a fully-throttled one.
-_SEARCH_DEADLINE = float(os.environ.get("HOUND_SEARCH_DEADLINE", "5") or "5")
+_SEARCH_DEADLINE = float(os.environ.get("HOUND_SEARCH_DEADLINE", "8") or "8")
 _ua = UserAgent()
 
 
@@ -752,6 +752,56 @@ _HOUND_TO_BACKEND = {
     "brave": "brave", "google": "google", "mojeek": "mojeek", "yandex": "yandex",
     "startpage": "startpage", "grokipedia": "grokipedia",
 }
+
+# Specialized JSON-API backends (lazy registration to avoid circular import:
+# api_backends imports from search_metasearch, so we register on first use
+# instead of at module load time when search_metasearch may not be fully loaded).
+
+def _register_api_backends() -> None:
+    """Register specialized JSON-API backends lazily. Called from metasearch()
+    on first use and from tests. Safe to call multiple times (idempotent).
+    Checks _TEXT_ENGINES directly (not a flag) so re-registration works even
+    if a test saved/restored the dict."""
+    if "semantic_scholar" in _TEXT_ENGINES:
+        return
+    try:
+        from master_fetch.api_backends import (
+            SemanticScholarEngine,
+            GitHubSearchEngine,
+            HackerNewsEngine,
+        )
+        _TEXT_ENGINES["semantic_scholar"] = SemanticScholarEngine
+        _TEXT_ENGINES["github_api"] = GitHubSearchEngine
+        _TEXT_ENGINES["hackernews"] = HackerNewsEngine
+        _HOUND_TO_BACKEND["semantic_scholar"] = "semantic_scholar"
+        _HOUND_TO_BACKEND["github_api"] = "github_api"
+        _HOUND_TO_BACKEND["hackernews"] = "hackernews"
+    except Exception as ex:
+        logger.debug("api_backends not loaded: %r", ex)
+
+
+def _register_byok_backends() -> None:
+    """Register BYOK (Bring Your Own Key) search backends lazily.
+
+    Called from metasearch() on first use. Registers API-backed engines
+    (serper, tavily, exa, firecrawl, tinyfish) when user-provided keys are
+    configured (via env vars or ~/.hound/search_keys.json). These engines
+    become the PRIMARY search sources; hound's keyless local engines
+    remain as fallback. Safe to call multiple times (idempotent via
+    _TEXT_ENGINES check). Refreshes key pools so newly-added keys are
+    picked up without restart.
+    """
+    try:
+        from master_fetch.search_api_keys import get_byok_engines
+        engines = get_byok_engines()
+        for name, cls in engines.items():
+            if name not in _TEXT_ENGINES:
+                _TEXT_ENGINES[name] = cls
+                _HOUND_TO_BACKEND[name] = name
+    except Exception as ex:
+        logger.debug("byok_backends not loaded: %r", ex)
+
+
 _DEFAULT_BACKENDS = ["duckduckgo", "brave", "mojeek", "yahoo", "yandex", "startpage", "google", "qwant"]
 
 
@@ -783,9 +833,23 @@ def _reset_circuit_breaker() -> None:
 
 
 def _resolve_backends(engines: Optional[list[str]]) -> list[str]:
-    """Map hound engine names (or 'auto'/None) to ddgs backend names, dropping dups/unknowns."""
+    """Map hound engine names (or 'auto'/None) to ddgs backend names, dropping dups/unknowns.
+
+    When engines is None, returns the default backend pool PLUS any BYOK
+    backends that have been registered (user-provided API keys).
+    """
     if not engines:
-        return list(_DEFAULT_BACKENDS)
+        # Default pool + any BYOK backends that are registered.
+        base = list(_DEFAULT_BACKENDS)
+        for name in _TEXT_ENGINES:
+            if name not in base and name not in (
+                # Already in _DEFAULT_BACKENDS if applicable.
+                "duckduckgo", "brave", "google", "startpage", "grokipedia",
+                "wikipedia", "yahoo", "mojeek", "yandex", "qwant",
+            ):
+                # Include BYOK + specialized API backends that were registered.
+                base.append(name)
+        return base
     out: list[str] = []
     for e in engines:
         b = _HOUND_TO_BACKEND.get(e)
@@ -882,6 +946,7 @@ async def metasearch(
     timelimit: Optional[str] = None,
     page: int = 1,
     engines: Optional[list[str]] = None,
+    query_map: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str]]:
     """Run the backends in PARALLEL and return (results, per-backend-status).
 
@@ -893,6 +958,8 @@ async def metasearch(
     laggards, so a healthy search returns in ~1-2s while a throttled one still
     finishes within the deadline from whichever backends got through.
     """
+    _register_api_backends()  # lazy-load specialized JSON-API backends on first use
+    _register_byok_backends()  # lazy-load BYOK (user-provided API key) backends
     backends = _resolve_backends(engines)
     status: dict[str, str] = {}
     # One engine instance per backend (cheap; primp/httpx clients are light).
@@ -931,13 +998,16 @@ async def metasearch(
     # fallback returns at SOFT_DEADLINE once we have enough results even if some
     # backends are dead/captcha'd (don't wait the full deadline for them).
     min_engines = min(3, len(instances))
-    soft_deadline = 2.0
+    soft_deadline = 4.0
     quorum_results = max_results + 4  # a little extra for the neural reranker
 
     async def _run(name: str, eng: BaseSearchEngine) -> tuple[str, list[Any]]:
-        # engine.search is sync (blocking HTTP) -> offload to a thread.
+        # Per-engine query: if a query_map is provided (v12 multi-query
+        # fan-out), each engine searches its assigned variant. Falls back to
+        # the main query for engines not in the map (backward-compatible).
+        q = (query_map or {}).get(name, query)
         res = await asyncio.to_thread(
-            eng.search, query, region, safesearch, timelimit, page,
+            eng.search, q, region, safesearch, timelimit, page,
         )
         return name, (res or [])
 
@@ -1008,12 +1078,15 @@ async def metasearch(
                 status[name] = "empty"
         # early-return: enough engines contributed enough results, OR enough
         # results after the soft deadline (don't hold for dead backends).
-        # Secondary check: if we have >= max_results and soft_deadline passed,
-        # return even without quorum_results (don't wait 8s for slow engines).
+        # Secondary check: if we have >= quorum_results and soft_deadline passed,
+        # return even without full quorum (don't wait the full deadline for dead
+        # backends). Note: previously returned at max_results after soft_deadline,
+        # which returned too early with results from just 1-2 fast engines,
+        # cancelling slower engines that would have returned better results.
         elapsed = time() - start
-        if (len(order) >= quorum_results and (
+        if len(order) >= quorum_results and (
             engines_ok >= min_engines or elapsed >= soft_deadline
-        )) or (len(order) >= max_results and elapsed >= soft_deadline):
+        ):
             for pt in pending:
                 pt.cancel()
             for pt in list(pending):
@@ -1042,4 +1115,22 @@ async def metasearch(
     # freeze backends sets to sorted lists for the caller
     for e in order:
         e["backends"] = sorted(e["backends"])
+
+    # Sort: BYOK engines first, then general engines, then API backends.
+    # BYOK backends (serper, tavily, exa, firecrawl, tinyfish) are user-provided
+    # API keys and take priority as the primary search source.
+    # General HTML engines are the fallback when BYOK is not configured.
+    # API backends (GitHub, Semantic Scholar, HN) are specialized indexes that
+    # may not match query intent as well as general engines.
+    _BYOK_BACKEND_NAMES = {"serper", "tavily", "exa", "firecrawl", "tinyfish"}
+    _API_BACKEND_NAMES = {"semantic_scholar", "github_api", "hackernews"}
+    def _sort_key(e: dict[str, str]) -> int:
+        b = e.get("backend", "")
+        if b in _BYOK_BACKEND_NAMES:
+            return 0  # BYOK first
+        if b in _API_BACKEND_NAMES:
+            return 2  # specialized API backends last
+        return 1  # general HTML engines
+    order.sort(key=_sort_key)
+
     return order, status

@@ -352,6 +352,13 @@ class TestSearchProxyValidation:
         finally:
             os.environ.pop("HOUND_SEARCH_PROXY", None)
             importlib.reload(m)
+            # Reload api_backends so MetaBlockedException references
+            # stay in sync after search_metasearch reload.
+            try:
+                import master_fetch.api_backends as _ab
+                importlib.reload(_ab)
+            except Exception:
+                pass
 
     def test_whitespace_only_nulled(self):
         """Whitespace-only proxy becomes None, not a crash-inducing string."""
@@ -364,6 +371,13 @@ class TestSearchProxyValidation:
         finally:
             os.environ.pop("HOUND_SEARCH_PROXY", None)
             importlib.reload(m)
+            # Reload api_backends so MetaBlockedException references
+            # stay in sync after search_metasearch reload.
+            try:
+                import master_fetch.api_backends as _ab
+                importlib.reload(_ab)
+            except Exception:
+                pass
 
     def test_invalid_scheme_rejected(self):
         """Unknown scheme (not http/https/socks5/socks5h) is rejected."""
@@ -376,6 +390,13 @@ class TestSearchProxyValidation:
         finally:
             os.environ.pop("HOUND_SEARCH_PROXY", None)
             importlib.reload(m)
+            # Reload api_backends so MetaBlockedException references
+            # stay in sync after search_metasearch reload.
+            try:
+                import master_fetch.api_backends as _ab
+                importlib.reload(_ab)
+            except Exception:
+                pass
 
     def test_valid_socks5_accepted(self):
         """socks5 scheme is accepted (primp supports it natively)."""
@@ -388,6 +409,13 @@ class TestSearchProxyValidation:
         finally:
             os.environ.pop("HOUND_SEARCH_PROXY", None)
             importlib.reload(m)
+            # Reload api_backends so MetaBlockedException references
+            # stay in sync after search_metasearch reload.
+            try:
+                import master_fetch.api_backends as _ab
+                importlib.reload(_ab)
+            except Exception:
+                pass
 
     def test_no_proxy_env(self):
         """Unset env var -> None (direct connection)."""
@@ -396,6 +424,12 @@ class TestSearchProxyValidation:
         import master_fetch.search_metasearch as m
         importlib.reload(m)
         assert m._PROXY is None
+        # Reload api_backends to sync class references after reload.
+        try:
+            import importlib as _il, master_fetch.api_backends as _ab
+            _il.reload(_ab)
+        except Exception:
+            pass
 
     def test_all_engines_construction_failure_raises(self):
         """If every engine fails to construct (bad deps, etc), raise an error
@@ -408,6 +442,10 @@ class TestSearchProxyValidation:
             def __init__(self, **kwargs):
                 raise RuntimeError("simulated construction failure")
 
+        original = dict(m._TEXT_ENGINES)
+        # Ensure lazy-registered backends (API, BYOK) are in the dict before replacing.
+        m._register_api_backends()
+        m._register_byok_backends()
         original = dict(m._TEXT_ENGINES)
         for name in m._TEXT_ENGINES:
             m._TEXT_ENGINES[name] = type(

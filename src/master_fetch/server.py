@@ -2756,7 +2756,7 @@ class MasterFetchServer:
         page: int = 0,
         freshness: Optional[str] = None,
     ) -> SearchResponseModel:
-        """Local keyless web search (no API key, no account, no third-party service).
+        """Keyless web search (no API key, no account, no third-party service).
 
         Runs 9 keyless backends in parallel (duckduckgo, brave, mojeek, yahoo,
         yandex, startpage, google + opt-in wikipedia, grokipedia; engines= to
@@ -2768,6 +2768,11 @@ class MasterFetchServer:
         site/exclude_sites (domain include/exclude on the final URL),
         location/language/region (geo), page (0-10), freshness
         (day|week|month|year). Results cached 5min.
+
+        BYOK: if you have configured search API keys (Serper, Tavily, Exa,
+        Firecrawl, TinyFish) via `hound keys add` or env vars
+        (HOUND_SEARCH_*_KEYS), those providers become the primary search source
+        with key rotation and automatic fallback to this keyless search.
         """
         from master_fetch.search import SearchResponseModel  # lazy: search.py pulls the metasearch engine chain
         try:
@@ -2900,7 +2905,7 @@ class MasterFetchServer:
         },
         {
             "name": "mcp_smart_search",
-            "description": "Keyless web search (no API key, no account). 10 backends in parallel (ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant + opt-in wikipedia,grokipedia), neural-reranked + six-signal ranking (consensus + domain reputation + answer-signal scoring + title relevance + URL relevance). Returns URLs + ranking + snippets, NOT page content. After search, smart_fetch the 1-2 best results with focus='your question' to get page content. \n\nANTI-PATTERN: Don't search for something you already have a URL for - use smart_fetch with focus= instead. Don't do one search per sub-fact - one broad search + 1-2 targeted fetches is enough. Don't fetch every search result. \n\nFILTERS (in options): site='domain.com' restricts to one domain. exclude_sites=['pinterest.com'] removes noise. freshness='day|week|month|year' for time-sensitive queries. page=0-10 for pagination. location/language/region for geo. \n\nRESULT FIELDS: relevance_score (0-1), fetch_relevance (high/med/low - fetch high first), engines_consensus (how many independent indexes returned this URL - higher = more authoritative), source_type (docs|paper|repo|blog|forum|reference|news|other - pick the right source type), related_queries (follow-up queries from result titles+snippets).",
+            "description": "Keyless web search (no API key, no account). 10 general backends in parallel (ddg,brave,mojeek,yahoo,yandex,startpage,google,qwant + opt-in wikipedia,grokipedia) + auto-fired specialized JSON-API backends based on query intent: Semantic Scholar (200M+ papers, AI-ranked, for research/factual queries), GitHub Search (repos sorted by stars, for code queries), Hacker News (tech community news/discussions, for news/howto queries). All run in parallel (zero added latency) and merge into the same ranking pipeline. Neural-reranked + intent-aware multi-query fan-out (detects query intent, sends expanded query variants to diversity engines for wider recall at zero added latency or request count) + six-signal ranking (cross-variant consensus + domain reputation + answer-signal scoring + title relevance + URL relevance) + result diversity (max 2 per domain in top results). Returns URLs + ranking + snippets, NOT page content. After search, smart_fetch the 1-2 best results with focus='your question' to get page content. \n\nANTI-PATTERN: Don't search for something you already have a URL for - use smart_fetch with focus= instead. Don't do one search per sub-fact - one broad search + 1-2 targeted fetches is enough. Don't fetch every search result. \n\nFILTERS (in options): site='domain.com' restricts to one domain. exclude_sites=['pinterest.com'] removes noise. freshness='day|week|month|year' for time-sensitive queries. page=0-10 for pagination. location/language/region for geo. \n\nRESULT FIELDS: relevance_score (0-1), fetch_relevance (high/med/low - fetch high first), engines_consensus (how many independent indexes returned this URL - higher = more authoritative; cross-variant consensus from multi-query fan-out strengthens this), source_type (docs|paper|repo|blog|forum|reference|news|other - pick the right source type), related_queries (follow-up queries from result titles+snippets).",
             "inputSchema": {
                 "type": "object", "required": ["query"],
                 "properties": {
@@ -3156,6 +3161,70 @@ def _help_epilog() -> str:
     ])
 
 
+def _test_byok_keys(provider: str | None = None) -> None:
+    """Test BYOK search API keys by making a live search request."""
+    from master_fetch import cli_ui as ui
+    from master_fetch.byok_config import BYOK_PROVIDERS, load_byok_keys, redact_key
+    import httpx
+    import time
+
+    keys = load_byok_keys()
+    if not keys:
+        print(ui.dim("  No search API keys configured."))
+        print(ui.dim("  Add with: hound keys add <provider> <key>"))
+        return
+
+    # API endpoints + auth headers for live testing.
+    _TEST_CONFIG: dict[str, dict] = {
+        "serper": {"url": "https://google.serper.dev/search", "method": "POST",
+                   "data": {"q": "test", "num": 1},
+                   "headers": lambda k: {"X-API-KEY": k, "Content-Type": "application/json"}},
+        "tavily": {"url": "https://api.tavily.com/search", "method": "POST",
+                   "data": {"query": "test", "max_results": 1, "search_depth": "basic"},
+                   "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}},
+        "exa": {"url": "https://api.exa.ai/search", "method": "POST",
+                "data": {"query": "test", "numResults": 1, "type": "auto"},
+                "headers": lambda k: {"x-api-key": k, "Content-Type": "application/json"}},
+        "firecrawl": {"url": "https://api.firecrawl.dev/v2/search", "method": "POST",
+                      "data": {"query": "test", "limit": 1},
+                      "headers": lambda k: {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}},
+        "tinyfish": {"url": "https://api.search.tinyfish.ai", "method": "GET",
+                     "data": {"query": "test", "limit": 1},
+                     "headers": lambda k: {"X-API-Key": k}},
+    }
+
+    providers_to_test = [provider] if provider else list(keys.keys())
+    for p in providers_to_test:
+        if p not in _TEST_CONFIG:
+            print(f"  {ui.red('ERROR')} Unknown provider: {p}")
+            continue
+        pkeys = keys.get(p, [])
+        if not pkeys:
+            print(f"  {ui.dim(p)}: no keys configured")
+            continue
+        cfg = _TEST_CONFIG[p]
+        for i, key in enumerate(pkeys):
+            try:
+                t0 = time.time()
+                if cfg["method"] == "GET":
+                    resp = httpx.get(cfg["url"], params=cfg["data"],
+                                   headers=cfg["headers"](key), timeout=10)
+                else:
+                    resp = httpx.post(cfg["url"], json=cfg["data"],
+                                    headers=cfg["headers"](key), timeout=10)
+                elapsed = time.time() - t0
+                if resp.status_code == 200:
+                    print(f"  {ui.ok('PASS')} {p}[{i}] {redact_key(key)} -> 200 OK ({elapsed:.1f}s)")
+                elif resp.status_code == 429:
+                    print(f"  {ui.warn('RATE')} {p}[{i}] {redact_key(key)} -> 429 rate-limited")
+                elif resp.status_code in (401, 403):
+                    print(f"  {ui.red('FAIL')} {p}[{i}] {redact_key(key)} -> {resp.status_code} unauthorized")
+                else:
+                    print(f"  {ui.red('FAIL')} {p}[{i}] {redact_key(key)} -> {resp.status_code}")
+            except Exception as e:
+                print(f"  {ui.red('FAIL')} {p}[{i}] {redact_key(key)} -> {type(e).__name__}: {str(e)[:60]}")
+
+
 def main():
     """Entry point for the hound CLI."""
     from master_fetch import cli_ui as ui
@@ -3185,6 +3254,20 @@ def main():
                         help="reinstall the version from before the last update")
     parser.add_argument("--reinstall", action="store_true",
                         help="full reinstall with all deps + [all] extras")
+    subparsers = parser.add_subparsers(dest="keys_cmd",
+                                       help="manage BYOK search API keys")
+    keys_parser = subparsers.add_parser("keys", help="manage search API keys (serper, tavily, exa, firecrawl, tinyfish)")
+    keys_sub = keys_parser.add_subparsers(dest="keys_action", help="keys sub-command")
+    keys_add = keys_sub.add_parser("add", help="add an API key for a provider")
+    keys_add.add_argument("provider", help="provider name (serper, tavily, exa, firecrawl, tinyfish)")
+    keys_add.add_argument("key", help="API key")
+    keys_list = keys_sub.add_parser("list", help="list configured API keys (redacted)")
+    keys_test = keys_sub.add_parser("test", help="test API keys")
+    keys_test.add_argument("provider", nargs="?", default=None, help="test only this provider (default: all)")
+    keys_remove = keys_sub.add_parser("remove", help="remove an API key")
+    keys_remove.add_argument("provider", help="provider name")
+    keys_remove.add_argument("index", type=int, nargs="?", default=None, help="key index (0-based). Omit to remove all keys for this provider")
+    keys_clear = keys_sub.add_parser("clear", help="remove all API keys")
     args = parser.parse_args()
 
     # Sweep a stale launcher left by a previous `hound -u` (Windows only).
@@ -3195,6 +3278,63 @@ def main():
         return
     if args.reinstall:
         updater.reinstall()
+        return
+    if args.keys_cmd == "keys":
+        from master_fetch.byok_config import (
+            BYOK_PROVIDERS, add_key, remove_key, clear_all_keys,
+            list_keys, redact_key, load_byok_keys,
+        )
+        action = args.keys_action
+        if action == "add":
+            try:
+                add_key(args.provider, args.key)
+                print(f"  {ui.ok('OK')} Added key for {args.provider} -> {redact_key(args.key)}")
+                print(f"  Config: ~/.hound/search_keys.json")
+            except (ValueError, OSError) as e:
+                print(f"  {ui.red('ERROR')} {e}")
+                return 1
+            return
+        if action == "list":
+            keys = list_keys()
+            if not keys:
+                print(ui.dim("  No search API keys configured."))
+                print(ui.dim("  Add with: hound keys add <provider> <key>"))
+                print(ui.dim(f"  Providers: {', '.join(BYOK_PROVIDERS)}"))
+                return
+            print(ui.branded(ui.cyan("BYOK Search Keys"), ui.dim("~/.hound/search_keys.json")))
+            for provider in BYOK_PROVIDERS:
+                pkeys = keys.get(provider, [])
+                if pkeys:
+                    print(f"  {ui.cyan(provider)}: {len(pkeys)} key(s)")
+                    for i, k in enumerate(pkeys):
+                        print(f"    [{i}] {redact_key(k)}")
+                else:
+                    print(f"  {ui.dim(provider)}: not configured")
+            return
+        if action == "test":
+            _test_byok_keys(args.provider)
+            return
+        if action == "remove":
+            try:
+                removed = remove_key(args.provider, args.index)
+                if removed:
+                    idx_str = f"[{args.index}]" if args.index is not None else "(all)"
+                    print(f"  {ui.ok('OK')} Removed {removed} key(s) {idx_str} from {args.provider}")
+                else:
+                    print(f"  {ui.warn('INFO')} No keys configured for {args.provider}")
+            except (ValueError, IndexError, OSError) as e:
+                print(f"  {ui.red('ERROR')} {e}")
+                return 1
+            return
+        if action == "clear":
+            removed = clear_all_keys()
+            if removed:
+                print(f"  {ui.ok('OK')} Removed {removed} key(s) from all providers")
+            else:
+                print(ui.dim("  No keys to remove."))
+            return
+        # No sub-action: show help.
+        keys_parser.print_help()
         return
     if args.rollback:
         updater.rollback()

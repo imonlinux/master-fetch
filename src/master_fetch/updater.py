@@ -820,6 +820,18 @@ def doctor() -> None:
     else:
         browser_detail = "ok"
 
+    # 9. BYOK search API keys (non-blocking, info-only)
+    byok_detail = "none configured"
+    try:
+        from master_fetch.byok_config import load_byok_keys, BYOK_PROVIDERS
+        byok_keys = load_byok_keys()
+        if byok_keys:
+            byok_detail = ", ".join(f"{p}({len(v)})" for p, v in byok_keys.items() if v)
+        else:
+            byok_detail = "none (local keyless search only)"
+    except Exception:
+        byok_detail = "check failed"
+
     # 8. PyPI reachability + version (info only, not a failure)
     installed, latest, _ = check_version()
     if latest is None:
@@ -848,6 +860,8 @@ def doctor() -> None:
     bw_mark = (ui._sty(ui._glyph("\u2713", "+"), ui._GREEN) if browser_ok
                else ui._sty(ui._glyph("!", "!"), ui._MAGENTA))
     rows.append(f"{bw_mark} {'browser deps':<22} {ui.dim(_short(browser_detail, 30))}")
+    # BYOK search API keys (non-blocking, info-only)
+    rows.append(f"  {'byok search keys':<22} {ui.dim(_short(byok_detail, 30))}")
     print(ui.panel(rows, 64))
     # Verdict + fixes (outside the panel)
     if missing:
