@@ -47,17 +47,21 @@ Same prompt, three tools. Hound does the whole thing on its own, search + fetch 
 
 ---
 
-## ✨ New in 11.1.5
+## ✨ New in 12.1.2
 
-**Next-gen stealth engine. Hound now passes the hardest anti-bot targets.**
+**BYOK search · intent-aware multi-query fan-out · six-signal ranking · next-gen stealth engine.**
 
-- 🧬 **Stealth engine**: system Chrome auto-detection (`channel=chrome` for real TLS fingerprint), 4 coherent fingerprint profiles, JS-layer patches (HeadlessChrome UA fix, `navigator.webdriver=undefined`, canvas noise via `getImageData`+`toDataURL` interception, permissions API). Human behavior simulation (Bezier mouse curves, natural scroll, dwell time). CF Turnstile solver with human-like mouse movement.
-- 📊 **Real-world results**: passes bot.sannysoft.com (all checks), bypasses Cloudflare Turnstile on CanadianInsider (hardest in a 31-site benchmark), Medium, StackOverflow, NowSecure, Glassdoor (DataDome). See the [stealth benchmark](#-stealth-benchmark) below.
-- 🧠 **Memory optimized**: `--renderer-process-limit=1`, V8 heap cap 512MB, `Memory.simulatePressureNotification` via CDP after each fetch (triggers Chrome GC). CDP session leak fixed. RSS stays flat across sequential fetches.
+- 🔑 **Bring Your Own Key (BYOK) search**: add your own API keys for Serper, Tavily, Exa, Firecrawl, or TinyFish via `hound keys add`. Keys become the primary search source with **key stacking** (multiple keys per provider, auto-rotation on rate limit), automatic fallback to Hound's keyless local engines when all keys are exhausted. CLI key management: `hound keys add/list/test/remove/clear`.
+- 🧠 **Intent-aware multi-query fan-out**: Hound detects query intent (comparison, howto, research, code, reference, news, factual) and generates expanded query variants distributed across diversity engines. Same parallel request count, zero added latency, wider recall. Cross-variant consensus: a URL surfaced by different queries from different engines is a stronger authority signal.
+- 📊 **Six-signal ranking**: cross-variant consensus + domain reputation + answer-signal scoring + title relevance + URL relevance + result diversity (max 2 per domain in top results). Source-type detection tags every result as docs/paper/repo/blog/forum/reference/news.
+- 🧬 **Next-gen stealth engine**: system Chrome auto-detection, 4 coherent fingerprint profiles, JS-layer patches (HeadlessChrome UA fix, `navigator.webdriver=undefined`, canvas noise, permissions API), human behavior simulation (Bezier mouse curves, natural scroll), CF Turnstile solver with human-like mouse movement. Passes bot.sannysoft.com, bypasses Cloudflare Turnstile on CanadianInsider (hardest in a 31-site benchmark), Medium, StackOverflow, NowSecure, Glassdoor (DataDome). See the [stealth benchmark](#-stealth-benchmark) below.
 - 🐍 **No more scrapling.** All scrapling functionality replaced with hound's own modules: `fetcher.py` (primp-based HTTP), `browser.py` (patchright-based browser), `extractor.py` (trafilatura + markdownify). Smaller install, fewer transitive deps, faster cold start.
 - 📱 **Works everywhere.** Lean install `pip install hound-mcp` pulls no browser deps. On platforms without playwright (Termux, aarch64), hound runs in HTTP-only mode with graceful degradation.
-- 🔒 **Fixed `Response.css()`**: added `cssselect` as explicit dependency (was missing from lxml's dependency tree). Removed silent `[]` return on errors; invalid selectors now raise.
-- 🔧 **805 tests**.
+- 🔒 **Reliability fixes**: universal error detection (error pages no longer look like success), dead Internet Archive fallback removed, self-healing CLI + stale process cleanup, CSS selector errors propagate instead of silently returning `[]`, browser startup failure cleans partial sessions, `hound --rollback` works for pinned older versions, `focus` and `actions` now forwarded from MCP dispatcher to `smart_fetch`.
+- 🐳 **Docker support**: multi-stage Dockerfile, docker-compose with shm_size 1gb, non-root user, healthcheck. By @imonlinux.
+- 🧪 **673 tests**.
+
+[457 more lines in file. Use offset=61.]
 
 ---
 
@@ -191,57 +195,79 @@ Same gray-area posture as SearXNG / ddgs; no search-engine ToS compliance is cla
 
 ### 🔑 Bring Your Own Key (BYOK)
 
-Hound's local keyless search is the default and works with zero configuration. If you want **superior search quality** from paid API providers, you can add your own API keys. When keys are configured, those providers become the **primary search source**, with Hound's local engines as automatic fallback when all API keys are exhausted or rate-limited.
+Hound's local keyless search works with zero configuration and never goes away. But some users have API keys from search providers, either from free tiers or paid plans. Hound respects that: bring your keys, and Hound makes them first-class citizens with the same reliability guarantees as its own keyless engines.
 
-**Supported providers** (all offer free tiers):
+When keys are configured, those providers become the **primary search source**. Hound's local engines run alongside them in parallel as automatic fallback: if every API key is exhausted or rate-limited, the local engines carry the search with zero interruption. The agent never sees an empty result set.
 
-| Provider | Free tier | Auth | Endpoint |
+#### Supported providers
+
+| Provider | Free tier | Auth | Strength |
 |----------|-----------|------|----------|
-| [Serper](https://serper.dev) | 2,500 credits one-time | `X-API-KEY` | Google SERP |
-| [Tavily](https://tavily.com) | 1,000 credits/month | `Bearer` | AI search |
+| [Serper](https://serper.dev) | 2,500 credits one-time | `X-API-KEY` | Google SERP, fast |
+| [Tavily](https://tavily.com) | 1,000 credits/month | `Bearer` | AI-ranked results |
 | [Exa](https://exa.ai) | 1,000 searches/month | `x-api-key` | Neural search |
-| [Firecrawl](https://firecrawl.dev) | 1,000 credits/month | `Bearer` | Web search |
-| [TinyFish](https://tinyfish.ai) | 30 req/min (~43K/month) | `X-API-Key` | Web search |
+| [Firecrawl](https://firecrawl.dev) | 1,000 credits/month | `Bearer` | Web search + crawl |
+| [TinyFish](https://tinyfish.ai) | 30 req/min (~43K/month) | `X-API-Key` | High throughput |
 
-**Key rotation**: add multiple keys per provider. If one key hits a rate limit (429), Hound automatically switches to the next key for the same provider instead of falling back to local search. Only when ALL keys for ALL providers are exhausted does Hound fall back to its keyless local engines.
+Mix and match. Use one provider, use all five, switch providers anytime. Hound treats them as parallel engines in the same ranking pipeline.
 
-**CLI key management**:
+#### Key stacking
+
+Add **multiple keys per provider**. Hound stacks them in a rotation pool per provider:
+
+- 🔁 **Auto-rotation**: when a key hits a rate limit (HTTP 429), Hound switches to the next key for the **same provider** within milliseconds. The search completes without the agent ever knowing a key was rate-limited.
+- ⏳ **Per-key cooldown**: a rate-limited key enters a 60-second cooldown. An invalid key (401/403) enters a 300-second cooldown. Hound keeps trying the remaining keys in the pool.
+- 🛡️ **Graceful exhaustion**: only when **all keys for all providers** are exhausted does Hound fall back to its keyless local engines. The transition is seamless.
+- 📊 **Live key testing**: `hound keys test` makes a real API call per key and reports which are valid, rate-limited, or invalid. Know before you search.
+
+This means your search capacity scales with how many keys you configure, not with a single key's rate limit.
+
+#### CLI key management
 
 ```bash
-# Add a key
+# Add a key (stack multiple keys for the same provider)
 hound keys add serper YOUR_SERPER_KEY
+hound keys add serper ANOTHER_SERPER_KEY   # stacked, auto-rotated
 hound keys add tavily YOUR_TAVILY_KEY
 
-# List configured keys (redacted)
+# List all configured keys (redacted for safety)
 hound keys list
 
-# Test all keys (makes a live API call per key)
+# Test all keys (live API call per key)
 hound keys test
 
 # Test a specific provider
 hound keys test serper
 
-# Remove a specific key (by index)
+# Remove a specific key by index (0-based)
 hound keys remove serper 0
 
 # Remove all keys for a provider
 hound keys remove serper
 
-# Remove all keys
+# Remove all keys across all providers
 hound keys clear
 ```
 
-**Environment variables** (comma-separated for multiple keys):
+Keys are stored at `~/.hound/search_keys.json` with redaction on display. Key rotation state is in-memory only (resets on restart).
+
+#### Environment variables
+
+For CI/CD, Docker, or ephemeral environments, set env vars instead of the config file. Comma-separated for multiple keys:
 
 ```bash
-export HOUND_SEARCH_SERPER_KEYS=key1,key2
+export HOUND_SEARCH_SERPER_KEYS=key1,key2,key3
 export HOUND_SEARCH_TAVILY_KEYS=key1
 export HOUND_SEARCH_EXA_KEYS=key1
 export HOUND_SEARCH_FIRECRAWL_KEYS=key1
 export HOUND_SEARCH_TINYFISH_KEYS=key1
 ```
 
-Env vars override the config file for any provider that has env vars set. Providers without env vars fall back to the config file at `~/.hound/search_keys.json`.
+Env vars override the config file for any provider that has env vars set. Providers without env vars fall back to the config file. Mix both: some providers in the config file, others via env vars.
+
+#### `hound doctor` integration
+
+`hound --doctor` reports your BYOK configuration status: which providers have keys, how many keys per provider, and whether any are in cooldown. One command to see the full picture.
 
 ---
 
