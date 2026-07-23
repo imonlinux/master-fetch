@@ -24,10 +24,11 @@ COPY pyproject.toml /app/
 COPY README.md /app/
 
 # Install Hound and its dependencies
-RUN pip install --no-cache-dir -e .[all]
+RUN pip install --no-cache-dir --break-system-packages -e .[all]
 
 # Install Playwright browsers
 RUN python3 -c "from playwright.sync_api import sync_playwright; sync_playwright().start(); install()" || \
+    pip install --break-system-packages playwright && \
     python3 -m playwright install chromium
 
 # Create data directory for cache
