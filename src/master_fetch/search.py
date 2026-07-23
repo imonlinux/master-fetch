@@ -1,18 +1,27 @@
-"""Hound local web search (v7 flagship: keyless, no-account, fully local).
+"""Hound local web search (v8: multi-signal ranking, zero-latency quality signals).
 
-Scrapes public search engines (DuckDuckGo, Bing, Qwant, Wikipedia) via the
-hound-native engine layer in search_engines.py - no third-party API, no key, no
-account. Results are merged across engines, deduped by normalized URL, and
-ranked. Merging INDEPENDENT indexes gives a free authority signal: a URL
-returned by several engines is a consensus hit (engines_consensus field) and
-gets a ranking boost. Every result also carries a relevance_score and a
-fetch_relevance tier so the agent fetches the right URLs via smart_fetch itself
-(search returns URLs + ranking, NOT page content - the agent decides what to fetch).
+Scrapes public search engines (DuckDuckGo, Brave, Mojeek, Yahoo, Yandex,
+Startpage, Google, Qwant + opt-in Wikipedia, Grokipedia) via the hound-native
+engine layer in search_engines.py - no third-party API, no key, no account.
+Results are merged across engines, deduped by normalized URL, and ranked by a
+six-signal composite: neural cross-encoder (topical relevance) + cross-engine
+consensus (authority) + domain reputation (source quality for query intent) +
+answer-signal scoring (snippet contains actual answer data vs just discussing
+the topic) + title relevance (query terms in the result title) + URL relevance
+(query terms in the result URL path). All signals are zero-latency (operate on
+already-fetched snippets, titles, and URLs - no extra HTTP calls).
 
-Rerank: neural (a local ONNX cross-encoder on snippets, needs [all]; the ONLY
-reranker - BM25 was removed as redundant since neural matches its speed and
-ranks better), find_similar (pass url=, find pages similar to it). Lean installs
-without the model fall back to cross-engine consensus + engine-position order.
+Snippets from multiple engines are MERGED when the same URL appears in several
+backends, giving the agent richer information per result without fetching pages.
+
+Returns URLs + ranking + snippets, NOT page content. The agent smart_fetches
+the 1-2 best results with focus= to get page content. This is the efficient
+workflow: one search (fast, no page fetches) + 1-2 targeted fetches (accurate,
+get exactly the content needed).
+
+Rerank: neural (local ONNX cross-encoder on snippets, needs [all]), find_similar
+(pass url=, find pages similar to it). Lean installs without the model fall back
+to cross-engine consensus + domain + answer-signal scoring (no neural).
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import re
 from collections import Counter
 from time import time
 from typing import Optional
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +45,116 @@ from master_fetch.search_engines import (
 )
 
 logger = logging.getLogger("master-fetch.search")
+
+
+# ─── domain reputation + answer-signal scoring (zero-latency quality signals) ─
+# These run AFTER neural rerank, operating on already-fetched snippets. They
+# address the "discusses vs contains" gap: a Medium blog post titled "The
+# Evolution of GPT" scores high on topical relevance but contains zero data.
+# A GitHub repo with "d_model=12288, layers=96" in the snippet scores similarly
+# on neural but CONTAINS the answer. Domain reputation + answer signals break
+# that tie toward the result that actually has the data.
+
+_TECH_DOMAINS = frozenset({
+    "github.com", "arxiv.org", "stackoverflow.com", "docs.python.org",
+    "huggingface.co", "paperswithcode.com", "pytorch.org", "tensorflow.org",
+    "developer.mozilla.org", "kaggle.com", "pypi.org", "npmjs.com",
+    "raw.githubusercontent.com", "dl.acm.org", "acm.org", "ieee.org",
+    "openreview.net", "semanticscholar.org", "scholar.google.com",
+    "docs.anthropic.com", "docs.openai.com", "platform.openai.com",
+    "openai.com", "anthropic.com", "ai.meta.com", "research.google.com",
+    "deepmind.google", "mistral.ai", "x.ai", "grok.com", "deepseek.com",
+})
+_REFERENCE_DOMAINS = frozenset({
+    "wikipedia.org", "wikimedia.org", "britannica.com",
+})
+
+# Keywords that indicate a technical/factual query (not an opinion/news query).
+_TECH_QUERY_SIGNALS = frozenset({
+    "model", "architecture", "d_model", "embedding", "dimension", "api",
+    "code", "implement", "benchmark", "paper", "arxiv", "github",
+    "algorithm", "neural", "transformer", "layer", "parameter",
+    "config", "specification", "spec", "schema", "table", "comparison",
+    "matrix", "tensor", "precision", "throughput", "latency",
+    "inference", "training", "fine-tun", "quantiz", "attention",
+    "tokeniz", "vocab", "hidden", "encoder", "decoder", "dense",
+})
+
+# Answer-signal patterns: detect if the snippet CONTAINS the answer, not just
+# discusses the topic. Each pattern is gated on a query-type check so it only
+# fires when the query asks for that type of answer.
+_DIGIT_RE = re.compile(r"\d{3,}")  # 3+ digits = likely a real value, not a year
+_TABLE_MARKERS = ("table", "|", "column", "row", "\t")
+_CODE_MARKERS = ("def ", "func ", "class ", "import ", "const ", "```", "=> ", "fn ")
+_COMPARISON_MARKERS = ("vs", "compared", "while", "however", "whereas", "better", "faster", "larger")
+
+
+def _domain_boost(url: str, query: str, is_technical: bool) -> float:
+    """Boost authoritative domains for the query type. Returns 0.0-0.15.
+    Not a blocklist: Medium/Substack are simply not boosted, not penalized.
+    Checks subdomain matching (en.wikipedia.org matches wikipedia.org)."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+    except Exception:
+        return 0.0
+    if not host:
+        return 0.0
+    # Check exact match or subdomain match (e.g. en.wikipedia.org matches wikipedia.org)
+    def _matches_domain_set(domain_set: frozenset[str]) -> bool:
+        if host in domain_set:
+            return True
+        for d in domain_set:
+            if host.endswith(f".{d}"):
+                return True
+        return False
+    if _matches_domain_set(_TECH_DOMAINS) and is_technical:
+        return 0.15
+    if _matches_domain_set(_REFERENCE_DOMAINS):
+        return 0.05
+    return 0.0
+
+
+def _answer_signal_score(query: str, snippet: str, is_technical: bool) -> float:
+    """Detect if the snippet contains actual answer data vs just discussing the topic.
+    Returns 0.0-0.3 additive boost. Zero-latency (regex on already-fetched text)."""
+    if not snippet:
+        return 0.0
+    boost = 0.0
+    q_lower = query.lower()
+    s_lower = snippet.lower()
+
+    # Query asks for numbers/sizes/dimensions -> boost snippets with real digits
+    if is_technical or any(w in q_lower for w in (
+        "dimension", "size", "parameters", "count", "number", "how many",
+        "value", "d_model", "embedding", "layers", "heads",
+    )):
+        if _DIGIT_RE.search(snippet):
+            boost += 0.15
+
+    # Query asks for a table -> boost snippets with table markers
+    if "table" in q_lower or "comparison" in q_lower:
+        if any(w in s_lower for w in _TABLE_MARKERS):
+            boost += 0.15
+
+    # Query asks for comparison -> boost snippets with comparison structure
+    if any(w in q_lower for w in ("vs", "compare", "comparison", "difference", "better")):
+        if any(w in s_lower for w in _COMPARISON_MARKERS):
+            boost += 0.10
+
+    # Query mentions code/API -> boost snippets with code markers
+    if any(w in q_lower for w in ("code", "api", "function", "method", "implement", "example", "snippet")):
+        if any(w in s_lower for w in _CODE_MARKERS):
+            boost += 0.10
+
+    return min(boost, 0.30)
+
+
+def _is_technical_query(query: str) -> bool:
+    """Detect if the query is technical/factual (vs opinion/news/how-to)."""
+    q_lower = query.lower()
+    return any(sig in q_lower for sig in _TECH_QUERY_SIGNALS)
 
 
 def neural_rerank(query: str, ranked: list[RawResult]):
@@ -167,14 +287,15 @@ class SearchResult(BaseModel):
     snippet: str = Field(default="", description="Result snippet from the engine")
     source: str = Field(default="", description="Backend(s) that returned this result (duckduckgo/brave/mojeek/yahoo/yandex/startpage/google/wikipedia/grokipedia). Multiple = cross-backend consensus.")
     position: int = Field(default=0, description="1-indexed rank after merge + rerank")
-    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (neural cross-encoder score in neural mode, min-max normalized), boosted by cross-backend consensus. 1.0 = most relevant in this set.")
-    fetch_relevance: str = Field(default="", description="high|med|low - relative relevance hint. smart_fetch what matches your need; the tiers rank results but a lower tier can be the right one - use your judgment.")
+    relevance_score: float = Field(default=0.0, description="0.0-1.0 relevance to the query (neural cross-encoder score in neural mode, min-max normalized), boosted by cross-backend consensus + domain reputation + answer-signal scoring. 1.0 = most relevant in this set.")
+    fetch_relevance: str = Field(default="", description="high|med|low - relative relevance hint incorporating neural score + consensus + domain reputation + answer signals. smart_fetch what matches your need; the tiers rank results but a lower tier can be the right one - use your judgment.")
     engines_consensus: str = Field(default="", description="How many independent indexes returned this URL (e.g. '3 of 4'). A free authority signal: a URL returned by several independent engines is more likely authoritative.")
+    source_type: str = Field(default="", description="Source type from URL pattern: docs|paper|repo|blog|forum|reference|news|other. Helps pick the right source: docs for API docs, paper for research, repo for code, forum for Q&A, reference for encyclopedic.")
 
 
 class SearchResponseModel(BaseModel):
     query: str = Field(description="Search query")
-    results: list[SearchResult] = Field(description="Ranked search results (URLs + ranking, not page content)")
+    results: list[SearchResult] = Field(description="Ranked search results (URLs + ranking + snippets, NOT page content). smart_fetch the best results to get content.")
     total_results: int = Field(default=0, description="Results returned")
     engines_used: list[str] = Field(default=[], description="Engines that returned results")
     engine_blocked: list[str] = Field(default=[], description="Engines that did NOT contribute (rate-limited/CAPTCHA'd/timed out/parsed no results). Results still came from engines_used; retry shortly for more recall.")
@@ -188,11 +309,154 @@ class SearchResponseModel(BaseModel):
     next_action: str = Field(default="", description="The obvious next call: fetch the high results, rephrase, retry, etc. Empty = nothing more to do.")
 
 
+# ─── source type detection (zero-latency URL pattern matching) ──────────────
+# Classifies results by URL pattern so the agent can pick the right type of
+# source: docs for API docs, paper for research, repo for code, forum for Q&A,
+# reference for encyclopedic. Helps the agent skip blog posts when it needs
+# primary sources, or skip forums when it needs official docs.
+
+_DOCS_DOMAINS = frozenset({
+    "docs.python.org", "docs.anthropic.com", "docs.openai.com", "platform.openai.com",
+    "pytorch.org", "tensorflow.org", "developer.mozilla.org", "developers.google.com",
+    "docs.github.com", "docs.microsoft.com", "learn.microsoft.com", "docs.rs",
+    "go.dev", "doc.rust-lang.org", "kotlinlang.org", "dart.dev", "flutter.dev",
+    "nodejs.org", "react.dev", "vuejs.org", "angular.io", "svelte.dev",
+})
+_PAPER_DOMAINS = frozenset({
+    "arxiv.org", "dl.acm.org", "acm.org", "ieee.org", "ieeexplore.ieee.org",
+    "openreview.net", "semanticscholar.org", "scholar.google.com",
+    "paperswithcode.com", "papers.ssrn.com", "biorxiv.org", "medrxiv.org",
+})
+_REPO_DOMAINS = frozenset({
+    "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+    "sourceforge.net", "raw.githubusercontent.com",
+})
+_FORUM_DOMAINS = frozenset({
+    "stackoverflow.com", "serverfault.com", "superuser.com", "askubuntu.com",
+    "reddit.com", "news.ycombinator.com", "discourse.org", "discuss.python.org",
+    "forum.vuejs.org", "groups.google.com", "community.openai.com",
+})
+_BLOG_DOMAINS = frozenset({
+    "medium.com", "substack.com", "dev.to", "hashnode.com", "blog.google",
+    "towardsdatascience.com", "freecodecamp.org",
+})
+_REFERENCE_DOMAINS_SET = frozenset({
+    "wikipedia.org", "wikimedia.org", "britannica.com", "en.wikipedia.org",
+})
+_NEWS_DOMAINS = frozenset({
+    "reuters.com", "bloomberg.com", "techcrunch.com", "theverge.com",
+    "arstechnica.com", "wired.com", "cnet.com", "zdnet.com",
+})
+
+
+def _source_type(url: str) -> str:
+    """Classify a URL by domain pattern. Returns one of:
+    docs, paper, repo, forum, reference, blog, news, other."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+    except Exception:
+        return "other"
+    if not host:
+        return "other"
+    def _matches(domain_set: frozenset[str]) -> bool:
+        if host in domain_set:
+            return True
+        for d in domain_set:
+            if host.endswith(f".{d}"):
+                return True
+        return False
+    if _matches(_DOCS_DOMAINS):
+        return "docs"
+    if _matches(_PAPER_DOMAINS):
+        return "paper"
+    if _matches(_REPO_DOMAINS):
+        return "repo"
+    if _matches(_FORUM_DOMAINS):
+        return "forum"
+    if _matches(_REFERENCE_DOMAINS_SET):
+        return "reference"
+    if _matches(_NEWS_DOMAINS):
+        return "news"
+    if _matches(_BLOG_DOMAINS):
+        return "blog"
+    # Path-based heuristics for unlisted domains
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        path = ""
+    if "/docs/" in path or "/documentation/" in path or "/api/" in path:
+        return "docs"
+    if "/blog/" in path or "/post/" in path or "/article/" in path:
+        return "blog"
+    if "/forum/" in path or "/thread/" in path or "/discussion/" in path:
+        return "forum"
+    return "other"
+
+
+# ─── title + URL relevance scoring (zero-latency lexical signals) ────────────
+# Boost results whose TITLE or URL PATH contains query terms. Neural rerank
+# scores (query, title+snippet) together, but title relevance is an independent
+# strong signal: a result titled "GPT-3 Architecture: d_model=12288" is more
+# relevant than "The Evolution of AI" for a query about "d_model". URL relevance
+# catches path-based relevance: /docs/api/models/gpt-3 > /blog/2023/my-thoughts.
+
+
+def _query_terms(query: str) -> set[str]:
+    """Extract meaningful query terms (words >= 3 chars, not stopwords)."""
+    return {w.lower() for w in _WORD_RE.findall(query or "") if w.lower() not in _STOPWORDS and len(w) >= 3}
+
+
+def _title_relevance(query: str, title: str) -> float:
+    """Boost for query terms appearing in the title. Up to +0.10.
+    More query terms in title = stronger signal."""
+    if not title:
+        return 0.0
+    q_terms = _query_terms(query)
+    if not q_terms:
+        return 0.0
+    title_lower = title.lower()
+    hits = sum(1 for t in q_terms if t in title_lower)
+    if hits == 0:
+        return 0.0
+    return min(hits / len(q_terms), 1.0) * 0.10
+
+
+def _url_relevance(query: str, url: str) -> float:
+    """Boost for query terms appearing in the URL path. Up to +0.08.
+    Path-based relevance: /docs/api/models/gpt-3 is more relevant than /blog/random."""
+    if not url:
+        return 0.0
+    q_terms = _query_terms(query)
+    if not q_terms:
+        return 0.0
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        return 0.0
+    if not path or path == "/":
+        return 0.0
+    hits = sum(1 for t in q_terms if t in path)
+    if hits == 0:
+        return 0.0
+    return min(hits / len(q_terms), 1.0) * 0.08
+
+
 # ─── tier derivation + hint ──────────────────────────────────────────────────
 
-def _tier(score: float, rank: int, total: int) -> str:
-    """Derive high|med|low from relevance score + rank. Top result is never 'low'."""
+def _tier(score: float, rank: int, total: int, *, consensus: int = 1,
+           domain_boosted: bool = False, answer_signals: float = 0.0) -> str:
+    """Derive high|med|low from relevance score + rank + quality signals.
+    Top result is never 'low'. High consensus (3+ engines), domain reputation,
+    or strong answer signals can promote a result to 'high' even with a medium
+    neural score - this prevents a blog post from getting 'high' while a GitHub
+    repo with the actual data gets 'med'."""
     if score >= 0.5 or rank == 1:
+        return "high"
+    # Quality-signal promotion: consensus 3+ OR domain-boosted OR strong answer
+    # signals (>= 0.15) bump a medium-score result up to 'high'.
+    if (consensus >= 3 or domain_boosted or answer_signals >= 0.15) and score >= 0.25:
         return "high"
     if score >= 0.15:
         return "med"
@@ -207,8 +471,17 @@ def compute_fetch_hint(results: list[SearchResult]) -> str:
     high = sum(1 for r in results if r.fetch_relevance == "high")
     med = sum(1 for r in results if r.fetch_relevance == "med")
     low = sum(1 for r in results if r.fetch_relevance == "low")
-    return (f"{high} high, {med} med, {low} low. Ranked by relevance_score; "
+    # Source type breakdown: show the agent what types of sources it got
+    type_counts: Counter = Counter()
+    for r in results:
+        if r.source_type:
+            type_counts[r.source_type] += 1
+    type_str = ", ".join(f"{t}:{c}" for t, c in type_counts.most_common()) if type_counts else ""
+    hint = (f"{high} high, {med} med, {low} low. Ranked by relevance_score + consensus + domain + answer signals; "
             f"smart_fetch what fits your need (high first, but a lower tier can be the right call).")
+    if type_str:
+        hint += f" Source types: {type_str}."
+    return hint
 
 
 def _search_summary(query: str, results: list[SearchResult], engines_used: list[str],
@@ -235,17 +508,14 @@ def _search_next_action(results: list[SearchResult], engine_blocked: list[str],
                     "or set HOUND_SEARCH_PROXY for sustained heavy use.")
         return "No results. Rephrase (more specific / different terms) or try mode=neural for semantic matching."
     high = [r for r in results if r.fetch_relevance == "high"]
-    base = ("Results are ranked by relevance + cross-engine consensus (engines_consensus = how many independent indexes agree). "
-            "smart_fetch the ones that match what you actually need - the ranking is a hint, "
-            "not a directive; a lower-ranked result can be the right one, so trust your judgment.")
+    base = ("Results ranked by relevance + cross-engine consensus. "
+            "smart_fetch the 1-2 that match your need.")
     if not high:
-        base += " No 'high' matches - if none of these fit, rephrase (more specific) or try mode=neural."
+        base += " No 'high' matches - rephrase (more specific) or try mode=neural."
     if engine_blocked:
         base += " Some engines didn't contribute; retry shortly for more recall."
     return base
 
-
-# ─── filter validation (site/exclude/location/language/page) ─────────────────
 
 def _validate_filters(site, exclude_sites, location, language, page):
     import re
@@ -332,19 +602,30 @@ def _rank(query: str, ranked: list[RawResult], mode: str):
 
 
 def _build_results(query: str, ranked: list[RawResult], scores: Optional[list[float]] = None,
-                   total_families: int = 1) -> list[SearchResult]:
-    """Convert RawResults (already ranked) into SearchResults with tiers + consensus."""
+                   total_families: int = 1, quality_signals: Optional[dict] = None
+                   ) -> list[SearchResult]:
+    """Convert RawResults (already ranked) into SearchResults with tiers + consensus + source_type."""
     total = len(ranked)
     out: list[SearchResult] = []
     for i, r in enumerate(ranked):
         score = scores[i] if scores and i < len(scores) else 0.0
         src = ",".join(r.sources) if r.sources else (r.source or "")
-        consensus = f"{max(1, getattr(r, 'consensus', 1))} of {max(1, total_families)}"
+        consensus_n = max(1, getattr(r, "consensus", 1))
+        consensus = f"{consensus_n} of {max(1, total_families)}"
+        stype = _source_type(r.url)
+        # Pull per-result quality signals for smarter tier calculation
+        signals = (quality_signals or {}).get(id(r), {})
         out.append(SearchResult(
             title=r.title, url=r.url, snippet=r.snippet, source=src,
             position=i + 1, relevance_score=round(score, 4),
-            fetch_relevance=_tier(score, i + 1, total),
+            fetch_relevance=_tier(
+                score, i + 1, total,
+                consensus=consensus_n,
+                domain_boosted=signals.get("domain_boosted", False),
+                answer_signals=signals.get("answer_signals", 0.0),
+            ),
             engines_consensus=consensus,
+            source_type=stype,
         ))
     return out
 
@@ -366,32 +647,49 @@ def _quality_filter(results: list[SearchResult], min_keep: int = 3) -> list[Sear
     return kept
 
 
-def _apply_consensus_boost(ranked: list[RawResult], scores: list[float]
+def _apply_quality_boost(ranked: list[RawResult], scores: list[float],
+                           query: str
                            ) -> tuple[list[RawResult], list[float]]:
-    """Boost results returned by multiple independent engines (consensus). A free
-    authority signal from merging independent indexes: a URL returned by N
-    distinct index-families gets score * (1 + 0.25*(N-1)). Consensus AMPLIFIES
-    relevance rather than overriding it (a consensus-but-irrelevant result still
-    ranks low). Also breaks the neural-saturation tie (ms-marco gives ~1.0 for any
-    clearly-relevant snippet; consensus is a discrete 1..N discriminator). Costs
-    zero extra fetches (consensus is stamped during merge). Re-sorts by boosted
-    score and renormalizes to 0..1 (top = 1.0)."""
+    """Apply consensus + domain reputation + answer-signal boosts in ONE pass,
+    then renormalize to 0..1. A free authority signal from merging independent
+    indexes: a URL returned by N distinct index-families gets +0.2 * (N-1).
+    Domain reputation adds +0.15 for known authoritative tech domains on technical
+    queries, +0.05 for reference domains. Answer-signal scoring adds up to +0.30
+    for snippets that contain actual answer data (numbers, tables, code) vs just
+    discussing the topic. Title relevance adds up to +0.10 for query terms in
+    the result title. URL relevance adds up to +0.08 for query terms in the URL
+    path. All additive; consensus AMPLIFIES relevance rather than overriding it
+    (a consensus-but-irrelevant result still ranks low). Re-sorts by boosted
+    score and renormalizes to 0..1 (top = 1.0). Costs zero extra fetches.
+    Returns (ranked, scores, quality_signals) where quality_signals maps id(result)
+    -> {domain_boosted, answer_signals} for smarter tier calculation."""
     if not ranked:
-        return ranked, scores
+        return ranked, scores, {}
+    is_tech = _is_technical_query(query)
     boosted = []
+    quality_signals: dict = {}
     for r, s in zip(ranked, scores):
         c = max(1, getattr(r, "consensus", 1))
-        boosted.append((r, s + 0.2 * (c - 1)))   # ADDITIVE: each agreeing family +0.2
+        consensus_boost = 0.2 * (c - 1)
+        domain_b = _domain_boost(r.url, query, is_tech)
+        signal_b = _answer_signal_score(query, r.snippet, is_tech)
+        title_b = _title_relevance(query, r.title)
+        url_b = _url_relevance(query, r.url)
+        total_boost = consensus_boost + domain_b + signal_b + title_b + url_b
+        boosted.append((r, s + total_boost))
+        quality_signals[id(r)] = {
+            "domain_boosted": domain_b > 0,
+            "answer_signals": signal_b,
+        }
     order = {id(r): i for i, (r, _) in enumerate(boosted)}
     boosted.sort(key=lambda rs: (-rs[1], -getattr(rs[0], "consensus", 1), rs[0].position, order[id(rs[0])]))
-    # Keep the field in 0..1: renormalize only when an additive consensus bonus
-    # pushed a score above 1.0. Otherwise preserve the ranker's scores.
+    # Renormalize to 0..1 only when a boost pushed a score above 1.0.
     mx = max((s for _, s in boosted), default=0.0)
     if mx > 1.0:
         boosted = [(r, round(s / mx, 4)) for r, s in boosted]
     else:
         boosted = [(r, round(s, 4)) for r, s in boosted]
-    return [r for r, _ in boosted], [s for _, s in boosted]
+    return [r for r, _ in boosted], [s for _, s in boosted], quality_signals
 
 
 # ─── main entry ───────────────────────────────────────────────────────────────
@@ -417,8 +715,8 @@ async def smart_search(
     independent indexes, all HTTP, no browser; add 'wikipedia' or 'grokipedia')
     is scraped in parallel, merged, deduped, and ranked. A URL returned
     by several independent engines is a consensus hit (engines_consensus field) and
-    gets a ranking boost - a free authority signal. Returns URLs + ranking (NOT
-    page content) so the agent smart_fetches the ones it wants itself.
+    gets a ranking boost - a free authority signal. Returns URLs + ranking + snippets
+    (NOT page content) so the agent smart_fetches the ones it wants itself.
 
     mode: auto (neural rerank if [all]+model present, else consensus + engine-
     position order), neural (same, explicit - surfaces a note if unavailable),
@@ -464,7 +762,7 @@ async def smart_search(
         region = f"{loc}-{lang}" if len(loc) == 2 else "us-en"
 
     cache_query = find_sim_url or query
-    cache_type = (f"search:v5:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
+    cache_type = (f"search:v8:{max_results}:{site or ''}:{','.join(exclude_sites or [])}:"f"{location or ''}:{language or ''}:{page or 0}:{','.join(engines or [])}:"f"{freshness or ''}:{mode}:{cache_query}")
     if cache_ttl > 0:
         cached = await get_cached(cache_query, cache_type, None, ttl=cache_ttl)
         if cached and cached.get("content"):
@@ -549,9 +847,9 @@ async def smart_search(
                                (unavailable_reason() or "install hound-mcp[all]"))
         _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
         total_families = len(_efams) or 1
-        ranked_list, scores = _apply_consensus_boost(ranked_list, scores)
+        ranked_list, scores, qsig = _apply_quality_boost(ranked_list, scores, derived_query)
         ranked_list, scores = ranked_list[:max_results], scores[:max_results]
-        results_list = _build_results(cache_query, ranked_list, scores, total_families)
+        results_list = _build_results(cache_query, ranked_list, scores, total_families, quality_signals=qsig)
         results_list = _quality_filter(results_list)
         sim_note = f"find_similar to {find_sim_url} (searched: {derived_query[:60]!r})"
         fetch_hint = compute_fetch_hint(results_list)
@@ -582,12 +880,17 @@ async def smart_search(
                 await _rerank_task
             except Exception:
                 pass
-        ranked_list, scores, rerank_used, rerank_note = _rank(query, ranked, mode)
+        # Pre-filter to 2x max_results before neural rerank. The metasearch returns
+        # up to 34 unique URLs across engines; neural reranking ALL of them takes
+        # ~3s. We only keep max_results, so reranking 2x is plenty (top results by
+        # engine rank order are the best candidates). Cuts rerank time ~60%.
+        _prerank = ranked[:max(2 * max_results, 12)]
+        ranked_list, scores, rerank_used, rerank_note = _rank(query, _prerank, mode)
         _efams = {_INDEX_FAMILY.get(r.name, r.name) for r in reports if r.ok}
         total_families = len(_efams) or 1
-        ranked_list, scores = _apply_consensus_boost(ranked_list, scores)
+        ranked_list, scores, qsig = _apply_quality_boost(ranked_list, scores, query)
         ranked_list, scores = ranked_list[:max_results], scores[:max_results]
-        results_list = _build_results(query, ranked_list, scores, total_families)
+        results_list = _build_results(query, ranked_list, scores, total_families, quality_signals=qsig)
         results_list = _quality_filter(results_list)
         fetch_hint = compute_fetch_hint(results_list)
         if rerank_note:

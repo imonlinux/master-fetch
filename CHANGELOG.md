@@ -2,6 +2,94 @@
 
 ## [Unreleased]
 
+## [11.2.0] - 2026-07-23
+
+### Added: Six-signal search ranking
+
+Hound's search reranking uses a six-signal composite score, all zero-latency
+(operate on already-fetched snippets, titles, URLs - no extra HTTP calls):
+
+- **Neural relevance** (existing): ONNX cross-encoder scores (query, title+snippet) topical relevance.
+- **Cross-engine consensus** (existing): URL returned by N distinct index-families gets +0.2 * (N-1).
+- **Domain reputation**: Known authoritative domains get +0.15 for technical queries.
+  Tech domains: github.com, arxiv.org, stackoverflow.com, huggingface.co, paperswithcode.com,
+  pytorch.org, openai.com, anthropic.com, deepmind.google, and 20+ more. Reference domains
+  (wikipedia.org, britannica.com) get +0.05 for any query. Not a blocklist: Medium/Substack
+  are simply not boosted, not penalized. Subdomain matching (en.wikipedia.org matches wikipedia.org).
+- **Answer-signal scoring**: Detects if the snippet CONTAINS the answer vs just
+  DISCUSSES the topic. Queries asking for "dimension/size/parameters" boost snippets with
+  3+ digit numbers (+0.15). Queries with "table/comparison" boost snippets with table markers
+  (+0.15). Queries with "vs/compare" boost snippets with comparison structure (+0.10). Queries
+  with "code/api/function" boost snippets with code markers (+0.10). Capped at +0.30.
+- **Title relevance** (new): Query terms appearing in the result title get up to +0.10 boost.
+  A result titled "GPT-3 Architecture: d_model=12288" outranks "The Evolution of AI" for a
+  query about "d_model", even with similar neural scores.
+- **URL relevance** (new): Query terms appearing in the URL path get up to +0.08 boost.
+  /docs/api/models/gpt-3 is more relevant than /blog/random-thoughts for a "gpt-3 api" query.
+
+### Added: Source type detection
+
+Each search result now has a `source_type` field classifying the source by URL pattern:
+`docs`, `paper`, `repo`, `blog`, `forum`, `reference`, `news`, or `other`. Helps the agent
+pick the right source: docs for API documentation, paper for research, repo for code,
+forum for Q&A, reference for encyclopedic. Surfaced in `fetch_hint` as a type breakdown
+(e.g. "Source types: repo:2, paper:1, blog:3").
+
+### Added: Snippet merging from multiple engines
+
+When the same URL appears in multiple search engines, their snippets are now merged
+(capped at 600 chars). Different engines often extract different sentences from the
+same page, so merged snippets give the agent richer information per result without
+fetching the page. Zero-latency (no extra HTTP calls).
+
+### Added: Smarter fetch_relevance tiers
+
+The `fetch_relevance` tier (high/med/low) now incorporates consensus, domain reputation,
+and answer signals, not just neural score. A GitHub repo with 3-engine consensus and
+answer signals gets "high" tier even with a medium neural score. This prevents a blog post
+from getting "high" while a technical reference with the actual data gets "med".
+
+### Added: Heading-aware BM25 for focus_content
+
+The `focus_content()` function (used by smart_fetch `focus=`) now uses three-pass block
+selection:
+
+1. **BM25 scoring** (existing): k1=1.5, b=0.75 with always-positive IDF.
+2. **Heading-aware boosting** (new): When a markdown heading contains query terms, ALL blocks
+   under that heading get 1.5x score boost. Content under "## Model Architecture" is relevant
+   to a query about "architecture" even if individual paragraphs don't contain the exact word.
+3. **Table/code preservation** (new): Tables and code blocks containing ANY query term are
+   ALWAYS kept, regardless of BM25 score. Tables get BM25-underweighted (sparse tokens) but
+   are high-value for factual queries.
+
+### Added: Neural rerank pre-filter (41% latency reduction)
+
+The neural cross-encoder previously scored ALL results from all engines (often 30+ URLs).
+Now it pre-filters to 2x max_results (12) before neural rerank, since the top results by
+engine rank order are already the best candidates. This cuts rerank time from ~3s to ~0.5s,
+reducing total search latency by 41% (5.8s -> 3.4s with warm reranker).
+
+### Added: Faster search deadline
+
+The per-engine search deadline has been reduced from 8s to 5s. Engines that haven't responded
+in 5s are cancelled (they're almost certainly blocked/rate-limited, not just slow). The soft
+deadline (2s) with early-return-on-quorum means most searches still return in 2-3s.
+
+### Removed: include_content feature
+
+The `include_content` parameter has been removed entirely from smart_search. It was a failed
+experiment: instead of reducing tool calls, it added 6-10 seconds of latency per search (fetching
+6 pages with 10s timeout each), added ~33k tokens of content damage per multi-search session,
+and the content quality was too low (BM25-filtered snippets from blog posts, not the actual
+data tables the agent needed). The efficient workflow is: search (fast, returns URLs + snippets,
+no page fetches) + smart_fetch with focus= (accurate, gets exactly the content needed).
+
+### Tests
+
+62 new adversarial tests in `test_search_quality.py` covering domain boost, answer signals,
+title/URL relevance, source type detection, smarter tier calculation, snippet merging, heading-
+aware BM25, and table/code preservation. Total: 466 tests.
+
 ## [11.1.10] - 2026-07-23
 
 ### Added: Docker support (PR #12 by @imonlinux)

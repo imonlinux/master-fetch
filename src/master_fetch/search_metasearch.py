@@ -66,7 +66,7 @@ if _PROXY:
             _PROXY = None
 # Per-engine + overall deadline. Engines run in parallel + we early-return on
 # quorum, so a healthy search is ~1-2s; this bounds a fully-throttled one.
-_SEARCH_DEADLINE = float(os.environ.get("HOUND_SEARCH_DEADLINE", "8") or "8")
+_SEARCH_DEADLINE = float(os.environ.get("HOUND_SEARCH_DEADLINE", "5") or "5")
 _ua = UserAgent()
 
 
@@ -980,6 +980,15 @@ async def metasearch(
                     # another backend already returned this URL -> record the
                     # agreement (cross-backend consensus authority signal).
                     seen[key]["backends"].add(name)
+                    # Snippet merging: combine snippets from multiple engines.
+                    # Zero-latency enrichment: the agent gets more info per result
+                    # without fetching the page. Different engines often extract
+                    # different sentences from the same page.
+                    new_body = (getattr(r, "body", "") or "").strip()
+                    if new_body:
+                        existing = seen[key].get("body", "")
+                        if new_body not in existing and len(existing) < 600:
+                            seen[key]["body"] = (existing + " " + new_body).strip()[:600]
                     touched = True
                     continue
                 entry = {"title": r.title, "href": r.href, "body": getattr(r, "body", "") or "",
@@ -999,10 +1008,12 @@ async def metasearch(
                 status[name] = "empty"
         # early-return: enough engines contributed enough results, OR enough
         # results after the soft deadline (don't hold for dead backends).
+        # Secondary check: if we have >= max_results and soft_deadline passed,
+        # return even without quorum_results (don't wait 8s for slow engines).
         elapsed = time() - start
-        if len(order) >= quorum_results and (
+        if (len(order) >= quorum_results and (
             engines_ok >= min_engines or elapsed >= soft_deadline
-        ):
+        )) or (len(order) >= max_results and elapsed >= soft_deadline):
             for pt in pending:
                 pt.cancel()
             for pt in list(pending):
