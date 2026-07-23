@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+## [11.1.10] - 2026-07-23
+
+### Added: Docker support (PR #12 by @imonlinux)
+
+Production-ready Docker setup for running hound as an HTTP MCP server in a container:
+
+- **Dockerfile**: Multi-stage build from `python:3.12-slim-bookworm`. Installs both
+  Playwright and Patchright browser binaries with `--with-deps` (Chromium system
+  libraries). Non-root user for Chromium sandbox. Optional `INSTALL_CHROME=true`
+  build arg to bake in real Google Chrome for maximum stealth. TCP healthcheck.
+  Serves streamable-HTTP MCP at `http://<host>:8765/mcp`.
+- **docker-compose.yml**: `shm_size: 1gb` (prevents Chromium crashes on default
+  64MB /dev/shm), `init: true` (reaps zombie processes), DNS set to 1.1.1.1 /
+  9.9.9.9, cache volume, 3g memory limit, `restart: unless-stopped`.
+- **.dockerignore**: Excludes .git, __pycache__, .venv, tests, docs from image.
+- **docker-ci.yml**: CI workflow that builds the image, starts the container,
+  runs healthcheck, and verifies the MCP endpoint. Only triggers on Docker file
+  changes.
+- **README**: Docker quick-start section with `docker-compose up -d`, manual
+  `docker build`, environment variables table (including `HOUND_SEARCH_PROXY`),
+  and HTTP mode connection instructions.
+
+### Fixed: MCP schema for `actions` array (PR #12 / #13 by @imonlinux)
+
+The `actions` parameter in `smart_crawl` was declared as `"type": "array"` without
+an `"items"` property. Strict MCP clients that validate JSON Schema may reject the
+parameter. Added `"items": {"type": "object", "additionalProperties": true}` so
+the array schema is complete. This was the only array parameter missing `items`
+(`urls` and `crawl_urls` already had `"items": {"type": "string"}`).
+
+### Fixed: docker-ci.yml only triggers on Docker file changes
+
+The original `docker-ci.yml` ran on every push to master (no `paths` filter on
+the `push` trigger). Fixed to only run when Docker files change. Also fixed the
+healthcheck to wait for `healthy` (not `healthy|starting`) and made the MCP
+endpoint check tolerate non-GET responses (MCP requires POST).
+
+### Fixed: README Docker env vars
+
+Removed `HOUND_HTTP_PORT` (not actually used, port is hardcoded in Dockerfile).
+Added `HOUND_SEARCH_PROXY` and `HOUND_SEARCH_DEADLINE` to the env var table.
+
 ## [11.1.9] - 2026-07-22
 
 ### Fixed: HOUND_SEARCH_PROXY reliability (3 bugs)
