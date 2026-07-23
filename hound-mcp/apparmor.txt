@@ -1,26 +1,48 @@
-# AppArmor profile for Hound MCP Server
-# Allows network access for web fetching and Playwright browser operations
+#include <tunables/global>
 
-capability net_raw,
-capability setuid,
-capability setgid,
+profile hound_mcp flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/nameservice>
 
-network inet tcp,
+  # Capabilities for network and browser operations
+  capability net_raw,
+  capability setuid,
+  capability setgid,
 
-# Allow access to cache and data directories
-/data/** rw,
-/app/** r,
+  # Network access
+  network inet tcp,
+  network inet stream,
 
-# Allow network access
-network tcp,
+  # Allow access to application directory
+  /app/** r,
+  /app/src/** rm,
 
-# Allow shared memory for Chromium
-/dev/shm/** rw,
+  # Allow access to data directory
+  /data/** rw,
+  /data/.hound/** rwkl,
 
-# Allow tmpfs access
-/tmp/** rw,
+  # Allow tmpfs and shared memory (for Chromium)
+  /tmp/** rw,
+  /dev/shm/** rw,
+  /dev/shm/** rwkl,
 
-# Deny access to sensitive areas
-deny /root/** rw,
-deny /home/** rw,
-deny /var/log/** rw,
+  # Python and Playwright requirements
+  /usr/bin/** rix,
+  /usr/lib/** r,
+  /usr/local/lib/** r,
+  /lib/** r,
+  /lib64/** r,
+
+  # Allow read access to system libraries
+  /etc/** r,
+  /proc/** r,
+
+  # Playwright browser files
+  /ms-playwright/** rw,
+  /root/.cache/ms-playwright/** rw,
+
+  # Deny sensitive areas (these are default denies, explicitly stated)
+  deny /root/.ssh/** rw,
+  deny /home/**/.ssh/** rw,
+}
