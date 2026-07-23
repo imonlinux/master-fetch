@@ -1,0 +1,26 @@
+# AppArmor profile for Hound MCP Server
+# Allows network access for web fetching and Playwright browser operations
+
+capability net_raw,
+capability setuid,
+capability setgid,
+
+network inet tcp,
+
+# Allow access to cache and data directories
+/data/** rw,
+/app/** r,
+
+# Allow network access
+network tcp,
+
+# Allow shared memory for Chromium
+/dev/shm/** rw,
+
+# Allow tmpfs access
+/tmp/** rw,
+
+# Deny access to sensitive areas
+deny /root/** rw,
+deny /home/** rw,
+deny /var/log/** rw,

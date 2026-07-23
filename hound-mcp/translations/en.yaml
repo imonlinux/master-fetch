@@ -1,0 +1,13 @@
+configuration:
+  log_level:
+    name: "Log Level"
+    description: "Set the logging verbosity for Hound"
+  cache_ttl:
+    name: "Cache TTL"
+    description: "Time in seconds to cache fetched content (0 to disable)"
+  max_results:
+    name: "Max Results"
+    description: "Maximum number of results to return from searches"
+
+network:
+  8765/tcp: "MCP Server - HTTP endpoint for Model Context Protocol"
